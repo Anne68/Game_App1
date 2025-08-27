@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-dotenv
+pydantic-settings
+passlib[bcrypt]
+python-jose[cryptography]==3.3.0
+cryptography
+python-multipart
+pymysql
+pandas
+scikit-learn==1.5.2
+prometheus-fastapi-instrumentator
+slowapi
+requests
+streamlit
+pytest
