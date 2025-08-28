@@ -1,4 +1,4 @@
-# client_streamlit.py (Search + AI Recos seulement) — version corrigée
+# client_streamlit.py (Search + AI Recos) — login + signup
 from __future__ import annotations
 
 import os
@@ -164,36 +164,9 @@ def discover_token_path_for(base: str, pref: str) -> str:
     return "/token"
 
 # ==============
-# Auth helpers
+# Auth helpers (login + register)
 # ==============
-def handle_401(code: int, payload: dict) -> bool:
-    if code == 401:
-        st.warning("🔒 Session expirée. Veuillez vous reconnecter.")
-        st.session_state.token = ""
-        login_box(suffix="401")
-        return True
-    return False
-
-def show_not_found(code: int, payload: dict, fallback_msg: str) -> bool:
-    if code == 404:
-        st.info(payload.get("detail", fallback_msg))
-        return True
-    return False
-
-# ==========
-# Auth UI (sans flag bloquant)
-# ==========
-def login_box(suffix: str = "main"):
-    st.subheader("Auth")
-    st.caption(f"API: {API_BASE()}{API_PREFIX() or ''}")
-    with st.form(f"login_form_{suffix}", clear_on_submit=False):
-        u = st.text_input("Username", key=f"login_u_{suffix}")
-        p = st.text_input("Password", type="password", key=f"login_p_{suffix}")
-        sub = st.form_submit_button("Login")
-
-    if not sub:
-        return
-
+def _attempt_login(u: str, p: str) -> bool:
     token_path = TOKEN_PATH_OVERRIDE() or st.session_state.get("discovered_token_path")
     if not token_path:
         token_path = discover_token_path_for(API_BASE(), API_PREFIX())
@@ -226,17 +199,77 @@ def login_box(suffix: str = "main"):
             st.session_state.username = u
             st.success(f"Authentifié ✅ (via {path})")
             _rerun()
-            return
+            return True
         if code == 404:
             continue
         st.error(f"{payload.get('detail', payload)} (status {code}, URL {build_url(path)})")
-        return
+        return False
 
     st.error(
         "Endpoint token introuvable. "
         + " — ".join(tried_msgs)
         + "\n➡ Vérifie API_BASE/API_PREFIX ou définis TOKEN_PATH (ex: '/auth/token')."
     )
+    return False
+
+def _attempt_register(u: str, p: str) -> bool:
+    # endpoint d'inscription
+    code, payload = api_post_form("/register", {"username": u, "password": p})
+    if code in (200, 201):
+        st.success("Compte créé ✅")
+        return True
+    if code == 409:
+        st.error("Nom d'utilisateur déjà pris.")
+        return False
+    st.error(payload.get("detail", payload))
+    return False
+
+def handle_401(code: int, payload: dict) -> bool:
+    if code == 401:
+        st.warning("🔒 Session expirée. Veuillez vous reconnecter.")
+        st.session_state.token = ""
+        auth_box()
+        return True
+    return False
+
+def show_not_found(code: int, payload: dict, fallback_msg: str) -> bool:
+    if code == 404:
+        st.info(payload.get("detail", fallback_msg))
+        return True
+    return False
+
+# ==========
+# Auth UI (onglets Connexion / Inscription)
+# ==========
+def auth_box():
+    st.subheader("Auth")
+    st.caption(f"API: {API_BASE()}{API_PREFIX() or ''}")
+
+    tab_login, tab_signup = st.tabs(["Se connecter", "S'inscrire"])
+
+    with tab_login:
+        with st.form("login_form", clear_on_submit=False):
+            u = st.text_input("Username", key="login_u")
+            p = st.text_input("Password", type="password", key="login_p")
+            sub = st.form_submit_button("Login")
+        if sub:
+            _attempt_login(u, p)
+
+    with tab_signup:
+        with st.form("signup_form", clear_on_submit=False):
+            u2 = st.text_input("Username", key="signup_u")
+            p2 = st.text_input("Password", type="password", key="signup_p")
+            p3 = st.text_input("Confirm password", type="password", key="signup_p2")
+            sub2 = st.form_submit_button("Créer mon compte")
+        if sub2:
+            if not u2 or not p2:
+                st.error("Veuillez remplir tous les champs.")
+            elif p2 != p3:
+                st.error("Les mots de passe ne correspondent pas.")
+            else:
+                if _attempt_register(u2, p2):
+                    # auto-login
+                    _attempt_login(u2, p2)
 
 # =================
 # UI helper blocks
@@ -404,7 +437,7 @@ with st.container():
 
 # ======== Auth obligatoire
 if not st.session_state.token:
-    login_box(suffix="main")
+    auth_box()
     st.stop()
 
 # =========================
