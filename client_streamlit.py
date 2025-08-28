@@ -15,30 +15,32 @@ import streamlit as st
 st.set_page_config(page_title="Games UI", page_icon="🎮", layout="wide")
 
 def _resolve_api_base() -> str:
-    """
-    Priorité :
-    1) st.secrets["API_BASE"] (Streamlit Cloud)
-    2) env API_BASE
-    3) env API_URL (compat)
-    4) fallback (modifie-le si besoin)
-    """
-    url = (
+    return (
         st.secrets.get("API_BASE", None)
         or os.getenv("API_BASE")
         or os.getenv("API_URL")
-        or "https://game-app1.onrender.com"   # <-- fallback prod ; mets localhost si dev
-    )
-    return url.rstrip("/")
+        or "https://game-app1.onrender.com"
+    ).rstrip("/")
 
-API_URL = _resolve_api_base()
+API_BASE = _resolve_api_base()
+
+# Préfixe optionnel si ton API est servie sous /api (ou autre)
+API_PREFIX = (st.secrets.get("API_PREFIX", os.getenv("API_PREFIX", "")) or "").strip()
+API_PREFIX = "" if API_PREFIX in ["/", "."] else API_PREFIX
+API_PREFIX = ("/" + API_PREFIX.strip("/")) if API_PREFIX else ""
+
+def build_url(path: str) -> str:
+    # path doit commencer par /
+    path = path if path.startswith("/") else ("/" + path)
+    return f"{API_BASE}{API_PREFIX}{path}"
 
 # Auth/session
 st.session_state.setdefault("token", "")
 st.session_state.setdefault("username", "")
-st.session_state["login_drawn_this_run"] = False  # reset each run
+st.session_state["login_drawn_this_run"] = False
 st.session_state.setdefault("active_tab", "Search")
 
-# HTTP session (garde le keep-alive & headers)
+# HTTP session
 _session = requests.Session()
 _BASE_HEADERS = {"Accept": "application/json"}
 
@@ -55,27 +57,28 @@ def _parse_json_or_text(r):
     try:
         return r.json()
     except Exception:
-        txt = (r.text or "").strip()
-        return {"detail": txt if txt else f"HTTP {r.status_code}"}
+        return {"detail": (r.text or "").strip() or f"HTTP {r.status_code}"}
 
 def api_get(path: str, params: dict | None = None):
+    url = build_url(path)
     try:
-        r = _session.get(API_URL + path, headers=_headers(), params=params, timeout=30)
+        r = _session.get(url, headers=_headers(), params=params, timeout=30)
         return r.status_code, _parse_json_or_text(r)
     except Exception as e:
-        return 599, {"detail": str(e)}
+        return 599, {"detail": f"{e} (GET {url})"}
 
 def api_post_form(path: str, form: dict):
+    url = build_url(path)
     try:
         r = _session.post(
-            API_URL + path,
+            url,
             headers={**_headers(), "Content-Type": "application/x-www-form-urlencoded"},
             data=form,
             timeout=30,
         )
         return r.status_code, _parse_json_or_text(r)
     except Exception as e:
-        return 599, {"detail": str(e)}
+        return 599, {"detail": f"{e} (POST {url})"}
 
 # ==========
 # Auth UI
@@ -86,7 +89,7 @@ def login_box(suffix: str = "main"):
     st.session_state["login_drawn_this_run"] = True
 
     st.subheader("Auth")
-    st.caption(f"API: {API_URL}")
+    st.caption(f"API: {API_BASE}{API_PREFIX or ''}")
     with st.form(f"login_form_{suffix}", clear_on_submit=False):
         u = st.text_input("Username", key=f"login_u_{suffix}")
         p = st.text_input("Password", type="password", key=f"login_p_{suffix}")
@@ -99,22 +102,7 @@ def login_box(suffix: str = "main"):
             st.success("Authentifié ✅")
             st.rerun()
         else:
-            st.error(payload.get("detail", payload))
-
-def handle_401(code: int, payload: dict) -> bool:
-    if code == 401:
-        st.warning("🔒 Session expirée. Veuillez vous reconnecter.")
-        st.session_state.token = ""
-        st.session_state["login_drawn_this_run"] = False
-        login_box(suffix="401")
-        return True
-    return False
-
-def show_not_found(code: int, payload: dict, fallback_msg: str) -> bool:
-    if code == 404:
-        st.info(payload.get("detail", fallback_msg))
-        return True
-    return False
+            st.error(f"{payload.get('detail', payload)} (status {code})")
 
 # =================
 # UI helper blocks
