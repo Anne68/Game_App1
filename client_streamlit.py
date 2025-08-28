@@ -29,7 +29,7 @@ API_PREFIX = (st.secrets.get("API_PREFIX", os.getenv("API_PREFIX", "")) or "").s
 API_PREFIX = "" if API_PREFIX in ["/", "."] else API_PREFIX
 API_PREFIX = ("/" + API_PREFIX.strip("/")) if API_PREFIX else ""
 
-# Override manuel possible du chemin du token (ex: "/auth/token")
+# Override manuel possible du chemin token (ex: "/auth/token")
 TOKEN_PATH_OVERRIDE = (st.secrets.get("TOKEN_PATH", os.getenv("TOKEN_PATH", "")) or "").strip()
 
 def build_url(path: str) -> str:
@@ -93,7 +93,6 @@ def _to_relative(p: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def discover_token_path() -> str:
-    # OpenAPI avec/ sans API_PREFIX
     for spec_url in [build_url("/openapi.json"), f"{API_BASE}/openapi.json"]:
         try:
             r = _session.get(spec_url, headers={"Accept": "application/json"}, timeout=10)
@@ -148,18 +147,25 @@ def login_box(suffix: str = "main"):
     if not sub:
         return
 
-    # 0) si override manuel fourni, essaie d'abord celui-ci
+    # 0) override manuel prioritaire
     candidates: list[str] = []
     if TOKEN_PATH_OVERRIDE:
         manual = TOKEN_PATH_OVERRIDE if TOKEN_PATH_OVERRIDE.startswith("/") else ("/" + TOKEN_PATH_OVERRIDE)
         candidates.append(manual)
 
-    # 1) découvre via OpenAPI (cache)
+    # 1) découvre via OpenAPI
     if not st.session_state.token_path:
         st.session_state.token_path = discover_token_path()
 
-    # 2) construction de la liste d'essais
-    candidates += [st.session_state.token_path, "/token", "/api/token"]
+    # 2) chemins à essayer
+    candidates += [
+        st.session_state.token_path,
+        "/token",
+        "/api/token",
+        "/auth/token",
+        "/login",
+        "/login/access-token",
+    ]
 
     seen = set()
     tried_msgs = []
@@ -178,12 +184,11 @@ def login_box(suffix: str = "main"):
             return
         if code == 404:
             continue
-        # autre erreur : montrer le détail
         st.error(f"{payload.get('detail', payload)} (status {code}, URL {build_url(path)})")
         return
 
-    st.error("Endpoint token introuvable.\n" + "\n".join(tried_msgs) + "\n"
-             "➡ Vérifie le préfixe (API_PREFIX) ou définis TOKEN_PATH (ex: '/auth/token').")
+    st.error("Endpoint token introuvable.\n" + "\n".join(tried_msgs) +
+             "\n➡ Vérifie API_PREFIX ou définis TOKEN_PATH (ex: '/auth/token').")
 
 # =================
 # UI helper blocks
