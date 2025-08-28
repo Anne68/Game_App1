@@ -1,4 +1,4 @@
-# client_streamlit.py — UI de recherche + recommandations
+# client_streamlit.py — UI de recherche + recommandations + inscription
 from __future__ import annotations
 
 import os
@@ -89,9 +89,7 @@ if st.sidebar.button("Test API"):
         st.sidebar.error(f"Échec: {code} {payload}")
 
 
-# ==========
-# Auth UI
-# ==========
+# ========== Auth UI ==========
 def login_box(suffix: str = "main"):
     st.subheader("Auth")
     with st.form(f"login_form_{suffix}", clear_on_submit=False):
@@ -104,6 +102,36 @@ def login_box(suffix: str = "main"):
             st.session_state["token"] = payload["access_token"]
             st.session_state["username"] = u
             st.success("Connecté !")
+        else:
+            st.error(payload.get("detail", payload))
+
+
+def signup_box(suffix: str = "main"):
+    st.subheader("Créer un compte")
+    with st.form(f"signup_form_{suffix}", clear_on_submit=False):
+        u = st.text_input("Username", key=f"signup_u_{suffix}")
+        p = st.text_input("Password", type="password", key=f"signup_p_{suffix}")
+        p2 = st.text_input("Confirmer le mot de passe", type="password", key=f"signup_p2_{suffix}")
+        sub = st.form_submit_button("S'inscrire")
+    if sub:
+        if not u.strip() or not p:
+            st.warning("Veuillez renseigner un username et un mot de passe.")
+            return
+        if p != p2:
+            st.error("Les mots de passe ne correspondent pas.")
+            return
+        # 1) Register
+        code, payload = api_post("/register", {"username": u.strip(), "password": p}, with_auth=False)
+        if code == 200 and payload.get("ok"):
+            st.success("Compte créé avec succès ✅")
+            # 2) Auto-login
+            code2, payload2 = api_post("/token", {"username": u.strip(), "password": p}, with_auth=False)
+            if code2 == 200 and "access_token" in payload2:
+                st.session_state["token"] = payload2["access_token"]
+                st.session_state["username"] = u.strip()
+                st.success("Connecté automatiquement 🎉")
+            else:
+                st.info("Compte créé. Vous pouvez maintenant vous connecter.")
         else:
             st.error(payload.get("detail", payload))
 
@@ -126,10 +154,11 @@ def platform_pills(items):
             )
 
 
-# ==========
-# MAIN TABS
-# ==========
-tab_auth, tab_search, tab_reco = st.tabs(["🔑 Auth", "🔎 Recherche", "✨ Recos"])
+# ========== MAIN TABS ==========
+tab_signup, tab_auth, tab_search, tab_reco = st.tabs(["🆕 Inscription", "🔑 Auth", "🔎 Recherche", "✨ Recos"])
+
+with tab_signup:
+    signup_box()
 
 with tab_auth:
     login_box()
