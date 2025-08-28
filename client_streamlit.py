@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 import pandas as pd
@@ -24,7 +24,7 @@ def _resolve_api_base() -> str:
 
 API_BASE = _resolve_api_base()
 
-# Préfixe optionnel si ton API est servie sous /api (ou autre)
+# Préfixe optionnel si l’API est servie sous /api (ou autre)
 API_PREFIX = (st.secrets.get("API_PREFIX", os.getenv("API_PREFIX", "")) or "").strip()
 API_PREFIX = "" if API_PREFIX in ["/", "."] else API_PREFIX
 API_PREFIX = ("/" + API_PREFIX.strip("/")) if API_PREFIX else ""
@@ -37,8 +37,9 @@ def build_url(path: str) -> str:
 # Auth/session
 st.session_state.setdefault("token", "")
 st.session_state.setdefault("username", "")
-st.session_state["login_drawn_this_run"] = False
 st.session_state.setdefault("active_tab", "Search")
+st.session_state.setdefault("token_path", "")  # mémorise l'endpoint correct
+st.session_state["login_drawn_this_run"] = False
 
 # HTTP session
 _session = requests.Session()
@@ -80,6 +81,53 @@ def api_post_form(path: str, form: dict):
     except Exception as e:
         return 599, {"detail": f"{e} (POST {url})"}
 
+# -------- Discover /token path from OpenAPI --------
+def _to_relative(p: str) -> str:
+    if not p:
+        return "/token"
+    if p.startswith("http://") or p.startswith("https://"):
+        return urlparse(p).path or "/token"
+    return p if p.startswith("/") else ("/" + p)
+
+@st.cache_data(show_spinner=False)
+def discover_token_path() -> str:
+    # Essaye d'abord /openapi.json avec API_PREFIX, puis sans
+    for spec_url in [build_url("/openapi.json"), f"{API_BASE}/openapi.json"]:
+        try:
+            r = _session.get(spec_url, headers={"Accept": "application/json"}, timeout=10)
+            if r.status_code != 200:
+                continue
+            spec = r.json()
+            comps = (spec or {}).get("components", {})
+            schemes = comps.get("securitySchemes", {})
+            for s in schemes.values():
+                flows = (s or {}).get("flows", {})
+                pwd = flows.get("password") or {}
+                token_url = _to_relative(pwd.get("tokenUrl"))
+                if token_url:
+                    return token_url
+        except Exception:
+            pass
+    return "/token"  # défaut
+
+# ==========
+# Helpers UI
+# ==========
+def handle_401(code: int, payload: dict) -> bool:
+    if code == 401:
+        st.warning("🔒 Session expirée. Veuillez vous reconnecter.")
+        st.session_state.token = ""
+        st.session_state["login_drawn_this_run"] = False
+        login_box(suffix="401")
+        return True
+    return False
+
+def show_not_found(code: int, payload: dict, fallback_msg: str) -> bool:
+    if code == 404:
+        st.info(payload.get("detail", fallback_msg))
+        return True
+    return False
+
 # ==========
 # Auth UI
 # ==========
@@ -94,15 +142,37 @@ def login_box(suffix: str = "main"):
         u = st.text_input("Username", key=f"login_u_{suffix}")
         p = st.text_input("Password", type="password", key=f"login_p_{suffix}")
         sub = st.form_submit_button("Login")
-    if sub:
-        code, payload = api_post_form("/token", {"username": u, "password": p})
+
+    if not sub:
+        return
+
+    # 1) découvre le chemin depuis l'OpenAPI (cache)
+    if not st.session_state.token_path:
+        st.session_state.token_path = discover_token_path()
+
+    # 2) tente séquentiellement: chemin découvert -> /token -> /api/token
+    tried = []
+    for path in [st.session_state.token_path, "/token", "/api/token"]:
+        if path in tried:
+            continue
+        tried.append(path)
+        code, payload = api_post_form(path, {"username": u, "password": p})
         if code == 200 and "access_token" in payload:
             st.session_state.token = payload["access_token"]
             st.session_state.username = u
-            st.success("Authentifié ✅")
+            st.session_state.token_path = path  # mémorise le bon endpoint
+            st.success(f"Authentifié ✅ (via {path})")
             st.rerun()
-        else:
-            st.error(f"{payload.get('detail', payload)} (status {code})")
+            return
+        # 404 -> on essaie la suivante
+        if code == 404:
+            continue
+        # autre erreur -> affiche et arrête
+        st.error(f"{payload.get('detail', payload)} (status {code}, URL {build_url(path)})")
+        return
+
+    # si tout a échoué en 404
+    st.error(f"Endpoint token introuvable. Essayé: {', '.join(tried)}  — Vérifie le préfixe (API_PREFIX).")
 
 # =================
 # UI helper blocks
@@ -137,10 +207,6 @@ def platform_pills(items):
             )
 
 def _extract_min_price(rows: list[dict]) -> tuple[str, str] | None:
-    """
-    Retourne (price_text, shop_text) pour le prix minimum si identifiable.
-    Sinon None.
-    """
     if not rows:
         return None
     df = pd.DataFrame(rows)
@@ -161,7 +227,6 @@ def _extract_min_price(rows: list[dict]) -> tuple[str, str] | None:
     if not c_price:
         return None
 
-    # convert to numeric when possible
     def to_num(s):
         if s is None:
             return None
@@ -185,58 +250,37 @@ def _extract_min_price(rows: list[dict]) -> tuple[str, str] | None:
 # Game card (Search results)
 # ==========================
 def game_card(g: dict, idx: int):
-    """
-    Carte jeu qui AFFICHE directement :
-      - prix mini via /games/title/{title}/prices ou /games/{id}/prices
-      - plateformes via /games/by-title/{title}/platforms ou /games/{id}/platforms
-    """
     with st.container():
         st.markdown(f"### {nice_game_title(g)}")
         c1, c2 = st.columns([2, 2])
 
-        # --- Genres
         with c1:
             genres = g.get("genres", "")
             if genres:
                 st.caption(genres)
 
-        # Résolution de l'identité
         title = (g.get("title") or g.get("name") or "").strip()
         gid   = g.get("id") or g.get("game_id_rawg")
 
-        # --- Prix (mini) ---
-        prices_endpoint = None
-        if title:
-            prices_endpoint = f"/games/title/{quote(title)}/prices"
-        elif gid:
-            prices_endpoint = f"/games/{gid}/prices"
-
-        min_price_text = None
-        min_price_shop = None
+        # Prix (mini)
+        prices_endpoint = f"/games/title/{quote(title)}/prices" if title else (f"/games/{gid}/prices" if gid else None)
+        min_price_text = min_price_shop = None
         if prices_endpoint:
             code, payload = api_get(prices_endpoint)
-            if not handle_401(code, payload):
-                if code == 200:
-                    rows = payload.get("prices", [])
-                    mp = _extract_min_price(rows)
-                    if mp:
-                        min_price_text, min_price_shop = mp
+            if not handle_401(code, payload) and code == 200:
+                rows = payload.get("prices", [])
+                mp = _extract_min_price(rows)
+                if mp:
+                    min_price_text, min_price_shop = mp
 
-        # --- Plateformes ---
-        plats_endpoint = None
-        if title:
-            plats_endpoint = f"/games/by-title/{quote(title)}/platforms"
-        elif gid:
-            plats_endpoint = f"/games/{gid}/platforms"
-
+        # Plateformes
+        plats_endpoint = f"/games/by-title/{quote(title)}/platforms" if title else (f"/games/{gid}/platforms" if gid else None)
         plats = []
         if plats_endpoint:
             code, payload = api_get(plats_endpoint)
-            if not handle_401(code, payload):
-                if code == 200:
-                    plats = payload.get("platforms") or payload.get("platform_ids") or []
+            if not handle_401(code, payload) and code == 200:
+                plats = payload.get("platforms") or payload.get("platform_ids") or []
 
-        # --- Rendu : prix mini + pastilles plateformes
         with c2:
             if min_price_text:
                 if min_price_shop:
@@ -289,7 +333,6 @@ if st.session_state.active_tab == "Search":
         if not q.strip():
             st.warning("Saisissez un texte de recherche.")
         else:
-            # L’API accepte /games/by-title/{title} ET /games/title/{title}
             code, payload = api_get(f"/games/by-title/{quote(q.strip())}")
             if handle_401(code, payload):
                 st.stop()
@@ -312,7 +355,6 @@ else:
     st.markdown("### Recommendations")
     s1, s2 = st.tabs(["By title", "By genre"])
 
-    # --- by title ---
     with s1:
         ti = st.text_input("Title", key="q_reco_title", placeholder="ex: The Witcher 3")
         k1 = st.number_input("Top-N", value=5, min_value=1, max_value=20, step=1, key="k_title")
@@ -331,7 +373,6 @@ else:
                 else:
                     st.error(payload.get("detail", payload))
 
-    # --- by genre ---
     with s2:
         ge = st.text_input("Genre", key="q_reco_genre", placeholder="ex: Action, RPG…")
         k2 = st.number_input("Top-N ", value=5, min_value=1, max_value=20, step=1, key="k_genre")
