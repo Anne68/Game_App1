@@ -8,7 +8,7 @@ import logging
 import pymysql
 from fastapi import FastAPI, HTTPException, Depends, Form, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
@@ -62,15 +62,33 @@ SECRET_KEY = settings.SECRET_KEY
 ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
 
+def _normalize_db_user(u: str) -> str:
+    """
+    Si l'env fournit 'anne@2a00:b6e0:...' on ne garde que 'anne'
+    (MySQL/PyMySQL attend juste le nom d'utilisateur ici).
+    """
+    if "@" in u:
+        right = u.split("@", 1)[1]
+        if "." in right or ":" in right:
+            return u.split("@", 1)[0]
+    return u
+
+
 def connect_to_db():
+    ssl_args = {}
+    # Active TLS si un CA est fourni (utile avec Alwaysdata)
+    if getattr(settings, "DB_SSL_CA", None):
+        ssl_args = {"ssl": {"ca": settings.DB_SSL_CA}}
+
     return pymysql.connect(
         host=settings.DB_HOST,
         port=settings.DB_PORT,
-        user=settings.DB_USER,
+        user=_normalize_db_user(settings.DB_USER),
         password=settings.DB_PASSWORD,
         database=settings.DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
+        **ssl_args,
     )
 
 
@@ -333,14 +351,28 @@ def register(request: Request, username: str = Form(...), password: str = Form(.
         raise HTTPException(status_code=500, detail="Erreur lors de la création")
 
 
+# ======= TOKEN (corrigé) + alias =======
 @app.post("/token", tags=["auth"])
 @limiter.limit("20/minute")
-def login(request: Request, username: str = Form(...), password: str = Form(...)):
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+    username = form_data.username
+    password = form_data.password
+
     user = get_user_from_db(username)
     if not user or not verify_password(password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Identifiants invalides")
+
     tok = create_access_token({"sub": user["username"]}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     return {"access_token": tok, "token_type": "bearer"}
+
+
+# Aliases pratiques (évite les 404 selon le front)
+@app.post("/auth/token", tags=["auth"])
+@app.post("/login", tags=["auth"])
+@app.post("/login/access-token", tags=["auth"])
+@app.post("/api/token", tags=["auth"])
+def login_alias(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+    return login(request, form_data)
 
 
 @app.get("/", tags=["public"])
