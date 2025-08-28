@@ -381,12 +381,13 @@ with st.container():
             token_path_in = st.text_input("TOKEN_PATH forcé (optionnel)", TOKEN_PATH_OVERRIDE())
 
             if st.button("💾 Enregistrer"):
-                st.session_state["api_base"] = api_base_in.rstrip("/")
-                st.session_state["api_prefix"] = api_prefix_in
-                st.session_state["token_path_override"] = token_path_in
-                st.session_state["discovered_token_path"] = ""  # reset
-                st.success("Paramètres API enregistrés. Rechargement…")
-                st.experimental_rerun()
+    st.session_state["api_base"] = api_base_in.rstrip("/")
+    st.session_state["api_prefix"] = api_prefix_in
+    st.session_state["token_path_override"] = token_path_in
+    st.session_state["discovered_token_path"] = ""  # reset
+    st.success("Paramètres API enregistrés. Rechargement…")
+    st.rerun()   # <- au lieu de st.experimental_rerun()
+
 
             if st.button("🔎 Tester l'API"):
                 url = build_url("/__paths")
