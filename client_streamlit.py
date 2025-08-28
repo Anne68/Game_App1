@@ -1,13 +1,12 @@
-# client_streamlit.py — UI Streamlit (Auth, Recherche, Recos, Observabilité)
+# client_streamlit.py (Search + AI Recos seulement)
 from __future__ import annotations
 
 import os
-import time
-from typing import Optional, Dict, Any, List
+import re
 from urllib.parse import quote
 
-import pandas as pd
 import requests
+import pandas as pd
 import streamlit as st
 
 # =======================
@@ -15,341 +14,321 @@ import streamlit as st
 # =======================
 st.set_page_config(page_title="Games UI", page_icon="🎮", layout="wide")
 
-API_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
-PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://localhost:9090").rstrip("/")
+# URL de l'API : ENV d'abord, sinon défaut (réseau docker)
+API_URL = (os.getenv("API_URL") or "http://api:8000").rstrip("/")
 
-if "token" not in st.session_state:
-    st.session_state["token"] = None
-if "username" not in st.session_state:
-    st.session_state["username"] = None
-if "login_drawn_this_run" not in st.session_state:
-    st.session_state["login_drawn_this_run"] = False
+# Auth/session
+st.session_state.setdefault("token", "")
+st.session_state.setdefault("username", "")
+st.session_state["login_drawn_this_run"] = False  # reset each run
 
-# =======================
-# Helpers HTTP (API)
-# =======================
-def _auth_headers() -> Dict[str, str]:
-    headers = {"Accept": "application/json"}
-    if st.session_state.get("token"):
-        headers["Authorization"] = f"Bearer {st.session_state['token']}"
-    return headers
+# Navigation pilotable par état
+st.session_state.setdefault("active_tab", "Search")
 
-def api_post_form(path: str, data: Dict[str, Any], timeout: int = 10) -> tuple[int, Any]:
-    url = f"{API_URL}{path}"
+# ==============
+# HTTP helpers
+# ==============
+def auth_headers() -> dict:
+    return {"Authorization": f"Bearer {st.session_state.token}"} if st.session_state.token else {}
+
+def api_get(path: str, params: dict | None = None):
     try:
-        r = requests.post(url, data=data, headers={"Accept": "application/json"}, timeout=timeout)
-        if r.headers.get("content-type", "").startswith("application/json"):
-            return r.status_code, r.json()
-        return r.status_code, {"detail": r.text}
+        r = requests.get(API_URL + path, headers=auth_headers(), params=params, timeout=30)
+        data = r.json() if r.content else {}
+        return r.status_code, data
     except Exception as e:
-        return 0, {"detail": f"API POST error: {e}"}
+        return 599, {"detail": str(e)}
 
-def api_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 15) -> tuple[int, Any]:
-    url = f"{API_URL}{path}"
+def api_post_form(path: str, form: dict):
     try:
-        r = requests.get(url, params=params, headers=_auth_headers(), timeout=timeout)
-        if r.headers.get("content-type", "").startswith("application/json"):
-            return r.status_code, r.json()
-        return r.status_code, {"detail": r.text}
+        r = requests.post(API_URL + path, headers=auth_headers(), data=form, timeout=30)
+        data = r.json() if r.content else {}
+        return r.status_code, data
     except Exception as e:
-        return 0, {"detail": f"API GET error: {e}"}
+        return 599, {"detail": str(e)}
 
-# =======================
+# ==========
 # Auth UI
-# =======================
-def handle_401(code: int, payload: Any) -> bool:
-    """Retourne True si 401 et affiche un message, sinon False."""
-    if code == 401:
-        st.warning("Session expirée ou non authentifiée. Merci de vous reconnecter.")
-        st.session_state["token"] = None
-        return True
-    return False
-
+# ==========
 def login_box(suffix: str = "main"):
-    if st.session_state.get("token"):
-        with st.expander("Connecté", expanded=False):
-            st.write(f"Utilisateur : **{st.session_state.get('username', 'inconnu')}**")
-            if st.button("Se déconnecter", key=f"logout_{suffix}"):
-                st.session_state["token"] = None
-                st.session_state["username"] = None
-                st.experimental_rerun()
+    if st.session_state.get("login_drawn_this_run", False):
         return
+    st.session_state["login_drawn_this_run"] = True
 
-    st.subheader("Authentification")
+    st.subheader("Auth")
     with st.form(f"login_form_{suffix}", clear_on_submit=False):
         u = st.text_input("Username", key=f"login_u_{suffix}")
         p = st.text_input("Password", type="password", key=f"login_p_{suffix}")
         sub = st.form_submit_button("Login")
     if sub:
-        code, payload = api_post_form("/token", data={"username": u.strip(), "password": p})
+        code, payload = api_post_form("/token", {"username": u, "password": p})
         if code == 200 and "access_token" in payload:
-            st.session_state["token"] = payload["access_token"]
-            st.session_state["username"] = u.strip()
+            st.session_state.token = payload["access_token"]
+            st.session_state.username = u
             st.success("Authentifié ✅")
-            st.experimental_rerun()
+            st.rerun()
         else:
-            st.error(payload.get("detail", "Échec d’authentification"))
+            st.error(payload.get("detail", payload))
 
-# =======================
-# UI: Recherche / Jeux
-# =======================
-def ui_games_search():
-    st.subheader("Recherche de jeux par titre")
-    col_a, col_b, col_c = st.columns([3, 1, 1])
-    with col_a:
-        q = st.text_input("Titre à rechercher", placeholder="ex: Halo", key="games_q")
-    with col_b:
-        k_page = st.number_input("Page", min_value=1, value=1, step=1, key="games_page")
-    with col_c:
-        k_size = st.number_input("Taille page", min_value=1, max_value=200, value=50, step=1, key="games_size")
+def handle_401(code: int, payload: dict) -> bool:
+    if code == 401:
+        st.warning("🔒 Session expirée. Veuillez vous reconnecter.")
+        st.session_state.token = ""
+        st.session_state["login_drawn_this_run"] = False
+        login_box(suffix="401")
+        return True
+    return False
 
-    cta = st.button("Rechercher", type="primary", key="btn_games_search")
-    if not cta:
+def show_not_found(code: int, payload: dict, fallback_msg: str) -> bool:
+    if code == 404:
+        st.info(payload.get("detail", fallback_msg))
+        return True
+    return False
+
+# =================
+# UI helper blocks
+# =================
+def nice_game_title(g: dict) -> str:
+    t = g.get("title") or g.get("name") or "Untitled"
+    r, m = g.get("rating"), g.get("metacritic")
+    bits = []
+    if r is not None:
+        try:
+            bits.append(f"⭐ {float(r):.1f}")
+        except:
+            pass
+    if m is not None:
+        try:
+            bits.append(f"MC {int(m)}")
+        except:
+            pass
+    return t + ((" · " + " · ".join(bits)) if bits else "")
+
+def platform_pills(items):
+    if not items:
+        st.caption("🎮 Aucune plateforme trouvée")
         return
+    items = list(items)
+    cols = st.columns(min(6, len(items)) or 1)
+    for i, p in enumerate(items):
+        with cols[i % len(cols)]:
+            st.markdown(
+                "<div style='padding:6px 10px;border-radius:999px;background:#f0f2f6;display:inline-block;margin:4px'>"
+                f"{p}</div>", unsafe_allow_html=True
+            )
 
-    title = (q or "").strip()
-    if not title:
-        st.warning("Saisissez un titre.")
-        return
+def _extract_min_price(rows: list[dict]) -> tuple[str, str] | None:
+    """
+    Retourne (price_text, shop_text) pour le prix minimum si identifiable.
+    Sinon None.
+    """
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
 
-    # Recherche directe par titre (endpoint by-title)
-    code, payload = api_get(f"/games/by-title/{quote(title)}")
-    if handle_401(code, payload):
-        st.stop()
-
-    if code == 200:
-        games = payload.get("games") or payload.get("items") or payload  # tolérance
-        if not isinstance(games, list):
-            st.info("Aucun résultat.")
-            return
-        df = pd.DataFrame(games)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        # Zone d'exploration prix/plateformes
-        st.markdown("### Prix & Plateformes")
-        sel_title = st.selectbox(
-            "Choisir un jeu pour voir les prix et plateformes",
-            options=[g.get("title") for g in games if g.get("title")],
-            index=0 if games else None,
-            key="sel_title_prices",
-        )
-        if sel_title:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.caption("💰 Prix")
-                c_code, c_payload = api_get(f"/games/title/{quote(sel_title)}/prices")
-                if handle_401(c_code, c_payload):
-                    st.stop()
-                if c_code == 200:
-                    prices = c_payload.get("prices", [])
-                    if prices:
-                        st.dataframe(pd.DataFrame(prices), use_container_width=True, hide_index=True)
-                    else:
-                        st.info("Pas de prix disponibles.")
-                else:
-                    st.warning(c_payload.get("detail", c_payload))
-
-            with c2:
-                st.caption("🕹️ Plateformes")
-                p_code, p_payload = api_get(f"/games/title/{quote(sel_title)}/platforms")
-                if handle_401(p_code, p_payload):
-                    st.stop()
-                if p_code == 200:
-                    plats = p_payload.get("platforms", [])
-                    if plats:
-                        st.dataframe(pd.DataFrame(plats), use_container_width=True, hide_index=True)
-                    else:
-                        st.info("Pas de plateformes disponibles.")
-                else:
-                    st.warning(p_payload.get("detail", p_payload))
-    elif code == 404:
-        st.info("Aucun jeu trouvé.")
-    else:
-        st.error(payload.get("detail", payload))
-
-# =======================
-# UI: Recommandations
-# =======================
-def ui_recommendations():
-    st.subheader("Recommandations IA")
-
-    tab1, tab2 = st.tabs(["Par titre", "Par genre"])
-
-    with tab1:
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            title = st.text_input("Titre", placeholder="ex: Halo Infinite", key="rec_title")
-        with col2:
-            k = st.slider("k", 1, 50, 5, key="rec_k_title")
-        if st.button("Obtenir des recommandations (titre)", key="btn_recos_title"):
-            if not (title or "").strip():
-                st.warning("Saisissez un titre.")
-            else:
-                code, payload = api_get(f"/recommend/by-title/{quote(title.strip())}", params={"k": int(k)})
-                if handle_401(code, payload):
-                    st.stop()
-                if code == 200:
-                    recs = payload.get("recommendations") or payload.get("items") or []
-                    st.dataframe(pd.DataFrame(recs), use_container_width=True, hide_index=True)
-                elif code == 404:
-                    st.info("Aucune recommandation.")
-                else:
-                    st.error(payload.get("detail", payload))
-
-    with tab2:
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            genre = st.text_input("Genre", placeholder="ex: Action", key="rec_genre")
-        with col2:
-            k2 = st.slider("k", 1, 50, 5, key="rec_k_genre")
-        if st.button("Obtenir des recommandations (genre)", key="btn_recos_genre"):
-            if not (genre or "").strip():
-                st.warning("Saisissez un genre.")
-            else:
-                code, payload = api_get(f"/recommend/by-genre/{quote(genre.strip())}", params={"k": int(k2)})
-                if handle_401(code, payload):
-                    st.stop()
-                if code == 200:
-                    recs = payload.get("recommendations") or payload.get("items") or []
-                    st.dataframe(pd.DataFrame(recs), use_container_width=True, hide_index=True)
-                elif code == 404:
-                    st.info("Aucune recommandation.")
-                else:
-                    st.error(payload.get("detail", payload))
-
-# =======================
-# Observabilité (Prometheus)
-# =======================
-# Requêtes PromQL alignées sur tes règles d’alertes
-PROMQL_ERROR_RATE_5XX_5M = 'sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))'
-PROMQL_LATENCY_P95_5M = 'histogram_quantile(0.95, sum(rate(api_request_latency_seconds_bucket[5m])) by (le))'
-PROMQL_RATE_401_5M = 'sum(rate(http_requests_total{status="401"}[5m]))'
-
-@st.cache_data(ttl=10)
-def prom_instant_query(query: str) -> Optional[float]:
-    """Retourne la valeur float d'une requête instant PromQL, ou None si pas de résultat."""
-    try:
-        r = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        res = data.get("data", {}).get("result", [])
-        if not res:
+    def pick(*cands):
+        if df.empty:
             return None
-        value = float(res[0]["value"][1])
-        return value
-    except Exception:
+        lower = {c.lower(): c for c in df.columns}
+        for c in cands:
+            if c in df.columns:
+                return c
+            if c.lower() in lower:
+                return lower[c.lower()]
         return None
 
-@st.cache_data(ttl=10)
-def prom_active_alerts() -> List[Dict[str, Any]]:
-    """Retourne la liste des alertes actives depuis Prometheus (API /api/v1/alerts)."""
-    try:
-        r = requests.get(f"{PROMETHEUS_URL}/api/v1/alerts", timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        alerts = data.get("data", {}).get("alerts", [])
-        return alerts or []
-    except Exception:
-        return []
+    c_price = pick("price", "best_price", "best_price_pc")
+    c_shop  = pick("shop", "best_shop", "best_shop_pc")
+    if not c_price:
+        return None
 
-def ui_observability():
-    st.subheader("Observabilité (Prometheus)")
+    # convert to numeric when possible
+    def to_num(s):
+        if s is None:
+            return None
+        s = str(s)
+        s_norm = (
+            s.replace("\xa0", " ")
+             .replace("€", "")
+             .replace("EUR", "")
+             .replace(",", ".")
+        )
+        m = re.search(r"-?\d+(?:\.\d+)?", s_norm)
+        return float(m.group(0)) if m else None
 
-    col1, col2, col3 = st.columns(3)
-    err_rate = prom_instant_query(PROMQL_ERROR_RATE_5XX_5M)  # ratio (0..1)
-    p95 = prom_instant_query(PROMQL_LATENCY_P95_5M)          # secondes
-    rate_401 = prom_instant_query(PROMQL_RATE_401_5M)        # req/s
+    df["_pnum"] = df[c_price].map(to_num)
+    row = df.loc[df["_pnum"].idxmin()] if df["_pnum"].notna().any() else df.iloc[0]
+    price_text = f"€ {row['_pnum']:.2f}" if pd.notna(row.get("_pnum")) else str(row[c_price])
+    shop_text  = str(row[c_shop]) if c_shop in df.columns else ""
+    return price_text, shop_text
 
-    # Taux d'erreurs 5xx
-    if err_rate is None:
-        col1.metric("Taux d’erreurs 5xx (5m)", "n/a")
-    else:
-        col1.metric("Taux d’erreurs 5xx (5m)", f"{err_rate*100:.2f} %")
-        if err_rate > 0.05:
-            col1.error("Alerte: > 5%")
+# ==========================
+# Game card (Search results)
+# ==========================
+def game_card(g: dict, idx: int):
+    """
+    Carte jeu qui AFFICHE directement :
+      - prix mini (si dispo) via /games/title/{title}/prices (alias OK) ou /games/{id}/prices
+      - plateformes via /games/by-title/{title}/platforms (alias OK) ou /games/{id}/platforms
+    """
+    with st.container():
+        st.markdown(f"### {nice_game_title(g)}")
+        c1, c2 = st.columns([2, 2])
+
+        # --- Genres
+        with c1:
+            genres = g.get("genres", "")
+            if genres:
+                st.caption(genres)
+
+        # Résolution de l'identité
+        title = (g.get("title") or g.get("name") or "").strip()
+        gid   = g.get("id") or g.get("game_id_rawg")
+
+        # --- Prix (mini) ---
+        if title:
+            prices_endpoint = f"/games/title/{quote(title)}/prices"
+        elif gid:
+            prices_endpoint = f"/games/{gid}/prices"
         else:
-            col1.success("OK")
+            prices_endpoint = None
 
-    # Latence P95
-    if p95 is None:
-        col2.metric("Latence P95 (5m)", "n/a")
-    else:
-        col2.metric("Latence P95 (5m)", f"{p95:.3f} s")
-        if p95 > 1.0:
-            col2.error("Alerte: > 1s")
+        min_price_text = None
+        min_price_shop = None
+        if prices_endpoint:
+            code, payload = api_get(prices_endpoint)
+            if not handle_401(code, payload):
+                if code == 200:
+                    rows = payload.get("prices", [])
+                    mp = _extract_min_price(rows)
+                    if mp:
+                        min_price_text, min_price_shop = mp
+
+        # --- Plateformes ---
+        if title:
+            plats_endpoint = f"/games/by-title/{quote(title)}/platforms"
+        elif gid:
+            plats_endpoint = f"/games/{gid}/platforms"
         else:
-            col2.success("OK")
+            plats_endpoint = None
 
-    # 401/s
-    if rate_401 is None:
-        col3.metric("401/s (5m)", "n/a")
-    else:
-        col3.metric("401/s (5m)", f"{rate_401:.2f}")
-        if rate_401 > 5:
-            col3.warning("Pic de 401")
-        else:
-            col3.success("OK")
+        plats = []
+        if plats_endpoint:
+            code, payload = api_get(plats_endpoint)
+            if not handle_401(code, payload):
+                if code == 200:
+                    plats = payload.get("platforms") or payload.get("platform_ids") or []
 
-    st.divider()
-    st.caption("Seuils alignés sur les règles d’alertes Prometheus.")
+        # --- Rendu : prix mini + pastilles plateformes
+        with c2:
+            if min_price_text:
+                if min_price_shop:
+                    st.markdown(f"**💶 From {min_price_text}**  ·  *{min_price_shop}*")
+                else:
+                    st.markdown(f"**💶 From {min_price_text}**")
+            else:
+                st.caption("💶 Prix indisponibles")
 
-    # Alertes actives
-    st.markdown("### Alertes actives")
-    alerts = prom_active_alerts()
-    if not alerts:
-        st.success("Aucune alerte active 👍")
-    else:
-        for a in alerts:
-            name = a.get("labels", {}).get("alertname", "unknown")
-            sev = a.get("labels", {}).get("severity", "unknown")
-            summary = (a.get("annotations", {}) or {}).get("summary", "")
-            state = a.get("state", "firing")
-            starts_at = a.get("activeAt", a.get("startsAt", ""))
+            platform_pills(plats)
 
-            box = st.container(border=True)
-            with box:
-                st.write(f"**{name}** — état: `{state}` — sévérité: `{sev}`")
-                if summary:
-                    st.write(summary)
-                if starts_at:
-                    st.caption(f"Active depuis: {starts_at}")
+# =========
+# Header
+# =========
+with st.container():
+    a, b = st.columns([1, 1])
+    with a:
+        st.title("🎮 Games UI")
+    with b:
+        with st.expander("Compte", expanded=True):
+            if st.session_state.token:
+                st.write(f"Connecté en tant que **{st.session_state.username}**")
+                if st.button("Se déconnecter"):
+                    st.session_state.token = ""
+                    st.session_state.username = ""
+                    st.rerun()
+            else:
+                st.caption("Non connecté")
 
-# =======================
-# Layout principal
-# =======================
-with st.sidebar:
-    st.markdown("### Configuration")
-    st.text_input("API_URL", value=API_URL, key="cfg_api_url", help="Ex: http://localhost:8000")
-    st.text_input("PROMETHEUS_URL", value=PROMETHEUS_URL, key="cfg_prom_url", help="Ex: http://localhost:9090")
-    st.caption("Modifiez les variables d’environnement pour persister ces URLs.")
-
-st.title("🎮 Games — Recherche, Recos & Observabilité")
-
-# Auth
-login_box()
-
-# Si non authentifié, arrêter ici (les endpoints /games/* et /recommend/* requièrent le token)
-if not st.session_state.get("token"):
+# Exige une session authentifiée
+if not st.session_state.token:
+    login_box(suffix="main")
     st.stop()
 
-# Tabs
-tab_search, tab_recos, tab_obs = st.tabs(["Recherche", "Recommandations", "Observabilité"])
+# =========================
+# Navigation (2 sections)
+# =========================
+nav_order = ["Search", "AI Recos"]
+nav_idx = nav_order.index(st.session_state.active_tab) if st.session_state.active_tab in nav_order else 0
+active = st.radio("Navigation", nav_order, index=nav_idx, horizontal=True)
+st.session_state.active_tab = active
 
-with tab_search:
-    ui_games_search()
+# =========
+# SEARCH
+# =========
+if st.session_state.active_tab == "Search":
+    st.markdown("### Search games by title ↪")
+    q = st.text_input("Title contains…", key="q_search", placeholder="ex: mario, battle royal…")
+    if st.button("Search", key="btn_search"):
+        if not q.strip():
+            st.warning("Saisissez un texte de recherche.")
+        else:
+            # L’API accepte /games/by-title/{title} ET /games/title/{title}
+            code, payload = api_get(f"/games/by-title/{quote(q.strip())}")
+            if handle_401(code, payload):
+                st.stop()
+            if code == 200:
+                games = payload.get("games", [])
+                if not games:
+                    st.info("Aucun résultat.")
+                else:
+                    for i, g in enumerate(games):
+                        game_card(g, i)
+            elif show_not_found(code, payload, "Aucun résultat."):
+                pass
+            else:
+                st.error(payload.get("detail", payload))
 
-with tab_recos:
-    ui_recommendations()
+# =========
+# AI RECOS
+# =========
+else:
+    st.markdown("### Recommendations")
+    s1, s2 = st.tabs(["By title", "By genre"])
 
-with tab_obs:
-    ui_observability()
+    # --- by title ---
+    with s1:
+        ti = st.text_input("Title", key="q_reco_title", placeholder="ex: The Witcher 3")
+        k1 = st.number_input("Top-N", value=5, min_value=1, max_value=20, step=1, key="k_title")
+        if st.button("Get recommendations (title)", key="btn_recos_title"):
+            if not ti.strip():
+                st.warning("Saisissez un titre.")
+            else:
+                code, payload = api_get(f"/recommend/by-title/{quote(ti.strip())}", params={"k": int(k1)})
+                if handle_401(code, payload):
+                    st.stop()
+                if code == 200:
+                    recs = payload.get("recommendations", [])
+                    st.dataframe(pd.DataFrame(recs), use_container_width=True, hide_index=True)
+                elif show_not_found(code, payload, "Aucune reco."):
+                    pass
+                else:
+                    st.error(payload.get("detail", payload))
 
-# (Option) Auto-refresh Observabilité — simple bouton
-with tab_obs:
-    colr1, colr2 = st.columns([1, 9])
-    if colr1.button("🔄 Rafraîchir les métriques", key="btn_refresh_metrics"):
-        # Invalider le cache Prometheus et relancer le rendering
-        prom_instant_query.clear()
-        prom_active_alerts.clear()
-        time.sleep(0.2)
-        st.experimental_rerun()
+    # --- by genre ---
+    with s2:
+        ge = st.text_input("Genre", key="q_reco_genre", placeholder="ex: Action, RPG…")
+        k2 = st.number_input("Top-N ", value=5, min_value=1, max_value=20, step=1, key="k_genre")
+        if st.button("Get recommendations (genre)", key="btn_recos_genre"):
+            if not ge.strip():
+                st.warning("Saisissez un genre.")
+            else:
+                code, payload = api_get(f"/recommend/by-genre/{quote(ge.strip())}", params={"k": int(k2)})
+                if handle_401(code, payload):
+                    st.stop()
+                if code == 200:
+                    recs = payload.get("recommendations", [])
+                    st.dataframe(pd.DataFrame(recs), use_container_width=True, hide_index=True)
+                elif show_not_found(code, payload, "Aucune reco."):
+                    pass
+                else:
+                    st.error(payload.get("detail", payload))
