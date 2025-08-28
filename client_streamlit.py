@@ -16,7 +16,6 @@ st.set_page_config(page_title="Games UI", page_icon="🎮", layout="wide")
 
 # ---- Defaults / candidates (tu peux en ajouter) ----
 DEFAULT_API_CANDIDATES = [
-    # Ajoute ici tes services Render valides
     "https://game-app-y8be.onrender.com",
     "https://game-app1.onrender.com",
 ]
@@ -29,10 +28,8 @@ def _secrets_get(key: str, default: str = "") -> str:
         return default
 
 def _resolve_api_base() -> str:
-    # 1) session override
     if st.session_state.get("api_base"):
         return st.session_state["api_base"].rstrip("/")
-    # 2) secrets/env
     base = (
         _secrets_get("API_BASE")
         or os.getenv("API_BASE")
@@ -41,7 +38,6 @@ def _resolve_api_base() -> str:
     ).strip()
     if base:
         return base.rstrip("/")
-    # 3) fallback candidats
     return DEFAULT_API_CANDIDATES[0]
 
 def _resolve_api_prefix() -> str:
@@ -60,13 +56,20 @@ def _resolve_token_path_override() -> str:
         return ""
     return p if p.startswith("/") else ("/" + p)
 
+# --- helper rerun (compat toutes versions Streamlit) ---
+def _rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+
 # Initial session
 st.session_state.setdefault("token", "")
 st.session_state.setdefault("username", "")
 st.session_state.setdefault("active_tab", "Search")
 st.session_state.setdefault("login_drawn_this_run", False)
 
-# API target in session (can be edited from UI)
+# API target in session (modifiable depuis l’UI)
 st.session_state.setdefault("api_base", _resolve_api_base())
 st.session_state.setdefault("api_prefix", _resolve_api_prefix())
 st.session_state.setdefault("token_path_override", _resolve_token_path_override())
@@ -140,9 +143,6 @@ def _to_relative(p: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def discover_token_path_for(base: str, pref: str) -> str:
-    """
-    Essaie de lire le tokenUrl de l'OpenAPI pour une base donnée.
-    """
     candidate_specs = [
         f"{base.rstrip('/')}{pref}/openapi.json",
         f"{base.rstrip('/')}/openapi.json",
@@ -201,7 +201,6 @@ def login_box(suffix: str = "main"):
     if not sub:
         return
 
-    # Token path discovery (or override)
     token_path = TOKEN_PATH_OVERRIDE() or st.session_state.get("discovered_token_path")
     if not token_path:
         token_path = discover_token_path_for(API_BASE(), API_PREFIX())
@@ -235,7 +234,7 @@ def login_box(suffix: str = "main"):
             st.session_state.token = payload["access_token"]
             st.session_state.username = u
             st.success(f"Authentifié ✅ (via {path})")
-            st.rerun()
+            _rerun()
             return
         if code == 404:
             continue
@@ -328,17 +327,14 @@ def game_card(g: dict, idx: int):
         st.markdown(f"### {nice_game_title(g)}")
         c1, c2 = st.columns([2, 2])
 
-        # Genres
         with c1:
             genres = g.get("genres", "")
             if genres:
                 st.caption(genres)
 
-        # Identité
         title = (g.get("title") or g.get("name") or "").strip()
         gid   = g.get("id") or g.get("game_id_rawg")
 
-        # Prix
         prices_endpoint = f"/games/title/{quote(title)}/prices" if title else (f"/games/{gid}/prices" if gid else None)
         min_price_text = min_price_shop = None
         if prices_endpoint:
@@ -349,7 +345,6 @@ def game_card(g: dict, idx: int):
                 if mp:
                     min_price_text, min_price_shop = mp
 
-        # Plateformes
         plats_endpoint = f"/games/by-title/{quote(title)}/platforms" if title else (f"/games/{gid}/platforms" if gid else None)
         plats = []
         if plats_endpoint:
@@ -376,20 +371,29 @@ with st.container():
         st.title("🎮 Games UI")
     with b:
         with st.expander("⚙️ API config", expanded=False):
-            api_base_in = st.text_input("API_BASE", API_BASE(), placeholder="https://<ton-service>.onrender.com")
+            api_base_in = st.text_input(
+                "API_BASE",
+                API_BASE(),
+                placeholder="https://<ton-service>.onrender.com",
+            )
             api_prefix_in = st.text_input("API_PREFIX (optionnel)", API_PREFIX())
             token_path_in = st.text_input("TOKEN_PATH forcé (optionnel)", TOKEN_PATH_OVERRIDE())
 
-            if st.button("💾 Enregistrer"):
-    st.session_state["api_base"] = api_base_in.rstrip("/")
-    st.session_state["api_prefix"] = api_prefix_in
-    st.session_state["token_path_override"] = token_path_in
-    st.session_state["discovered_token_path"] = ""  # reset
-    st.success("Paramètres API enregistrés. Rechargement…")
-    st.rerun()   # <- au lieu de st.experimental_rerun()
+            col1, col2 = st.columns(2)
+            with col1:
+                save_clicked = st.button("💾 Enregistrer")
+            with col2:
+                test_clicked = st.button("🔎 Tester l'API")
 
+            if save_clicked:
+                st.session_state["api_base"] = api_base_in.rstrip("/")
+                st.session_state["api_prefix"] = api_prefix_in
+                st.session_state["token_path_override"] = token_path_in
+                st.session_state["discovered_token_path"] = ""  # reset
+                st.success("Paramètres API enregistrés. Rechargement…")
+                _rerun()
 
-            if st.button("🔎 Tester l'API"):
+            if test_clicked:
                 url = build_url("/__paths")
                 try:
                     r = _session.get(url, timeout=10)
@@ -407,7 +411,7 @@ with st.container():
                 if st.button("Se déconnecter"):
                     st.session_state.token = ""
                     st.session_state.username = ""
-                    st.rerun()
+                    _rerun()
             else:
                 st.caption("Non connecté")
 
