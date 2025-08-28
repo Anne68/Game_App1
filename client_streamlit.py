@@ -14,34 +14,79 @@ import streamlit as st
 # =======================
 st.set_page_config(page_title="Games UI", page_icon="🎮", layout="wide")
 
+# ---- Defaults / candidates (tu peux en ajouter) ----
+DEFAULT_API_CANDIDATES = [
+    # Ajoute ici tes services Render valides
+    "https://game-app-y8be.onrender.com",
+    "https://game-app1.onrender.com",
+]
+
+def _secrets_get(key: str, default: str = "") -> str:
+    try:
+        val = st.secrets.get(key, default)
+        return str(val) if val is not None else default
+    except Exception:
+        return default
+
 def _resolve_api_base() -> str:
-    return (
-        st.secrets.get("API_BASE", None)
+    # 1) session override
+    if st.session_state.get("api_base"):
+        return st.session_state["api_base"].rstrip("/")
+    # 2) secrets/env
+    base = (
+        _secrets_get("API_BASE")
         or os.getenv("API_BASE")
         or os.getenv("API_URL")
-        or "https://game-app1.onrender.com"
-    ).rstrip("/")
+        or ""
+    ).strip()
+    if base:
+        return base.rstrip("/")
+    # 3) fallback candidats
+    return DEFAULT_API_CANDIDATES[0]
 
-API_BASE = _resolve_api_base()
+def _resolve_api_prefix() -> str:
+    if st.session_state.get("api_prefix") is not None:
+        return st.session_state["api_prefix"]
+    pref = (_secrets_get("API_PREFIX") or os.getenv("API_PREFIX", "") or "").strip()
+    if pref in ["/", "."]:
+        return ""
+    return ("/" + pref.strip("/")) if pref else ""
 
-# Préfixe optionnel si l’API est servie sous /api (ou autre)
-API_PREFIX = (st.secrets.get("API_PREFIX", os.getenv("API_PREFIX", "")) or "").strip()
-API_PREFIX = "" if API_PREFIX in ["/", "."] else API_PREFIX
-API_PREFIX = ("/" + API_PREFIX.strip("/")) if API_PREFIX else ""
+def _resolve_token_path_override() -> str:
+    if st.session_state.get("token_path_override") is not None:
+        return st.session_state["token_path_override"]
+    p = (_secrets_get("TOKEN_PATH") or os.getenv("TOKEN_PATH", "") or "").strip()
+    if not p:
+        return ""
+    return p if p.startswith("/") else ("/" + p)
 
-# Forcer un chemin token si besoin
-TOKEN_PATH_OVERRIDE = (st.secrets.get("TOKEN_PATH", os.getenv("TOKEN_PATH", "")) or "").strip()
-
-def build_url(path: str) -> str:
-    path = path if path.startswith("/") else ("/" + path)
-    return f"{API_BASE}{API_PREFIX}{path}"
-
-# Auth/session
+# Initial session
 st.session_state.setdefault("token", "")
 st.session_state.setdefault("username", "")
 st.session_state.setdefault("active_tab", "Search")
-st.session_state.setdefault("token_path", "")
-st.session_state["login_drawn_this_run"] = False
+st.session_state.setdefault("login_drawn_this_run", False)
+
+# API target in session (can be edited from UI)
+st.session_state.setdefault("api_base", _resolve_api_base())
+st.session_state.setdefault("api_prefix", _resolve_api_prefix())
+st.session_state.setdefault("token_path_override", _resolve_token_path_override())
+st.session_state.setdefault("discovered_token_path", "")
+
+def API_BASE() -> str:
+    return (st.session_state.get("api_base") or _resolve_api_base()).rstrip("/")
+
+def API_PREFIX() -> str:
+    pref = st.session_state.get("api_prefix") or ""
+    if pref in ["/", "."]:
+        return ""
+    return ("/" + pref.strip("/")) if pref else ""
+
+def TOKEN_PATH_OVERRIDE() -> str:
+    return st.session_state.get("token_path_override") or ""
+
+def build_url(path: str) -> str:
+    path = path if path.startswith("/") else ("/" + path)
+    return f"{API_BASE()}{API_PREFIX()}{path}"
 
 # HTTP session
 _session = requests.Session()
@@ -84,7 +129,7 @@ def api_post_form(path: str, form: dict):
         return 599, {"detail": f"{e} (POST {url})"}
 
 # ==============
-# Login helpers
+# Discovery
 # ==============
 def _to_relative(p: str) -> str:
     if not p:
@@ -94,9 +139,15 @@ def _to_relative(p: str) -> str:
     return p if p.startswith("/") else ("/" + p)
 
 @st.cache_data(show_spinner=False)
-def discover_token_path() -> str:
-    # Essaie d'abord l’OpenAPI local (avec/ sans préfixe)
-    for spec_url in [build_url("/openapi.json"), f"{API_BASE}/openapi.json"]:
+def discover_token_path_for(base: str, pref: str) -> str:
+    """
+    Essaie de lire le tokenUrl de l'OpenAPI pour une base donnée.
+    """
+    candidate_specs = [
+        f"{base.rstrip('/')}{pref}/openapi.json",
+        f"{base.rstrip('/')}/openapi.json",
+    ]
+    for spec_url in candidate_specs:
         try:
             r = _session.get(spec_url, headers={"Accept": "application/json"}, timeout=10)
             if r.status_code != 200:
@@ -114,6 +165,9 @@ def discover_token_path() -> str:
             pass
     return "/token"
 
+# ==============
+# Auth helpers
+# ==============
 def handle_401(code: int, payload: dict) -> bool:
     if code == 401:
         st.warning("🔒 Session expirée. Veuillez vous reconnecter.")
@@ -138,7 +192,7 @@ def login_box(suffix: str = "main"):
     st.session_state["login_drawn_this_run"] = True
 
     st.subheader("Auth")
-    st.caption(f"API: {API_BASE}{API_PREFIX or ''}")
+    st.caption(f"API: {API_BASE()}{API_PREFIX() or ''}")
     with st.form(f"login_form_{suffix}", clear_on_submit=False):
         u = st.text_input("Username", key=f"login_u_{suffix}")
         p = st.text_input("Password", type="password", key=f"login_p_{suffix}")
@@ -147,17 +201,17 @@ def login_box(suffix: str = "main"):
     if not sub:
         return
 
+    # Token path discovery (or override)
+    token_path = TOKEN_PATH_OVERRIDE() or st.session_state.get("discovered_token_path")
+    if not token_path:
+        token_path = discover_token_path_for(API_BASE(), API_PREFIX())
+        st.session_state["discovered_token_path"] = token_path
+
     candidates: list[str] = []
-    if TOKEN_PATH_OVERRIDE:
-        manual = TOKEN_PATH_OVERRIDE if TOKEN_PATH_OVERRIDE.startswith("/") else ("/" + TOKEN_PATH_OVERRIDE)
-        candidates.append(manual)
-
-    if not st.session_state.token_path:
-        st.session_state.token_path = discover_token_path()
-
-    # Essais multi-chemins
+    if TOKEN_PATH_OVERRIDE():
+        candidates.append(TOKEN_PATH_OVERRIDE())
     candidates += [
-        st.session_state.token_path,
+        token_path or "/token",
         "/token",
         "/api/token",
         "/auth/token",
@@ -168,27 +222,30 @@ def login_box(suffix: str = "main"):
     seen = set()
     tried_msgs = []
     for path in candidates:
+        if not path:
+            continue
         if path in seen:
             continue
         seen.add(path)
+        if not path.startswith("/"):
+            path = "/" + path
         code, payload = api_post_form(path, {"username": u, "password": p})
         tried_msgs.append(f"{build_url(path)} → {code}")
         if code == 200 and "access_token" in payload:
             st.session_state.token = payload["access_token"]
             st.session_state.username = u
-            st.session_state.token_path = path
             st.success(f"Authentifié ✅ (via {path})")
             st.rerun()
             return
         if code == 404:
-            continue  # on tente l’alias suivant
+            continue
         st.error(f"{payload.get('detail', payload)} (status {code}, URL {build_url(path)})")
         return
 
     st.error(
         "Endpoint token introuvable. "
         + " — ".join(tried_msgs)
-        + "\n➡ Vérifie API_PREFIX ou définis TOKEN_PATH (ex: '/auth/token')."
+        + "\n➡ Vérifie API_BASE/API_PREFIX ou définis TOKEN_PATH (ex: '/auth/token')."
     )
 
 # =================
@@ -311,13 +368,38 @@ def game_card(g: dict, idx: int):
             platform_pills(plats)
 
 # =========
-# Header
+# Header + API config
 # =========
 with st.container():
     a, b = st.columns([1, 1])
     with a:
         st.title("🎮 Games UI")
     with b:
+        with st.expander("⚙️ API config", expanded=False):
+            api_base_in = st.text_input("API_BASE", API_BASE(), placeholder="https://<ton-service>.onrender.com")
+            api_prefix_in = st.text_input("API_PREFIX (optionnel)", API_PREFIX())
+            token_path_in = st.text_input("TOKEN_PATH forcé (optionnel)", TOKEN_PATH_OVERRIDE())
+
+            if st.button("💾 Enregistrer"):
+                st.session_state["api_base"] = api_base_in.rstrip("/")
+                st.session_state["api_prefix"] = api_prefix_in
+                st.session_state["token_path_override"] = token_path_in
+                st.session_state["discovered_token_path"] = ""  # reset
+                st.success("Paramètres API enregistrés. Rechargement…")
+                st.experimental_rerun()
+
+            if st.button("🔎 Tester l'API"):
+                url = build_url("/__paths")
+                try:
+                    r = _session.get(url, timeout=10)
+                    st.write(f"GET {url} → {r.status_code}")
+                    try:
+                        st.json(r.json())
+                    except Exception:
+                        st.code(r.text)
+                except Exception as e:
+                    st.error(str(e))
+
         with st.expander("Compte", expanded=True):
             if st.session_state.token:
                 st.write(f"Connecté en tant que **{st.session_state.username}**")
