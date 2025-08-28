@@ -1,4 +1,4 @@
-# client_streamlit.py (Search + AI Recos seulement)
+# client_streamlit.py (Search + AI Recos seulement) — version corrigée
 from __future__ import annotations
 
 import os
@@ -14,7 +14,6 @@ import streamlit as st
 # =======================
 st.set_page_config(page_title="Games UI", page_icon="🎮", layout="wide")
 
-# ---- Defaults / candidates (tu peux en ajouter) ----
 DEFAULT_API_CANDIDATES = [
     "https://game-app-y8be.onrender.com",
     "https://game-app1.onrender.com",
@@ -28,48 +27,47 @@ def _secrets_get(key: str, default: str = "") -> str:
         return default
 
 def _resolve_api_base() -> str:
-    if st.session_state.get("api_base"):
-        return st.session_state["api_base"].rstrip("/")
     base = (
-        _secrets_get("API_BASE")
+        st.session_state.get("api_base")
+        or _secrets_get("API_BASE")
         or os.getenv("API_BASE")
         or os.getenv("API_URL")
-        or ""
-    ).strip()
-    if base:
-        return base.rstrip("/")
-    return DEFAULT_API_CANDIDATES[0]
+        or DEFAULT_API_CANDIDATES[0]
+    )
+    return str(base).rstrip("/")
 
 def _resolve_api_prefix() -> str:
-    if st.session_state.get("api_prefix") is not None:
-        return st.session_state["api_prefix"]
-    pref = (_secrets_get("API_PREFIX") or os.getenv("API_PREFIX", "") or "").strip()
+    pref = (
+        st.session_state.get("api_prefix")
+        or _secrets_get("API_PREFIX")
+        or os.getenv("API_PREFIX", "")
+        or ""
+    ).strip()
     if pref in ["/", "."]:
         return ""
     return ("/" + pref.strip("/")) if pref else ""
 
 def _resolve_token_path_override() -> str:
-    if st.session_state.get("token_path_override") is not None:
-        return st.session_state["token_path_override"]
-    p = (_secrets_get("TOKEN_PATH") or os.getenv("TOKEN_PATH", "") or "").strip()
+    p = (
+        st.session_state.get("token_path_override")
+        or _secrets_get("TOKEN_PATH")
+        or os.getenv("TOKEN_PATH", "")
+        or ""
+    ).strip()
     if not p:
         return ""
     return p if p.startswith("/") else ("/" + p)
 
-# --- helper rerun (compat toutes versions Streamlit) ---
 def _rerun():
     if hasattr(st, "rerun"):
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
 
-# Initial session
+# Session defaults
 st.session_state.setdefault("token", "")
 st.session_state.setdefault("username", "")
 st.session_state.setdefault("active_tab", "Search")
-st.session_state.setdefault("login_drawn_this_run", False)
-
-# API target in session (modifiable depuis l’UI)
 st.session_state.setdefault("api_base", _resolve_api_base())
 st.session_state.setdefault("api_prefix", _resolve_api_prefix())
 st.session_state.setdefault("token_path_override", _resolve_token_path_override())
@@ -172,7 +170,6 @@ def handle_401(code: int, payload: dict) -> bool:
     if code == 401:
         st.warning("🔒 Session expirée. Veuillez vous reconnecter.")
         st.session_state.token = ""
-        st.session_state["login_drawn_this_run"] = False
         login_box(suffix="401")
         return True
     return False
@@ -184,13 +181,9 @@ def show_not_found(code: int, payload: dict, fallback_msg: str) -> bool:
     return False
 
 # ==========
-# Auth UI
+# Auth UI (sans flag bloquant)
 # ==========
 def login_box(suffix: str = "main"):
-    if st.session_state.get("login_drawn_this_run", False):
-        return
-    st.session_state["login_drawn_this_run"] = True
-
     st.subheader("Auth")
     st.caption(f"API: {API_BASE()}{API_PREFIX() or ''}")
     with st.form(f"login_form_{suffix}", clear_on_submit=False):
@@ -221,9 +214,7 @@ def login_box(suffix: str = "main"):
     seen = set()
     tried_msgs = []
     for path in candidates:
-        if not path:
-            continue
-        if path in seen:
+        if not path or path in seen:
             continue
         seen.add(path)
         if not path.startswith("/"):
@@ -363,7 +354,7 @@ def game_card(g: dict, idx: int):
             platform_pills(plats)
 
 # =========
-# Header + API config
+# Header + API config + Compte
 # =========
 with st.container():
     a, b = st.columns([1, 1])
@@ -371,11 +362,7 @@ with st.container():
         st.title("🎮 Games UI")
     with b:
         with st.expander("⚙️ API config", expanded=False):
-            api_base_in = st.text_input(
-                "API_BASE",
-                API_BASE(),
-                placeholder="https://<ton-service>.onrender.com",
-            )
+            api_base_in = st.text_input("API_BASE", API_BASE(), placeholder="https://<ton-service>.onrender.com")
             api_prefix_in = st.text_input("API_PREFIX (optionnel)", API_PREFIX())
             token_path_in = st.text_input("TOKEN_PATH forcé (optionnel)", TOKEN_PATH_OVERRIDE())
 
@@ -389,7 +376,7 @@ with st.container():
                 st.session_state["api_base"] = api_base_in.rstrip("/")
                 st.session_state["api_prefix"] = api_prefix_in
                 st.session_state["token_path_override"] = token_path_in
-                st.session_state["discovered_token_path"] = ""  # reset
+                st.session_state["discovered_token_path"] = ""
                 st.success("Paramètres API enregistrés. Rechargement…")
                 _rerun()
 
@@ -415,7 +402,7 @@ with st.container():
             else:
                 st.caption("Non connecté")
 
-# Exige une session authentifiée
+# ======== Auth obligatoire
 if not st.session_state.token:
     login_box(suffix="main")
     st.stop()
