@@ -24,12 +24,12 @@ def _resolve_api_base() -> str:
 
 API_BASE = _resolve_api_base()
 
-# Préfixe optionnel si l’API est sous /api
+# Préfixe optionnel si l’API est servie sous /api (ou autre)
 API_PREFIX = (st.secrets.get("API_PREFIX", os.getenv("API_PREFIX", "")) or "").strip()
 API_PREFIX = "" if API_PREFIX in ["/", "."] else API_PREFIX
 API_PREFIX = ("/" + API_PREFIX.strip("/")) if API_PREFIX else ""
 
-# Override manuel possible du chemin token (ex: "/auth/token")
+# Forcer un chemin token si besoin
 TOKEN_PATH_OVERRIDE = (st.secrets.get("TOKEN_PATH", os.getenv("TOKEN_PATH", "")) or "").strip()
 
 def build_url(path: str) -> str:
@@ -40,7 +40,7 @@ def build_url(path: str) -> str:
 st.session_state.setdefault("token", "")
 st.session_state.setdefault("username", "")
 st.session_state.setdefault("active_tab", "Search")
-st.session_state.setdefault("token_path", "")  # mémorise l'endpoint correct
+st.session_state.setdefault("token_path", "")
 st.session_state["login_drawn_this_run"] = False
 
 # HTTP session
@@ -83,7 +83,9 @@ def api_post_form(path: str, form: dict):
     except Exception as e:
         return 599, {"detail": f"{e} (POST {url})"}
 
-# -------- Découverte du chemin /token via OpenAPI --------
+# ==============
+# Login helpers
+# ==============
 def _to_relative(p: str) -> str:
     if not p:
         return "/token"
@@ -93,6 +95,7 @@ def _to_relative(p: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def discover_token_path() -> str:
+    # Essaie d'abord l’OpenAPI local (avec/ sans préfixe)
     for spec_url in [build_url("/openapi.json"), f"{API_BASE}/openapi.json"]:
         try:
             r = _session.get(spec_url, headers={"Accept": "application/json"}, timeout=10)
@@ -111,9 +114,6 @@ def discover_token_path() -> str:
             pass
     return "/token"
 
-# ==========
-# Helpers UI
-# ==========
 def handle_401(code: int, payload: dict) -> bool:
     if code == 401:
         st.warning("🔒 Session expirée. Veuillez vous reconnecter.")
@@ -147,17 +147,15 @@ def login_box(suffix: str = "main"):
     if not sub:
         return
 
-    # 0) override manuel prioritaire
     candidates: list[str] = []
     if TOKEN_PATH_OVERRIDE:
         manual = TOKEN_PATH_OVERRIDE if TOKEN_PATH_OVERRIDE.startswith("/") else ("/" + TOKEN_PATH_OVERRIDE)
         candidates.append(manual)
 
-    # 1) découvre via OpenAPI
     if not st.session_state.token_path:
         st.session_state.token_path = discover_token_path()
 
-    # 2) chemins à essayer
+    # Essais multi-chemins
     candidates += [
         st.session_state.token_path,
         "/token",
@@ -183,12 +181,15 @@ def login_box(suffix: str = "main"):
             st.rerun()
             return
         if code == 404:
-            continue
+            continue  # on tente l’alias suivant
         st.error(f"{payload.get('detail', payload)} (status {code}, URL {build_url(path)})")
         return
 
-    st.error("Endpoint token introuvable.\n" + "\n".join(tried_msgs) +
-             "\n➡ Vérifie API_PREFIX ou définis TOKEN_PATH (ex: '/auth/token').")
+    st.error(
+        "Endpoint token introuvable. "
+        + " — ".join(tried_msgs)
+        + "\n➡ Vérifie API_PREFIX ou définis TOKEN_PATH (ex: '/auth/token')."
+    )
 
 # =================
 # UI helper blocks
@@ -270,15 +271,17 @@ def game_card(g: dict, idx: int):
         st.markdown(f"### {nice_game_title(g)}")
         c1, c2 = st.columns([2, 2])
 
+        # Genres
         with c1:
             genres = g.get("genres", "")
             if genres:
                 st.caption(genres)
 
+        # Identité
         title = (g.get("title") or g.get("name") or "").strip()
         gid   = g.get("id") or g.get("game_id_rawg")
 
-        # Prix (mini)
+        # Prix
         prices_endpoint = f"/games/title/{quote(title)}/prices" if title else (f"/games/{gid}/prices" if gid else None)
         min_price_text = min_price_shop = None
         if prices_endpoint:
@@ -305,7 +308,6 @@ def game_card(g: dict, idx: int):
                     st.markdown(f"**💶 From {min_price_text}**")
             else:
                 st.caption("💶 Prix indisponibles")
-
             platform_pills(plats)
 
 # =========
