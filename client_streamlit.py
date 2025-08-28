@@ -51,20 +51,29 @@ def _headers() -> dict:
         h["Authorization"] = f"Bearer {st.session_state.token}"
     return h
 
+def _parse_json_or_text(r):
+    try:
+        return r.json()
+    except Exception:
+        txt = (r.text or "").strip()
+        return {"detail": txt if txt else f"HTTP {r.status_code}"}
+
 def api_get(path: str, params: dict | None = None):
     try:
         r = _session.get(API_URL + path, headers=_headers(), params=params, timeout=30)
-        data = r.json() if r.content else {}
-        return r.status_code, data
+        return r.status_code, _parse_json_or_text(r)
     except Exception as e:
         return 599, {"detail": str(e)}
 
 def api_post_form(path: str, form: dict):
-    # /token attend x-www-form-urlencoded -> data= (pas json=)
     try:
-        r = _session.post(API_URL + path, headers=_headers(), data=form, timeout=30)
-        data = r.json() if r.content else {}
-        return r.status_code, data
+        r = _session.post(
+            API_URL + path,
+            headers={**_headers(), "Content-Type": "application/x-www-form-urlencoded"},
+            data=form,
+            timeout=30,
+        )
+        return r.status_code, _parse_json_or_text(r)
     except Exception as e:
         return 599, {"detail": str(e)}
 
