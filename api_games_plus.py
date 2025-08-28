@@ -18,13 +18,11 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-
+# Reco
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from settings import get_settings
-
-
 
 
 # ========= App & config =========
@@ -32,7 +30,7 @@ settings = get_settings()
 app = FastAPI(
     title="Games API (C9→C13)",
     description="API sécurisée avec monitoring, modèle de reco, tests et CI/CD",
-    version="1.2.2",
+    version="1.2.0",
 )
 
 # CORS
@@ -64,32 +62,15 @@ SECRET_KEY = settings.SECRET_KEY
 ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
 
-def _normalize_db_user(u: str) -> str:
-    """
-    Alwaysdata fournit parfois un user du type 'anne@2a00:...' ; MySQL attend juste 'anne'.
-    """
-    if "@" in u:
-        right = u.split("@", 1)[1]
-        if "." in right or ":" in right:
-            return u.split("@", 1)[0]
-    return u
-
-
 def connect_to_db():
-    # TLS si dispo (facultatif, suivant settings)
-    ssl_args = {}
-    if getattr(settings, "DB_SSL_CA", None):
-        ssl_args = {"ssl": {"ca": settings.DB_SSL_CA}}
-
     return pymysql.connect(
         host=settings.DB_HOST,
         port=settings.DB_PORT,
-        user=_normalize_db_user(settings.DB_USER),
+        user=settings.DB_USER,
         password=settings.DB_PASSWORD,
         database=settings.DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
-        **ssl_args,
     )
 
 
@@ -322,12 +303,6 @@ def _ensure_reco_model():
             tfidf_matrix = None
 
 
-# ========= Petit debug pour voir les routes exposées =========
-@app.get("/__paths", tags=["system"])
-def list_paths():
-    return {"paths": sorted({getattr(r, "path", "") for r in app.routes if getattr(r, "path", "")})}
-
-
 # ========= Routes =========
 @app.get("/healthz", tags=["system"])
 def healthz():
@@ -353,29 +328,19 @@ def register(request: Request, username: str = Form(...), password: str = Form(.
                     (username, pwd_context.hash(password)),
                 )
         return {"message": f"Utilisateur '{username}' créé"}
-    except Exception:
+    except Exception as e:
         logger.exception("register failed")
         raise HTTPException(status_code=500, detail="Erreur lors de la création")
 
 
-# ======= TOKEN (OAuth2) + alias — corrigé (pas d'OAuth2PasswordRequestForm) =======
 @app.post("/token", tags=["auth"])
 @limiter.limit("20/minute")
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
     user = get_user_from_db(username)
     if not user or not verify_password(password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Identifiants invalides")
-
     tok = create_access_token({"sub": user["username"]}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     return {"access_token": tok, "token_type": "bearer"}
-
-
-@app.post("/auth/token", tags=["auth"])
-@app.post("/login", tags=["auth"])
-@app.post("/login/access-token", tags=["auth"])
-@app.post("/api/token", tags=["auth"])
-def login_alias(request: Request, username: str = Form(...), password: str = Form(...)):
-    return login(request, username, password)
 
 
 @app.get("/", tags=["public"])
