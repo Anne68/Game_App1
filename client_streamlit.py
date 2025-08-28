@@ -14,34 +14,55 @@ import streamlit as st
 # =======================
 st.set_page_config(page_title="Games UI", page_icon="🎮", layout="wide")
 
-# URL de l'API : ENV d'abord, sinon défaut (réseau docker)
-API_URL = (os.getenv("API_URL") or "http://api:8000").rstrip("/")
+def _resolve_api_base() -> str:
+    """
+    Priorité :
+    1) st.secrets["API_BASE"] (Streamlit Cloud)
+    2) env API_BASE
+    3) env API_URL (compat)
+    4) fallback (modifie-le si besoin)
+    """
+    url = (
+        st.secrets.get("API_BASE", None)
+        or os.getenv("API_BASE")
+        or os.getenv("API_URL")
+        or "https://game-app1.onrender.com"   # <-- fallback prod ; mets localhost si dev
+    )
+    return url.rstrip("/")
+
+API_URL = _resolve_api_base()
 
 # Auth/session
 st.session_state.setdefault("token", "")
 st.session_state.setdefault("username", "")
 st.session_state["login_drawn_this_run"] = False  # reset each run
-
-# Navigation pilotable par état
 st.session_state.setdefault("active_tab", "Search")
+
+# HTTP session (garde le keep-alive & headers)
+_session = requests.Session()
+_BASE_HEADERS = {"Accept": "application/json"}
 
 # ==============
 # HTTP helpers
 # ==============
-def auth_headers() -> dict:
-    return {"Authorization": f"Bearer {st.session_state.token}"} if st.session_state.token else {}
+def _headers() -> dict:
+    h = dict(_BASE_HEADERS)
+    if st.session_state.token:
+        h["Authorization"] = f"Bearer {st.session_state.token}"
+    return h
 
 def api_get(path: str, params: dict | None = None):
     try:
-        r = requests.get(API_URL + path, headers=auth_headers(), params=params, timeout=30)
+        r = _session.get(API_URL + path, headers=_headers(), params=params, timeout=30)
         data = r.json() if r.content else {}
         return r.status_code, data
     except Exception as e:
         return 599, {"detail": str(e)}
 
 def api_post_form(path: str, form: dict):
+    # /token attend x-www-form-urlencoded -> data= (pas json=)
     try:
-        r = requests.post(API_URL + path, headers=auth_headers(), data=form, timeout=30)
+        r = _session.post(API_URL + path, headers=_headers(), data=form, timeout=30)
         data = r.json() if r.content else {}
         return r.status_code, data
     except Exception as e:
@@ -56,6 +77,7 @@ def login_box(suffix: str = "main"):
     st.session_state["login_drawn_this_run"] = True
 
     st.subheader("Auth")
+    st.caption(f"API: {API_URL}")
     with st.form(f"login_form_{suffix}", clear_on_submit=False):
         u = st.text_input("Username", key=f"login_u_{suffix}")
         p = st.text_input("Password", type="password", key=f"login_p_{suffix}")
@@ -168,8 +190,8 @@ def _extract_min_price(rows: list[dict]) -> tuple[str, str] | None:
 def game_card(g: dict, idx: int):
     """
     Carte jeu qui AFFICHE directement :
-      - prix mini (si dispo) via /games/title/{title}/prices (alias OK) ou /games/{id}/prices
-      - plateformes via /games/by-title/{title}/platforms (alias OK) ou /games/{id}/platforms
+      - prix mini via /games/title/{title}/prices ou /games/{id}/prices
+      - plateformes via /games/by-title/{title}/platforms ou /games/{id}/platforms
     """
     with st.container():
         st.markdown(f"### {nice_game_title(g)}")
@@ -186,12 +208,11 @@ def game_card(g: dict, idx: int):
         gid   = g.get("id") or g.get("game_id_rawg")
 
         # --- Prix (mini) ---
+        prices_endpoint = None
         if title:
             prices_endpoint = f"/games/title/{quote(title)}/prices"
         elif gid:
             prices_endpoint = f"/games/{gid}/prices"
-        else:
-            prices_endpoint = None
 
         min_price_text = None
         min_price_shop = None
@@ -205,12 +226,11 @@ def game_card(g: dict, idx: int):
                         min_price_text, min_price_shop = mp
 
         # --- Plateformes ---
+        plats_endpoint = None
         if title:
             plats_endpoint = f"/games/by-title/{quote(title)}/platforms"
         elif gid:
             plats_endpoint = f"/games/{gid}/platforms"
-        else:
-            plats_endpoint = None
 
         plats = []
         if plats_endpoint:
