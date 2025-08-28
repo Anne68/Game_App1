@@ -24,13 +24,15 @@ def _resolve_api_base() -> str:
 
 API_BASE = _resolve_api_base()
 
-# Préfixe optionnel si l’API est servie sous /api (ou autre)
+# Préfixe optionnel si l’API est sous /api
 API_PREFIX = (st.secrets.get("API_PREFIX", os.getenv("API_PREFIX", "")) or "").strip()
 API_PREFIX = "" if API_PREFIX in ["/", "."] else API_PREFIX
 API_PREFIX = ("/" + API_PREFIX.strip("/")) if API_PREFIX else ""
 
+# Override manuel possible du chemin du token (ex: "/auth/token")
+TOKEN_PATH_OVERRIDE = (st.secrets.get("TOKEN_PATH", os.getenv("TOKEN_PATH", "")) or "").strip()
+
 def build_url(path: str) -> str:
-    # path doit commencer par /
     path = path if path.startswith("/") else ("/" + path)
     return f"{API_BASE}{API_PREFIX}{path}"
 
@@ -81,7 +83,7 @@ def api_post_form(path: str, form: dict):
     except Exception as e:
         return 599, {"detail": f"{e} (POST {url})"}
 
-# -------- Discover /token path from OpenAPI --------
+# -------- Découverte du chemin /token via OpenAPI --------
 def _to_relative(p: str) -> str:
     if not p:
         return "/token"
@@ -91,7 +93,7 @@ def _to_relative(p: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def discover_token_path() -> str:
-    # Essaye d'abord /openapi.json avec API_PREFIX, puis sans
+    # OpenAPI avec/ sans API_PREFIX
     for spec_url in [build_url("/openapi.json"), f"{API_BASE}/openapi.json"]:
         try:
             r = _session.get(spec_url, headers={"Accept": "application/json"}, timeout=10)
@@ -108,7 +110,7 @@ def discover_token_path() -> str:
                     return token_url
         except Exception:
             pass
-    return "/token"  # défaut
+    return "/token"
 
 # ==========
 # Helpers UI
@@ -146,33 +148,42 @@ def login_box(suffix: str = "main"):
     if not sub:
         return
 
-    # 1) découvre le chemin depuis l'OpenAPI (cache)
+    # 0) si override manuel fourni, essaie d'abord celui-ci
+    candidates: list[str] = []
+    if TOKEN_PATH_OVERRIDE:
+        manual = TOKEN_PATH_OVERRIDE if TOKEN_PATH_OVERRIDE.startswith("/") else ("/" + TOKEN_PATH_OVERRIDE)
+        candidates.append(manual)
+
+    # 1) découvre via OpenAPI (cache)
     if not st.session_state.token_path:
         st.session_state.token_path = discover_token_path()
 
-    # 2) tente séquentiellement: chemin découvert -> /token -> /api/token
-    tried = []
-    for path in [st.session_state.token_path, "/token", "/api/token"]:
-        if path in tried:
+    # 2) construction de la liste d'essais
+    candidates += [st.session_state.token_path, "/token", "/api/token"]
+
+    seen = set()
+    tried_msgs = []
+    for path in candidates:
+        if path in seen:
             continue
-        tried.append(path)
+        seen.add(path)
         code, payload = api_post_form(path, {"username": u, "password": p})
+        tried_msgs.append(f"{build_url(path)} → {code}")
         if code == 200 and "access_token" in payload:
             st.session_state.token = payload["access_token"]
             st.session_state.username = u
-            st.session_state.token_path = path  # mémorise le bon endpoint
+            st.session_state.token_path = path
             st.success(f"Authentifié ✅ (via {path})")
             st.rerun()
             return
-        # 404 -> on essaie la suivante
         if code == 404:
             continue
-        # autre erreur -> affiche et arrête
+        # autre erreur : montrer le détail
         st.error(f"{payload.get('detail', payload)} (status {code}, URL {build_url(path)})")
         return
 
-    # si tout a échoué en 404
-    st.error(f"Endpoint token introuvable. Essayé: {', '.join(tried)}  — Vérifie le préfixe (API_PREFIX).")
+    st.error("Endpoint token introuvable.\n" + "\n".join(tried_msgs) + "\n"
+             "➡ Vérifie le préfixe (API_PREFIX) ou définis TOKEN_PATH (ex: '/auth/token').")
 
 # =================
 # UI helper blocks
