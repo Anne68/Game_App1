@@ -18,11 +18,23 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-# Reco
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from settings import get_settings
+
+# au top
+from fastapi import FastAPI, Depends
+from app.errors import http_exception_handler, validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.middleware.request_id import RequestIDMiddleware
+from app.middleware.metrics import RequestLatencyMiddleware, observe_recommendation
+from app.models import RecommendRequest, RecommendResponse, RecommendItem, GameOut, PriceOut
+from app.auth_refresh import router as refresh_router
+
 
 
 # ========= App & config =========
