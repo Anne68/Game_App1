@@ -1,0 +1,332 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION: 3.11
+
+jobs:
+  # ========= TESTS UNITAIRES =========
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.11]
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpassword
+          MYSQL_DATABASE: test_db
+          MYSQL_USER: testuser
+          MYSQL_PASSWORD: testpass
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements_api.txt
+        pip install pytest pytest-cov pytest-asyncio psutil
+    
+    - name: Wait for MySQL
+      run: |
+        while ! mysqladmin ping -h 127.0.0.1 -P 3306 -u root -prootpassword --silent; do
+          echo "Waiting for MySQL..."
+          sleep 2
+        done
+        echo "MySQL is ready!"
+    
+    - name: Setup test database
+      run: |
+        mysql -h 127.0.0.1 -P 3306 -u root -prootpassword -e "
+          CREATE DATABASE IF NOT EXISTS test_db;
+          GRANT ALL PRIVILEGES ON test_db.* TO 'testuser'@'%' IDENTIFIED BY 'testpass';
+          FLUSH PRIVILEGES;
+        "
+    
+    - name: Run unit tests
+      env:
+        DB_HOST: 127.0.0.1
+        DB_PORT: 3306
+        DB_USER: testuser
+        DB_PASSWORD: testpass
+        DB_NAME: test_db
+        SECRET_KEY: test-secret-key-for-ci
+        ALGORITHM: HS256
+        ACCESS_TOKEN_EXPIRE_MINUTES: 60
+        ALLOW_ORIGINS: "*"
+        LOG_LEVEL: INFO
+        DB_REQUIRED: false
+      run: |
+        python -m pytest test_api.py test_model.py -v --cov=. --cov-report=xml --cov-report=term-missing
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  # ========= TESTS D'INTÉGRATION =========
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpassword
+          MYSQL_DATABASE: test_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        pip install -r requirements_api.txt
+        pip install pytest pytest-asyncio psutil requests
+    
+    - name: Start API server
+      env:
+        DB_HOST: 127.0.0.1
+        DB_PORT: 3306
+        DB_USER: root
+        DB_PASSWORD: rootpassword
+        DB_NAME: test_db
+        SECRET_KEY: test-secret-key
+      run: |
+        uvicorn api_games_plus:app --host 0.0.0.0 --port 8000 &
+        sleep 10  # Attendre que l'API démarre
+        curl -f http://localhost:8000/healthz || exit 1
+    
+    - name: Run integration tests
+      run: |
+        python -m pytest test_integration.py -v
+    
+    - name: Run performance tests
+      run: |
+        python -m pytest test_performance.py -v -k "not sustained_load"
+
+  # ========= SÉCURITÉ =========
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install security tools
+      run: |
+        pip install bandit safety semgrep
+    
+    - name: Run Bandit security scan
+      run: |
+        bandit -r . -f json -o bandit-report.json
+        bandit -r . -f txt
+      continue-on-error: true
+    
+    - name: Run Safety check
+      run: |
+        safety check --json --output safety-report.json
+        safety check
+      continue-on-error: true
+    
+    - name: Run Semgrep
+      run: |
+        semgrep --config=auto . --json --output=semgrep-report.json
+        semgrep --config=auto .
+      continue-on-error: true
+    
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+          semgrep-report.json
+
+  # ========= QUALITÉ CODE =========
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install linting tools
+      run: |
+        pip install ruff black isort mypy
+        pip install -r requirements_api.txt
+    
+    - name: Run ruff
+      run: |
+        ruff check . --output-format=github
+    
+    - name: Run black
+      run: |
+        black --check --diff .
+    
+    - name: Run isort
+      run: |
+        isort --check-only --diff .
+    
+    - name: Run mypy
+      run: |
+        mypy . --ignore-missing-imports
+      continue-on-error: true
+
+  # ========= BUILD ET PUSH DOCKER =========
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, integration-tests, security, code-quality]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.DOCKER_USERNAME }}/games-api
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # ========= VALIDATION MODÈLE =========
+  model-validation:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        pip install -r requirements_api.txt
+    
+    - name: Validate model performance
+      env:
+        SECRET_KEY: test-key
+      run: |
+        python -c "
+        import sys
+        from model_manager import RecommendationModel
+        import json
+        
+        print('🤖 Testing model training and validation...')
+        
+        # Test données
+        games = [
+            {'id': i, 'title': f'Test Game {i}', 'genres': 'Action RPG', 
+             'rating': 4.0 + (i % 10) * 0.1, 'metacritic': 80 + (i % 20), 
+             'platforms': ['PC', 'PS4']}
+            for i in range(50)
+        ]
+        
+        model = RecommendationModel(model_version='ci-validation')
+        
+        # Test entraînement
+        print('Training model...')
+        result = model.train(games)
+        assert result['status'] == 'success', f'Training failed: {result}'
+        print(f'✅ Training successful: {result[\"games_count\"]} games, {result[\"feature_dim\"]} features')
+        
+        # Test prédictions
+        print('Testing predictions...')
+        queries = ['Action', 'RPG', 'Adventure']
+        for query in queries:
+            preds = model.predict(query, k=5)
+            assert len(preds) > 0, f'No predictions for query: {query}'
+            print(f'✅ Query \"{query}\": {len(preds)} recommendations')
+        
+        # Test métriques
+        metrics = model.get_metrics()
+        assert metrics['is_trained'] == True
+        assert metrics['games_count'] == 50
+        print(f'✅ Metrics validated: {metrics[\"total_predictions\"]} predictions made')
+        
+        print('🎉 Model validation completed successfully!')
+        "
+
+  # ========= DÉPLOIEMENT =========
+  deploy
