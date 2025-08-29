@@ -500,14 +500,40 @@ def check_drift(user: str = Depends(verify_token)):
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting Games API with ML...")
-    ensure_users_table()
-    logger.info("Users table ready")
+
+    # === DB init ===
+    try:
+        ensure_users_table()
+        logger.info("Users table ready")
+
+        # (optionnel) migre password_hash -> hashed_password si la colonne legacy existe
+        try:
+            if "migrate_legacy_passwords" in globals():
+                migrated = migrate_legacy_passwords()
+                if migrated:
+                    logger.info("Password migration: %d row(s) updated", migrated)
+                else:
+                    logger.info("Password migration: nothing to do")
+        except Exception as e:
+            logger.warning("Password migration skipped (error): %s", e)
+
+    except Exception as e:
+        logger.exception("Database initialization failed")
+        raise
+
+    # === ML model ===
     model = get_model()
-    if os.path.exists("model/recommendation_model.pkl"):
-        if model.load_model():
-            logger.info(f"Model {model.model_version} loaded successfully")
+    model_path = os.path.join("model", "recommendation_model.pkl")
+    try:
+        if os.path.exists(model_path):
+            if model.load_model():
+                logger.info("Model %s loaded successfully", getattr(model, "model_version", "unknown"))
+            else:
+                logger.warning("Saved model found at %s but load failed; will train on first request", model_path)
         else:
-            logger.warning("Failed to load saved model, will train on first request")
-    else:
-        logger.info("No saved model found, will train on first request")
-    logger.info(f"API startup complete. {len(GAMES)} games available.")
+            logger.info("No saved model found at %s; will train on first request", model_path)
+    except Exception as e:
+        logger.warning("Error while loading model: %s. Will train on first request.", e)
+
+    logger.info("API startup complete. %d games available.", len(GAMES))
+
