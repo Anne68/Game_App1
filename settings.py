@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Optional
-from pydantic import field_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,23 +12,24 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        case_sensitive=False,
     )
 
     # ========= Database =========
-    DB_HOST: str
+    DB_REQUIRED: bool = Field(default=False)  # si True: on exige la DB au démarrage
+    DB_HOST: Optional[str] = None
     DB_PORT: int = 3306
-    DB_USER: str
-    DB_PASSWORD: str
-    DB_NAME: str
+    DB_USER: Optional[str] = None
+    DB_PASSWORD: Optional[str] = None
+    DB_NAME: Optional[str] = None
     DB_SSL_CA: Optional[str] = None  # facultatif (TLS vérifié si fourni)
-    DB_REQUIRED: bool = False        # si True, on bloque le démarrage si DB KO
 
     # ========= API / CORS =========
     ALLOW_ORIGINS: str = "*"
     LOG_LEVEL: str = "INFO"
 
     # ========= Auth / JWT =========
-    SECRET_KEY: str
+    SECRET_KEY: str = Field(default="dev-secret-key")  # en prod: fournir via ENV
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
@@ -45,17 +46,9 @@ class Settings(BaseSettings):
     DEMO_USERNAME: str = "demo"
     DEMO_PASSWORD: str = "demo123!"
 
-    @field_validator("ALLOW_ORIGINS", mode="before")
-    @classmethod
-    def _normalize_origins(cls, v):
-        if v is None:
-            return "*"
-        if isinstance(v, (list, tuple)):
-            return ",".join(s.strip() for s in v if s and str(s).strip())
-        s = str(v)
-        parts = [p.strip() for p in s.split(",")]
-        parts = [p for p in parts if p]
-        return ",".join(parts) if parts else "*"
+    @property
+    def db_configured(self) -> bool:
+        return all([self.DB_HOST, self.DB_USER, self.DB_PASSWORD, self.DB_NAME])
 
 
 @lru_cache
