@@ -4,7 +4,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import field_validator, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     # ========= Database =========
     DB_HOST: str
-    DB_PORT: int = 3306            # AlwaysData par défaut (ton local Docker était 3307)
+    DB_PORT: int = 3306            # AlwaysData / MySQL par défaut
     DB_USER: str
     DB_PASSWORD: str
     DB_NAME: str
@@ -28,7 +28,9 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # ========= Auth / JWT =========
-    SECRET_KEY: str
+    # défaut de DEV pour éviter un crash si la variable d'env manque.
+    # En prod, définis toujours SECRET_KEY dans Render.
+    SECRET_KEY: str = Field(default="dev-secret-change-me")
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
