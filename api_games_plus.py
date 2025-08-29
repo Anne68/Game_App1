@@ -14,6 +14,8 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
+import pymysql
+from settings import get_settings
 
 # Import des modules ML
 from model_manager import get_model, RecommendationModel
@@ -57,8 +59,6 @@ class PredictionRequest(BaseModel):
     min_confidence: float = 0.1
 
 class ModelMetricsResponse(BaseModel):
-    model_config = {"protected_namespaces": ()}  # << ajoute cette ligne
-
     model_version: str
     is_trained: bool
     total_predictions: int
@@ -66,7 +66,6 @@ class ModelMetricsResponse(BaseModel):
     last_training: Optional[str]
     games_count: int
     feature_dimension: int
-
 
 # ========= Demo Data =========
 GAMES: List[Dict] = [
@@ -79,7 +78,50 @@ GAMES: List[Dict] = [
     {"id": 7, "title": "Disco Elysium", "genres": "RPG, Narrative", "rating": 4.7, "metacritic": 91, "platforms": ["PC", "PS4", "Xbox One"]},
 ]
 
+# Stockage users désormais en base MySQL (table `users`) via PyMySQL
 USERS: Dict[str, str] = {}
+
+settings = get_settings()
+
+def _get_db_conn():
+    """Retourne une connexion PyMySQL basée sur settings.py"""
+    ssl_params = {"ca": settings.DB_SSL_CA} if settings.DB_SSL_CA else None
+    return pymysql.connect(
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        user=settings.DB_USER,
+        password=settings.DB_PASSWORD,
+        database=settings.DB_NAME,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
+        ssl=ssl_params,
+    )
+
+def _init_users_table():
+    """Crée la table users si elle n'existe pas."""
+    ddl = (
+        "CREATE TABLE IF NOT EXISTS users ("
+        " id INT AUTO_INCREMENT PRIMARY KEY,"
+        " username VARCHAR(255) UNIQUE NOT NULL,"
+        " hashed_password VARCHAR(255) NOT NULL,"
+        " created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+    )
+    with _get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+
+def _get_user(username: str) -> Optional[Dict]:
+    with _get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, username, hashed_password FROM users WHERE username=%s", (username,))
+            return cur.fetchone()
+
+def _create_user(username: str, hashed_password: str) -> None:
+    with _get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO users (username, hashed_password) VALUES (%s, %s)", (username, hashed_password))
+
 
 # ========= Utils =========
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
@@ -314,15 +356,31 @@ def recommend_by_genre(
 # ========= Auth & Games =========
 @app.post("/register", tags=["auth"])
 def register(username: str = Form(...), password: str = Form(...)):
-    if username in USERS:
+    """Crée un utilisateur dans la base MySQL (table `users`)."""
+    # validation minimale côté API
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password too short (min 8)")
+
+    # existe déjà ?
+    if _get_user(username):
         raise HTTPException(status_code=400, detail="User already exists")
-    USERS[username] = pwd_ctx.hash(password)
-    return {"ok": True}
+
+    hashed = pwd_ctx.hash(password)
+    try:
+        _create_user(username, hashed)
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"/register failed: {e}")
+        raise HTTPException(status_code=500, detail="Registration failed")
 
 @app.post("/token", tags=["auth"])
 def token(username: str = Form(...), password: str = Form(...)):
-    hpwd = USERS.get(username)
-    if not hpwd or not pwd_ctx.verify(password, hpwd):
+    """Vérifie identifiants depuis MySQL et génère un JWT."""
+    row = _get_user(username)
+    if not row:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    hpwd = row["hashed_password"]
+    if not pwd_ctx.verify(password, hpwd):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     access_token = create_access_token({"sub": username})
     return {"access_token": access_token, "token_type": "bearer"}
@@ -372,6 +430,14 @@ def check_drift(user: str = Depends(verify_token)):
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting Games API with ML...")
+
+    # Init table users en base
+    try:
+        _init_users_table()
+        logger.info("Users table ready")
+    except Exception as e:
+        logger.error(f"Failed to init users table: {e}")
+
     model = get_model()
     if os.path.exists("model/recommendation_model.pkl"):
         if model.load_model():
@@ -380,4 +446,4 @@ async def startup_event():
             logger.warning("Failed to load saved model, will train on first request")
     else:
         logger.info("No saved model found, will train on first request")
-    logger.info(f"API startup complete. {len(GAMES)} games available.")
+    logger.info(f"API startup complete. {len(GAMES)} games available.")} games available.")
