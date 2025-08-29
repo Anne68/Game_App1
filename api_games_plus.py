@@ -430,20 +430,37 @@ def register(username: str = Form(...), password: str = Form(...)):
 
 @app.post("/token", tags=["auth"])
 def token(username: str = Form(...), password: str = Form(...)):
-    u = get_user(username.strip())
+    username = username.strip()
+    u = get_user(username)  # doit retourner un dict (cursor=DictCursor)
     if not u:
-        # éviter de révéler si l'utilisateur existe
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-    pwd_col = "password_hash" if "password_hash" in u else ("password" if "password" in u else None)
+    pwd_col, stored = extract_stored_password(u)
     if not pwd_col:
-        logger.error("User row has no password column. Keys: %s", list(u.keys()))
-        raise HTTPException(status_code=500, detail="Server password column missing")
+        logger.error("Aucune colonne de mot de passe présente pour '%s' (keys=%s)", username, list(u.keys()))
+        raise HTTPException(status_code=500, detail="Password column missing")
 
-    if not pwd_ctx.verify(password, u[pwd_col]):
+    # Vérification : d'abord comme hash, sinon (legacy) comparaison en clair
+    try:
+        ok = pwd_ctx.verify(password, stored)
+        need_upgrade = pwd_ctx.needs_update(stored)
+    except UnknownHashError:
+        ok = (password == stored)
+        need_upgrade = True
+
+    if not ok:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-    access_token = create_access_token({"sub": username.strip()})
+    # Upgrade automatique -> écrit dans 'hashed_password' (+ éventuellement password_hash)
+    if pwd_col != "hashed_password" or need_upgrade:
+        try:
+            new_hash = pwd_ctx.hash(password)
+            update_user_password(username, new_hash)
+            logger.info("Upgraded password hash for '%s' (from %s)", username, pwd_col)
+        except Exception as e:
+            logger.warning("Failed to upgrade password for '%s': %s", username, e)
+
+    access_token = create_access_token({"sub": username})
     return {"access_token": access_token, "token_type": "bearer"}
 
 
