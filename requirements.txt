@@ -3,6 +3,14 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 
+# --- Client Streamlit (Py 3.13) ---
+streamlit>=1.38
+requests>=2.32
+pandas>=2.2.2
+numpy>=2.0
+python-dotenv>=1.0
+
+
 # Auth
 passlib==1.7.4
 bcrypt==3.2.2
