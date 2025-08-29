@@ -420,48 +420,27 @@ def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = 
 # ---------------------------------------------------------------------
 # Auth endpoints (MySQL)
 # ---------------------------------------------------------------------
+def users_password_target_column() -> str:
+    # On privilégie 'hashed_password'
+    return "hashed_password" if users_has_column("hashed_password") else "password_hash"
+
 @app.post("/register", tags=["auth"])
 def register(username: str = Form(...), password: str = Form(...)):
-    if len(password) < settings.PASSWORD_MIN_LENGTH:
-        raise HTTPException(status_code=400, detail="Password too short")
-    create_user(username.strip(), password)
-    return {"ok": True}
-
-
-@app.post("/token", tags=["auth"])
-def token(username: str = Form(...), password: str = Form(...)):
     username = username.strip()
-    u = get_user(username)  # doit retourner un dict (cursor=DictCursor)
-    if not u:
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    if get_user(username):
+        raise HTTPException(status_code=400, detail="User already exists")
 
-    pwd_col, stored = extract_stored_password(u)
-    if not pwd_col:
-        logger.error("Aucune colonne de mot de passe présente pour '%s' (keys=%s)", username, list(u.keys()))
-        raise HTTPException(status_code=500, detail="Password column missing")
+    hpwd = pwd_ctx.hash(password)
+    col = users_password_target_column()
 
-    # Vérification : d'abord comme hash, sinon (legacy) comparaison en clair
-    try:
-        ok = pwd_ctx.verify(password, stored)
-        need_upgrade = pwd_ctx.needs_update(stored)
-    except UnknownHashError:
-        ok = (password == stored)
-        need_upgrade = True
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"INSERT INTO users (username, {col}) VALUES (%s, %s)", (username, hpwd))
+        # si les deux colonnes existent, tu peux synchroniser :
+        if col == "hashed_password" and users_has_column("password_hash"):
+            cur.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hpwd, username))
+        conn.commit()
 
-    if not ok:
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-
-    # Upgrade automatique -> écrit dans 'hashed_password' (+ éventuellement password_hash)
-    if pwd_col != "hashed_password" or need_upgrade:
-        try:
-            new_hash = pwd_ctx.hash(password)
-            update_user_password(username, new_hash)
-            logger.info("Upgraded password hash for '%s' (from %s)", username, pwd_col)
-        except Exception as e:
-            logger.warning("Failed to upgrade password for '%s': %s", username, e)
-
-    access_token = create_access_token({"sub": username})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------
