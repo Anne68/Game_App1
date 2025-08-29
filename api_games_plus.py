@@ -25,6 +25,15 @@ from monitoring_metrics import (
     get_monitor,
 )
 
+from passlib.context import CryptContext
+from passlib.exc import UnknownHashError  # <-- ajouter
+
+# accepte plusieurs formats historiques et « upgrade » automatiquement
+pwd_ctx = CryptContext(
+    schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"],
+    deprecated="auto",
+)
+
 # ---------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------
