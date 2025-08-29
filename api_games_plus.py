@@ -110,9 +110,10 @@ def healthz():
         "monitoring": monitor.get_metrics_summary()
     }
 
-@app.get("/__paths", tags=["system"])
-def list_paths(request: Request):
-    return {"paths": sorted({r.path for r in request.app.routes})}
+@app.get("/", include_in_schema=False)
+def root():
+    return {"name": app.title, "version": app.version, "status": "ok"}
+
 
 # Prometheus metrics avec Instrumentator
 instrumentator = Instrumentator()
