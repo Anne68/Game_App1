@@ -111,6 +111,8 @@ def _ssl_kwargs() -> dict:
     return {"ssl": {}}
 
 def get_db_conn():
+    if not settings.db_configured:
+        raise RuntimeError("Database not configured (missing DB_* env vars)")
     return pymysql.connect(
         host=settings.DB_HOST,
         port=settings.DB_PORT,
@@ -123,6 +125,7 @@ def get_db_conn():
         write_timeout=10,
         **_ssl_kwargs(),
     )
+
 
 # ---------- USERS TABLE ----------
 def ensure_users_table():
