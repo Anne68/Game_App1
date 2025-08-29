@@ -5,6 +5,7 @@ import os
 import time
 import logging
 import inspect
+from functools import wraps
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
 
@@ -41,21 +42,21 @@ SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = settings.ALGORITHM
 ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
-# OAuth2 for Swagger
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
-
-# Accepte plusieurs formats historiques et « upgrade » automatiquement
+# accepte plusieurs formats historiques et « upgrade » automatiquement
 pwd_ctx = CryptContext(
     schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"],
     deprecated="auto",
 )
+
+# OAuth2 (conserver /token pour Swagger)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
 # ---------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------
 app = FastAPI(
     title="Games API ML (C9→C13)",
-    version="2.1.0",
+    version="2.2.0",
     description="API avec modèle ML, monitoring avancé et MySQL pour les utilisateurs",
 )
 
@@ -69,7 +70,7 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------
-# Models (Pydantic)
+# Pydantic models
 # ---------------------------------------------------------------------
 class TrainRequest(BaseModel):
     version: Optional[str] = None
@@ -81,8 +82,7 @@ class PredictionRequest(BaseModel):
     min_confidence: float = 0.1
 
 class ModelMetricsResponse(BaseModel):
-    # supprime l’avertissement pydantic “model_” comme espace réservé
-    model_config = {"protected_namespaces": ()}
+    model_config = {"protected_namespaces": ()}      # enlève l'avertissement pydantic
     model_version: str
     is_trained: bool
     total_predictions: int
@@ -122,11 +122,12 @@ def get_db_conn():
         password=settings.DB_PASSWORD,
         database=settings.DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
         **ssl,
     )
 
 def ensure_users_table():
-    """Crée la table si absente et migre 'password' -> 'password_hash' si besoin."""
+    """Crée la table si absente + ajoute les bonnes colonnes; garde compat 'password_hash'."""
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute("SHOW TABLES LIKE 'users';")
         if not cur.fetchone():
@@ -135,60 +136,52 @@ def ensure_users_table():
                 CREATE TABLE users (
                   id INT AUTO_INCREMENT PRIMARY KEY,
                   username VARCHAR(190) UNIQUE NOT NULL,
-                  password_hash VARCHAR(255) NOT NULL,
+                  hashed_password VARCHAR(255) NOT NULL,
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                 """
             )
             conn.commit()
-            logger.info("Created users table (password_hash).")
+            logger.info("Created users table (hashed_password).")
             return
 
-        # table présente → vérifier colonnes
-        cur.execute("SHOW COLUMNS FROM users LIKE 'password_hash';")
-        has_hash = cur.fetchone() is not None
-        if not has_hash:
-            cur.execute("SHOW COLUMNS FROM users LIKE 'password';")
-            has_legacy = cur.fetchone() is not None
-            if has_legacy:
-                try:
-                    cur.execute("ALTER TABLE users CHANGE COLUMN password password_hash VARCHAR(255) NOT NULL;")
-                    conn.commit()
-                    logger.info("Migrated users.password -> users.password_hash")
-                except Exception as e:
-                    logger.warning("Could not migrate users table, will use legacy 'password' column. %s", e)
-            else:
-                cur.execute("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NOT NULL;")
-                conn.commit()
-                logger.info("Added users.password_hash column.")
+        # s'assurer que 'hashed_password' existe
+        cur.execute("SHOW COLUMNS FROM users LIKE 'hashed_password';")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE users ADD COLUMN hashed_password VARCHAR(255) NULL;")
+            conn.commit()
+            logger.info("Added users.hashed_password column.")
+
+        # garder compat: si pas de password_hash, on ne force pas, mais on gère dans le code
 
 def users_has_column(column: str) -> bool:
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute("SHOW COLUMNS FROM users LIKE %s;", (column,))
         return cur.fetchone() is not None
 
-def users_password_column() -> str:
-    with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SHOW COLUMNS FROM users LIKE 'hashed_password';")
-        if cur.fetchone():
-            return "hashed_password"
-        cur.execute("SHOW COLUMNS FROM users LIKE 'password_hash';")
-        if cur.fetchone():
-            return "password_hash"
-        cur.execute("SHOW COLUMNS FROM users LIKE 'password';")
-        if cur.fetchone():
-            return "password"
-    return "password_hash"
-
 def get_user(username: str) -> Optional[dict]:
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT * FROM users WHERE username=%s", (username,))
         return cur.fetchone()
 
+def users_password_column(row: dict | None = None) -> str:
+    """
+    Choisit la colonne à lire/écrire. Priorité à 'hashed_password'.
+    Si row est fourni, renvoie la première non vide.
+    """
+    if row is not None:
+        for c in ("hashed_password", "password_hash", "password"):
+            if c in row and (row[c] or "").strip():
+                return c
+    # sinon par structure
+    if users_has_column("hashed_password"):
+        return "hashed_password"
+    if users_has_column("password_hash"):
+        return "password_hash"
+    return "password"  # très vieux schéma
+
 def update_user_password(username: str, new_hash: str) -> None:
-    """
-    Écrit le hash moderne dans 'hashed_password'. Si 'password_hash' existe, on la met aussi.
-    """
+    """Écrit le hash moderne; garde la compat si 'password_hash' existe."""
     set_parts = []
     params: list[Any] = []
 
@@ -200,15 +193,13 @@ def update_user_password(username: str, new_hash: str) -> None:
         params.append(new_hash)
 
     if not set_parts:
-        # dernier recours : créer la colonne password_hash et écrire
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NOT NULL;")
-            conn.commit()
-        set_parts.append("password_hash=%s")
+        # dernier recours: une colonne 'password' legacy
+        set_parts.append("password=%s")
         params.append(new_hash)
 
     params.append(username)
     sql = f"UPDATE users SET {', '.join(set_parts)} WHERE username=%s"
+
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute(sql, tuple(params))
         conn.commit()
@@ -221,17 +212,14 @@ def migrate_legacy_passwords() -> int:
         cur.execute(
             """
             UPDATE users
-            SET hashed_password = password_hash
-            WHERE (hashed_password IS NULL OR hashed_password = '')
-              AND password_hash IS NOT NULL AND password_hash <> '';
+               SET hashed_password = password_hash
+             WHERE (hashed_password IS NULL OR hashed_password = '')
+               AND password_hash IS NOT NULL AND password_hash <> '';
             """
         )
         affected = cur.rowcount or 0
         conn.commit()
         return affected
-
-def looks_like_hash(s: str) -> bool:
-    return isinstance(s, str) and s.startswith("$")
 
 # ---------------------------------------------------------------------
 # Auth helpers
@@ -252,46 +240,51 @@ def verify_token(token: str = Depends(oauth2_scheme)) -> str:
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# =======================
-# AUTH — routes /token + /auth/token
-# =======================
+def _verify_password_and_upgrade_if_needed(username: str, plain_password: str, stored_hash: str) -> bool:
+    """
+    Vérifie le mot de passe:
+     - si 'stored_hash' est un hash reconnu (bcrypt, pbkdf2...), on vérifie via passlib
+     - sinon, on tente une comparaison "legacy" en clair; en cas de succès => on re-hash et on met à jour
+    """
+    try:
+        ok = pwd_ctx.verify(plain_password, stored_hash)
+        if ok:
+            # si l'algorithme est obsolète, passlib peut suggérer un upgrade
+            if pwd_ctx.needs_update(stored_hash):
+                new_hash = pwd_ctx.hash(plain_password)
+                update_user_password(username, new_hash)
+            return True
+        return False
+    except UnknownHashError:
+        # ancien stockage en clair (ou autre format non reconnu)
+        if stored_hash == plain_password:
+            new_hash = pwd_ctx.hash(plain_password)
+            update_user_password(username, new_hash)
+            return True
+        return False
+
 def _issue_token_core(username: str, password: str):
-    u = get_user(username)
-    if not u:
+    row = get_user(username)
+    if not row:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-    stored = (u.get("hashed_password") or u.get("password_hash") or u.get("password") or "").strip()
+    pwd_col = users_password_column(row)
+    stored = (row.get(pwd_col) or "").strip()
     if not stored:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-    ok = False
-    if looks_like_hash(stored):
-        try:
-            ok = pwd_ctx.verify(password, stored)
-        except UnknownHashError:
-            ok = False
-    else:
-        # ancien stockage en clair
-        ok = (stored == password)
-
-    if not ok:
+    if not _verify_password_and_upgrade_if_needed(username, password, stored):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
-
-    # Upgrade en bcrypt si nécessaire
-    try:
-        scheme = pwd_ctx.identify(stored) if looks_like_hash(stored) else None
-    except Exception:
-        scheme = None
-    if scheme != "bcrypt":  # None, pbkdf2, sha256_crypt, plain…
-        update_user_password(username, pwd_ctx.hash(password))
 
     access_token = create_access_token({"sub": username})
     return {"access_token": access_token, "token_type": "bearer"}
 
+# Route attendue par Swagger & Streamlit
 @app.post("/token", tags=["auth"])
 def token(username: str = Form(...), password: str = Form(...)):
     return _issue_token_core(username, password)
 
+# Alias optionnel
 @app.post("/auth/token", tags=["auth"])
 def token_alias(username: str = Form(...), password: str = Form(...)):
     return _issue_token_core(username, password)
@@ -299,53 +292,57 @@ def token_alias(username: str = Form(...), password: str = Form(...)):
 @app.post("/register", tags=["auth"])
 def register(username: str = Form(...), password: str = Form(...)):
     username = username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username required")
+
     if get_user(username):
         raise HTTPException(status_code=400, detail="User already exists")
 
     hpwd = pwd_ctx.hash(password)
-    col = users_password_column()
     with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute(f"INSERT INTO users (username, {col}) VALUES (%s, %s)", (username, hpwd))
-        # si une 2e colonne existe, synchronise
-        if col != "hashed_password" and users_has_column("hashed_password"):
-            cur.execute("UPDATE users SET hashed_password=%s WHERE username=%s", (hpwd, username))
-        if col != "password_hash" and users_has_column("password_hash"):
-            cur.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hpwd, username))
+        # écrire dans la colonne moderne; garder compat si l’ancienne existe
+        cols, vals = ["username", "hashed_password"], [username, hpwd]
+        if users_has_column("password_hash"):
+            cols.append("password_hash")
+            vals.append(hpwd)
+        ph = ", ".join(["%s"] * len(cols))
+        cur.execute(f"INSERT INTO users ({', '.join(cols)}) VALUES ({ph})", tuple(vals))
         conn.commit()
+
     return {"ok": True}
 
 # ---------------------------------------------------------------------
-# Decorator (fix: preserve signature + support async)
+# Decorator (measure latency)
 # ---------------------------------------------------------------------
 def measure_latency(endpoint: str):
     def decorator(func):
         if inspect.iscoroutinefunction(func):
+            @wraps(func)
             async def async_wrapper(*args, **kwargs):
                 start = time.time()
                 try:
                     res = await func(*args, **kwargs)
                     prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="ok").inc()
                     return res
                 except Exception:
                     prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
                     model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
                     raise
-            async_wrapper.__name__ = func.__name__
-            async_wrapper.__signature__ = inspect.signature(func)
             return async_wrapper
         else:
+            @wraps(func)
             def sync_wrapper(*args, **kwargs):
                 start = time.time()
                 try:
                     res = func(*args, **kwargs)
                     prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="ok").inc()
                     return res
                 except Exception:
                     prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
                     model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
                     raise
-            sync_wrapper.__name__ = func.__name__
-            sync_wrapper.__signature__ = inspect.signature(func)
             return sync_wrapper
     return decorator
 
@@ -399,7 +396,6 @@ def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: 
         )
 
         background_tasks.add_task(model.save_model)
-
         return TrainResponse(status="success", version=version, duration=duration, result=result)
     except Exception as e:
         logger.exception("Training failed")
@@ -469,10 +465,17 @@ def recommend_by_game(game_id: int, k: int = Query(10, ge=1, le=50), user: str =
 # --- Endpoints pour Streamlit UI ---
 @app.get("/recommend/by-title/{title}", tags=["recommend"])
 def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
+    # 1) si un jeu local matche, on réutilise la reco par id
     matches = [g for g in GAMES if title.lower() in g["title"].lower()]
-    if not matches:
-        raise HTTPException(status_code=404, detail="Game not found")
-    return recommend_by_game(matches[0]["id"], k, user)
+    if matches:
+        return recommend_by_game(matches[0]["id"], k, user)  # réutilise la logique
+
+    # 2) fallback: requête texte au modèle (utile pour "Mario")
+    model = get_model()
+    if not model.is_trained:
+        model.train(GAMES)
+    recos = model.predict(query=title, k=k, min_confidence=0.0)
+    return {"title": title, "recommendations": recos, "from": "text_query"}
 
 @app.get("/recommend/by-genre/{genre}", tags=["recommend"])
 def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
@@ -530,8 +533,6 @@ async def startup_event():
     try:
         ensure_users_table()
         logger.info("Users table ready")
-
-        # (optionnel) migre password_hash -> hashed_password si la colonne legacy existe
         try:
             migrated = migrate_legacy_passwords()
             if migrated:
@@ -540,7 +541,6 @@ async def startup_event():
                 logger.info("Password migration: nothing to do")
         except Exception as e:
             logger.warning("Password migration skipped (error): %s", e)
-
     except Exception:
         logger.exception("Database initialization failed")
         raise
