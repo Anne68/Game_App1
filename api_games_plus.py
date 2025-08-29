@@ -1,12 +1,14 @@
-# api_games_plus.py — API FastAPI avec ML + Auth MySQL + Monitoring
+# api_games_plus.py
 from __future__ import annotations
 
 import os
 import time
 import logging
+import inspect
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
+import pymysql
 from fastapi import FastAPI, HTTPException, Depends, Form, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
@@ -15,19 +17,25 @@ from passlib.context import CryptContext
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 
-# ML + monitoring
-from model_manager import get_model, RecommendationModel
-from monitoring_metrics import get_monitor, measure_latency
-
-# Auth via MySQL
-import pymysql
 from settings import get_settings
+from model_manager import get_model
+from monitoring_metrics import (
+    prediction_latency,
+    model_prediction_counter,
+    get_monitor,
+)
 
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
 logger = logging.getLogger("games-api-ml")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
-# ========= Config via settings.py =========
+# ---------------------------------------------------------------------
+# Settings & Security
+# ---------------------------------------------------------------------
 settings = get_settings()
+
 SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = settings.ALGORITHM
 ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
@@ -35,22 +43,27 @@ ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# ---------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------
 app = FastAPI(
     title="Games API ML (C9→C13)",
-    version="2.0.0",
-    description="API avec modèle ML, monitoring avancé et pipeline MLOps",
+    version="2.1.0",
+    description="API avec modèle ML, monitoring avancé et MySQL pour les utilisateurs",
 )
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in settings.ALLOW_ORIGINS.split(",") if o.strip()] or ["*"],
+    allow_origins=[o for o in settings.ALLOW_ORIGINS.split(",") if o] or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ========= Pydantic Models =========
+# ---------------------------------------------------------------------
+# Models (Pydantic)
+# ---------------------------------------------------------------------
 class TrainRequest(BaseModel):
     version: Optional[str] = None
     force_retrain: bool = False
@@ -61,7 +74,7 @@ class PredictionRequest(BaseModel):
     min_confidence: float = 0.1
 
 class ModelMetricsResponse(BaseModel):
-    # Evite le warning Pydantic: "model_" namespace protégé
+    # supprime l’avertissement pydantic “model_” comme espace réservé
     model_config = {"protected_namespaces": ()}
     model_version: str
     is_trained: bool
@@ -71,8 +84,16 @@ class ModelMetricsResponse(BaseModel):
     games_count: int
     feature_dimension: int
 
-# ========= Demo Data =========
-GAMES: List[Dict] = [
+class TrainResponse(BaseModel):
+    status: str
+    version: Optional[str] = None
+    duration: Optional[float] = None
+    result: Optional[Dict[str, Any]] = None
+
+# ---------------------------------------------------------------------
+# Demo data
+# ---------------------------------------------------------------------
+GAMES: List[Dict[str, Any]] = [
     {"id": 1, "title": "The Witcher 3: Wild Hunt", "genres": "RPG, Action", "rating": 4.9, "metacritic": 93, "platforms": ["PC", "PS4", "Xbox One"]},
     {"id": 2, "title": "Hades", "genres": "Action, Roguelike", "rating": 4.8, "metacritic": 93, "platforms": ["PC", "Switch", "PS4"]},
     {"id": 3, "title": "Stardew Valley", "genres": "Simulation, RPG", "rating": 4.7, "metacritic": 89, "platforms": ["PC", "Switch", "PS4", "Xbox One"]},
@@ -82,49 +103,52 @@ GAMES: List[Dict] = [
     {"id": 7, "title": "Disco Elysium", "genres": "RPG, Narrative", "rating": 4.7, "metacritic": 91, "platforms": ["PC", "PS4", "Xbox One"]},
 ]
 
-# ========= MySQL helpers =========
-def _get_db_conn():
-    """Connexion PyMySQL basée sur settings.py (SSL optionnel)."""
-    ssl_params = {"ca": settings.DB_SSL_CA} if getattr(settings, "DB_SSL_CA", None) else None
-    kwargs = dict(
+# ---------------------------------------------------------------------
+# DB helpers (MySQL users)
+# ---------------------------------------------------------------------
+def get_db_conn():
+    ssl = {"ssl": {"ca": settings.DB_SSL_CA}} if settings.DB_SSL_CA else {}
+    return pymysql.connect(
         host=settings.DB_HOST,
         port=settings.DB_PORT,
         user=settings.DB_USER,
         password=settings.DB_PASSWORD,
         database=settings.DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
+        **ssl,
     )
-    if ssl_params:
-        kwargs["ssl"] = ssl_params
-    return pymysql.connect(**kwargs)
 
-def _init_users_table():
-    ddl = (
-        "CREATE TABLE IF NOT EXISTS users ("
-        " id INT AUTO_INCREMENT PRIMARY KEY,"
-        " username VARCHAR(255) UNIQUE NOT NULL,"
-        " hashed_password VARCHAR(255) NOT NULL,"
-        " created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
-    )
-    with _get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(ddl)
+def ensure_users_table():
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              username VARCHAR(190) UNIQUE NOT NULL,
+              password_hash VARCHAR(255) NOT NULL,
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+        conn.commit()
 
-def _get_user(username: str) -> Optional[Dict]:
-    with _get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, username, hashed_password FROM users WHERE username=%s", (username,))
-            return cur.fetchone()
+def get_user(username: str) -> Optional[dict]:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        return cur.fetchone()
 
-def _create_user(username: str, hashed_password: str) -> None:
-    with _get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO users (username, hashed_password) VALUES (%s, %s)", (username, hashed_password))
+def create_user(username: str, password: str):
+    if get_user(username):
+        raise HTTPException(status_code=400, detail="User already exists")
+    hpwd = pwd_ctx.hash(password)
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO users(username, password_hash) VALUES(%s,%s)", (username, hpwd))
+        conn.commit()
 
-# ========= Utils auth =========
-def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+# ---------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
@@ -140,7 +164,44 @@ def verify_token(token: str = Depends(oauth2_scheme)) -> str:
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# ========= System & Monitoring =========
+# ---------------------------------------------------------------------
+# Decorator (fix: preserve signature + support async)
+# ---------------------------------------------------------------------
+def measure_latency(endpoint: str):
+    def decorator(func):
+        if inspect.iscoroutinefunction(func):
+            async def async_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = await func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            async_wrapper.__name__ = func.__name__
+            async_wrapper.__signature__ = inspect.signature(func)  # <- crucial for FastAPI
+            return async_wrapper
+        else:
+            def sync_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            sync_wrapper.__name__ = func.__name__
+            sync_wrapper.__signature__ = inspect.signature(func)    # <- crucial for FastAPI
+            return sync_wrapper
+    return decorator
+
+# ---------------------------------------------------------------------
+# System & monitoring
+# ---------------------------------------------------------------------
 @app.get("/healthz", tags=["system"])
 def healthz():
     model = get_model()
@@ -157,23 +218,19 @@ def healthz():
 def root():
     return {"name": app.title, "version": app.version, "status": "ok"}
 
-# Prometheus metrics
-instrumentator = Instrumentator()
-instrumentator.instrument(app).expose(app, include_in_schema=True)
+# Prometheus
+Instrumentator().instrument(app).expose(app, include_in_schema=True)
 
-# ========= ML Model Management =========
-@app.post("/model/train", tags=["model"], response_model=Dict)
-def train_model(
-    request: TrainRequest,
-    background_tasks: BackgroundTasks,
-    user: str = Depends(verify_token),
-):
-    """Entraîne ou ré-entraîne le modèle de recommandation"""
+# ---------------------------------------------------------------------
+# Model management
+# ---------------------------------------------------------------------
+@app.post("/model/train", tags=["model"], response_model=TrainResponse)
+def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: str = Depends(verify_token)):
     model = get_model()
     monitor = get_monitor()
 
     if model.is_trained and not request.force_retrain:
-        return {"status": "already_trained", "version": model.model_version}
+        return TrainResponse(status="already_trained", version=model.model_version)
 
     start_time = time.time()
     version = request.version or f"api-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
@@ -193,9 +250,9 @@ def train_model(
 
         background_tasks.add_task(model.save_model)
 
-        return {"status": "success", "version": version, "duration": duration, "result": result}
+        return TrainResponse(status="success", version=version, duration=duration, result=result)
     except Exception as e:
-        logger.error(f"Training failed: {e}")
+        logger.exception("Training failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/model/metrics", tags=["model"], response_model=ModelMetricsResponse)
@@ -213,165 +270,104 @@ def get_model_metrics(user: str = Depends(verify_token)):
     )
 
 @app.post("/model/evaluate", tags=["model"])
-def evaluate_model(
-    test_queries: List[str] = Query(default=["RPG", "Action", "Indie", "Simulation"]),
-    user: str = Depends(verify_token),
-):
+def evaluate_model(test_queries: List[str] = Query(default=["RPG", "Action", "Indie", "Simulation"]),
+                   user: str = Depends(verify_token)):
     model = get_model()
     monitor = get_monitor()
     if not model.is_trained:
         raise HTTPException(status_code=400, detail="Model not trained")
     return monitor.evaluate_model(model, test_queries)
 
-# ========= Recommendations =========
+# ---------------------------------------------------------------------
+# Recommendations (ML)
+# ---------------------------------------------------------------------
 @app.post("/recommend/ml", tags=["recommend"])
 @measure_latency("recommend_ml")
-def recommend_ml(
-    request: PredictionRequest,
-    user: str = Depends(verify_token),
-):
+def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     model = get_model()
     monitor = get_monitor()
+
     if not model.is_trained:
         logger.info("Model not trained, auto-training...")
         model.train(GAMES)
         model.save_model()
 
-    t0 = time.time()
-    try:
-        recommendations = model.predict(query=request.query, k=request.k, min_confidence=request.min_confidence)
-        latency = time.time() - t0
-        monitor.record_prediction("recommend_ml", request.query, recommendations, latency)
-        return {
-            "query": request.query,
-            "recommendations": recommendations,
-            "latency_ms": latency * 1000,
-            "model_version": model.model_version,
-        }
-    except Exception as e:
-        monitor.record_error("recommend_ml", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+    start_time = time.time()
+    recommendations = model.predict(query=request.query, k=request.k, min_confidence=request.min_confidence)
+    latency = time.time() - start_time
+
+    monitor.record_prediction("recommend_ml", request.query, recommendations, latency)
+    return {"query": request.query, "recommendations": recommendations, "latency_ms": latency * 1000, "model_version": model.model_version}
 
 @app.get("/recommend/by-game/{game_id}", tags=["recommend"])
 @measure_latency("recommend_by_game")
-def recommend_by_game(
-    game_id: int,
-    k: int = Query(10, ge=1, le=50),
-    user: str = Depends(verify_token),
-):
+def recommend_by_game(game_id: int, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
     model = get_model()
     monitor = get_monitor()
     if not model.is_trained:
         model.train(GAMES)
 
-    t0 = time.time()
+    start_time = time.time()
     try:
         recommendations = model.predict_by_game_id(game_id, k)
-        latency = time.time() - t0
-        monitor.record_prediction("recommend_by_game", f"game_id:{game_id}", recommendations, latency)
-        return {"game_id": game_id, "recommendations": recommendations, "latency_ms": latency * 1000}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        monitor.record_error("recommend_by_game", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+    latency = time.time() - start_time
+    monitor.record_prediction("recommend_by_game", f"game_id:{game_id}", recommendations, latency)
+    return {"game_id": game_id, "recommendations": recommendations, "latency_ms": latency * 1000}
 
-# Compat Streamlit: par titre / par genre
+# --- Endpoints pour Streamlit UI ---
 @app.get("/recommend/by-title/{title}", tags=["recommend"])
-@measure_latency("recommend_by_title")
-def recommend_by_title(
-    title: str,
-    k: int = Query(10, ge=1, le=50),
-    user: str = Depends(verify_token),
-):
-    model = get_model()
-    monitor = get_monitor()
-    if not model.is_trained:
-        model.train(GAMES)
-
-    df = model.games_df
-    if df is None or df.empty:
-        raise HTTPException(status_code=404, detail="No games loaded")
-
-    # matching simple: similarité TF-IDF sur le titre
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-
-    vec = TfidfVectorizer(stop_words="english").fit(df["title"])
-    qv = vec.transform([title])
-    sims = cosine_similarity(qv, vec.transform(df["title"]))[0]
-    best_idx = int(sims.argmax())
-    best_id = int(df.iloc[best_idx]["id"])
-    recs = model.predict_by_game_id(best_id, k=k)
-    monitor.record_prediction("recommend_by_title", f"title:{title}", recs, 0.0)
-    return {"title": title, "base_match_id": best_id, "recommendations": recs}
+def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
+    # prend le 1er jeu qui “match” le titre, puis utilise le modèle par id
+    matches = [g for g in GAMES if title.lower() in g["title"].lower()]
+    if not matches:
+        raise HTTPException(status_code=404, detail="Game not found")
+    return recommend_by_game(matches[0]["id"], k, user)  # réutilise la logique ci-dessus
 
 @app.get("/recommend/by-genre/{genre}", tags=["recommend"])
-@measure_latency("recommend_by_genre")
-def recommend_by_genre(
-    genre: str,
-    k: int = Query(10, ge=1, le=50),
-    min_confidence: float = Query(0.1, ge=0.0, le=1.0),
-    user: str = Depends(verify_token),
-):
+def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
     model = get_model()
-    monitor = get_monitor()
     if not model.is_trained:
         model.train(GAMES)
-    recs = model.predict(genre, k=k, min_confidence=min_confidence)
-    monitor.record_prediction("recommend_by_genre", f"genre:{genre}", recs, 0.0)
-    return {"genre": genre, "recommendations": recs}
+    # simple: utiliser la requête texte du modèle
+    recos = model.predict(query=genre, k=k, min_confidence=0.0)
+    return {"genre": genre, "recommendations": recos}
 
-# ========= Auth (MySQL) & Games =========
+# ---------------------------------------------------------------------
+# Auth endpoints (MySQL)
+# ---------------------------------------------------------------------
 @app.post("/register", tags=["auth"])
 def register(username: str = Form(...), password: str = Form(...)):
-    """Crée un utilisateur dans la base MySQL (table `users`)."""
     if len(password) < settings.PASSWORD_MIN_LENGTH:
-        raise HTTPException(status_code=400, detail=f"Password too short (min {settings.PASSWORD_MIN_LENGTH})")
-    # (optionnel) regex de complexité
-    # import re
-    # if not re.match(settings.PASSWORD_REGEX, password):
-    #     raise HTTPException(status_code=400, detail="Password does not meet complexity requirements")
-    if _get_user(username):
-        raise HTTPException(status_code=400, detail="User already exists")
-    hashed = pwd_ctx.hash(password)
-    try:
-        _create_user(username, hashed)
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"/register failed: {e}")
-        raise HTTPException(status_code=500, detail="Registration failed")
+        raise HTTPException(status_code=400, detail="Password too short")
+    create_user(username.strip(), password)
+    return {"ok": True}
 
 @app.post("/token", tags=["auth"])
 def token(username: str = Form(...), password: str = Form(...)):
-    """Vérifie identifiants depuis MySQL et génère un JWT."""
-    row = _get_user(username)
-    if not row:
+    u = get_user(username.strip())
+    if not u or not pwd_ctx.verify(password, u["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
-    hpwd = row["hashed_password"]
-    if not pwd_ctx.verify(password, hpwd):
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-    access_token = create_access_token({"sub": username})
+    access_token = create_access_token({"sub": username.strip()})
     return {"access_token": access_token, "token_type": "bearer"}
 
+# ---------------------------------------------------------------------
+# Simple games search
+# ---------------------------------------------------------------------
 @app.get("/games/by-title/{title}", tags=["games"])
 def games_by_title(title: str, user: str = Depends(verify_token)):
     q = title.strip().lower()
-    results = [
-        {
-            "id": g["id"],
-            "title": g["title"],
-            "genres": g["genres"],
-            "rating": g["rating"],
-            "metacritic": g["metacritic"],
-            "platforms": ", ".join(g["platforms"]),
-        }
-        for g in GAMES
-        if q in g["title"].lower()
-    ]
+    results = [{
+        "id": g["id"], "title": g["title"], "genres": g["genres"],
+        "rating": g["rating"], "metacritic": g["metacritic"],
+        "platforms": ", ".join(g["platforms"]),
+    } for g in GAMES if q in g["title"].lower()]
     return {"results": results}
 
-# ========= Monitoring extra =========
+# ---------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------
 @app.get("/monitoring/summary", tags=["monitoring"])
 def monitoring_summary(user: str = Depends(verify_token)):
     monitor = get_monitor()
@@ -389,25 +385,18 @@ def check_drift(user: str = Depends(verify_token)):
         status = "high_drift"
     elif drift_score > 0.15:
         status = "moderate_drift"
-    return {
-        "drift_score": drift_score,
-        "status": status,
-        "recommendation": "Retrain model" if status == "high_drift" else ("Monitor closely" if status == "moderate_drift" else "No action needed"),
-    }
+    return {"drift_score": drift_score, "status": status,
+            "recommendation": "Retrain model" if status == "high_drift"
+            else "Monitor closely" if status == "moderate_drift" else "No action needed"}
 
-# ========= Startup =========
+# ---------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting Games API with ML...")
-
-    # Init table users
-    try:
-        _init_users_table()
-        logger.info("Users table ready")
-    except Exception as e:
-        logger.error(f"Failed to init users table: {e}")
-
-    # Charger modèle si dispo
+    ensure_users_table()
+    logger.info("Users table ready")
     model = get_model()
     if os.path.exists("model/recommendation_model.pkl"):
         if model.load_model():
@@ -416,5 +405,4 @@ async def startup_event():
             logger.warning("Failed to load saved model, will train on first request")
     else:
         logger.info("No saved model found, will train on first request")
-
     logger.info(f"API startup complete. {len(GAMES)} games available.")
