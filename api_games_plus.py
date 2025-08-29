@@ -1,19 +1,26 @@
-# api_games_plus.py — API FastAPI (auth + search + recos)
+# api_games_enhanced.py - Version améliorée de l'API avec ML complet
 from __future__ import annotations
 
 import os
+import time
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Form, Request, Query
+from fastapi import FastAPI, HTTPException, Depends, Form, Request, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
+from fastapi.responses import JSONResponse
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel
 
-logger = logging.getLogger("games-api")
+# Import des modules ML
+from model_manager import get_model, RecommendationModel
+from monitoring import get_monitor, measure_latency
+
+logger = logging.getLogger("games-api-ml")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
 # ========= Config =========
@@ -24,9 +31,13 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-app = FastAPI(title="Games API (C9→C13)", version="1.2.2", description="API sécurisée avec monitoring, modèle de reco, tests et CI/CD")
+app = FastAPI(
+    title="Games API ML (C9→C13)", 
+    version="2.0.0", 
+    description="API avec modèle ML, monitoring avancé et pipeline MLOps"
+)
 
-# CORS (Streamlit, Render…)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,8 +46,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========= Demo Data =========
-# NB : remplace ceci par ta BDD MySQL si besoin
+# ========= Data Models =========
+class TrainRequest(BaseModel):
+    version: Optional[str] = None
+    force_retrain: bool = False
+
+class PredictionRequest(BaseModel):
+    query: str
+    k: int = 10
+    min_confidence: float = 0.1
+
+class ModelMetricsResponse(BaseModel):
+    model_version: str
+    is_trained: bool
+    total_predictions: int
+    avg_confidence: float
+    last_training: Optional[str]
+    games_count: int
+    feature_dimension: int
+
+# ========= Demo Data (identique à l'original) =========
 GAMES: List[Dict] = [
     {"id": 1, "title": "The Witcher 3: Wild Hunt", "genres": "RPG, Action", "rating": 4.9, "metacritic": 93, "platforms": ["PC", "PS4", "Xbox One"]},
     {"id": 2, "title": "Hades", "genres": "Action, Roguelike", "rating": 4.8, "metacritic": 93, "platforms": ["PC", "Switch", "PS4"]},
@@ -47,16 +76,14 @@ GAMES: List[Dict] = [
     {"id": 7, "title": "Disco Elysium", "genres": "RPG, Narrative", "rating": 4.7, "metacritic": 91, "platforms": ["PC", "PS4", "Xbox One"]},
 ]
 
-USERS: Dict[str, str] = {}  # username -> hashed_password (démo mémoire)
+USERS: Dict[str, str] = {}
 
-
-# ========= Utils =========
+# ========= Utils (identiques) =========
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
 
 def verify_token(token: str = Depends(oauth2_scheme)) -> str:
     try:
@@ -68,43 +95,197 @@ def verify_token(token: str = Depends(oauth2_scheme)) -> str:
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-
-def tokenize(text: str) -> List[str]:
-    # petit tokenizer simple (lower + split non-alphanum)
-    import re
-    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
-
-
-def jaccard(a: List[str], b: List[str]) -> float:
-    sa, sb = set(a), set(b)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-
-# ========= System =========
+# ========= System & Monitoring =========
 @app.get("/healthz", tags=["system"])
 def healthz():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
-
+    model = get_model()
+    monitor = get_monitor()
+    
+    return {
+        "status": "healthy",
+        "time": datetime.utcnow().isoformat(),
+        "model_loaded": model.is_trained,
+        "model_version": model.model_version,
+        "monitoring": monitor.get_metrics_summary()
+    }
 
 @app.get("/__paths", tags=["system"])
 def list_paths(request: Request):
     return {"paths": sorted({r.path for r in request.app.routes})}
 
+# Prometheus metrics avec Instrumentator
+instrumentator = Instrumentator()
+instrumentator.instrument(app).expose(app, include_in_schema=True)
 
-# prometheus /metrics
-Instrumentator().instrument(app).expose(app, include_in_schema=True)
+# ========= ML Model Management =========
+@app.post("/model/train", tags=["model"], response_model=Dict)
+def train_model(
+    request: TrainRequest,
+    background_tasks: BackgroundTasks,
+    user: str = Depends(verify_token)
+):
+    """Entraîne ou ré-entraîne le modèle de recommandation"""
+    model = get_model()
+    monitor = get_monitor()
+    
+    if model.is_trained and not request.force_retrain:
+        return {"status": "already_trained", "version": model.model_version}
+    
+    # Entraînement
+    start_time = time.time()
+    version = request.version or f"api-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    model.model_version = version
+    
+    try:
+        result = model.train(GAMES)
+        duration = time.time() - start_time
+        
+        # Enregistrer les métriques
+        monitor.record_training(
+            model_version=version,
+            games_count=len(GAMES),
+            feature_dim=model.game_features.shape[1],
+            duration=duration,
+            metrics=result
+        )
+        
+        # Sauvegarder le modèle en arrière-plan
+        background_tasks.add_task(model.save_model)
+        
+        return {
+            "status": "success",
+            "version": version,
+            "duration": duration,
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/model/metrics", tags=["model"], response_model=ModelMetricsResponse)
+def get_model_metrics(user: str = Depends(verify_token)):
+    """Retourne les métriques du modèle"""
+    model = get_model()
+    metrics = model.get_metrics()
+    
+    return ModelMetricsResponse(
+        model_version=metrics.get("model_version", "unknown"),
+        is_trained=metrics.get("is_trained", False),
+        total_predictions=metrics.get("total_predictions", 0),
+        avg_confidence=metrics.get("avg_confidence", 0.0),
+        last_training=metrics.get("last_training"),
+        games_count=metrics.get("games_count", 0),
+        feature_dimension=metrics.get("feature_dim", 0)
+    )
 
-# ========= Auth =========
+@app.post("/model/evaluate", tags=["model"])
+def evaluate_model(
+    test_queries: List[str] = Query(default=["RPG", "Action", "Indie", "Simulation"]),
+    user: str = Depends(verify_token)
+):
+    """Évalue le modèle avec des requêtes de test"""
+    model = get_model()
+    monitor = get_monitor()
+    
+    if not model.is_trained:
+        raise HTTPException(status_code=400, detail="Model not trained")
+    
+    results = monitor.evaluate_model(model, test_queries)
+    return results
+
+# ========= Enhanced Recommendations with ML =========
+@app.post("/recommend/ml", tags=["recommend"])
+@measure_latency("recommend_ml")
+def recommend_ml(
+    request: PredictionRequest,
+    user: str = Depends(verify_token)
+):
+    """Recommandations basées sur le modèle ML"""
+    model = get_model()
+    monitor = get_monitor()
+    
+    if not model.is_trained:
+        # Auto-train si pas encore fait
+        logger.info("Model not trained, auto-training...")
+        model.train(GAMES)
+        model.save_model()
+    
+    start_time = time.time()
+    
+    try:
+        recommendations = model.predict(
+            query=request.query,
+            k=request.k,
+            min_confidence=request.min_confidence
+        )
+        
+        latency = time.time() - start_time
+        
+        # Enregistrer la prédiction
+        monitor.record_prediction(
+            endpoint="recommend_ml",
+            query=request.query,
+            recommendations=recommendations,
+            latency=latency
+        )
+        
+        return {
+            "query": request.query,
+            "recommendations": recommendations,
+            "latency_ms": latency * 1000,
+            "model_version": model.model_version
+        }
+        
+    except Exception as e:
+        monitor.record_error("recommend_ml", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/recommend/by-game/{game_id}", tags=["recommend"])
+@measure_latency("recommend_by_game")
+def recommend_by_game(
+    game_id: int,
+    k: int = Query(10, ge=1, le=50),
+    user: str = Depends(verify_token)
+):
+    """Recommandations basées sur un jeu spécifique"""
+    model = get_model()
+    monitor = get_monitor()
+    
+    if not model.is_trained:
+        model.train(GAMES)
+    
+    start_time = time.time()
+    
+    try:
+        recommendations = model.predict_by_game_id(game_id, k)
+        latency = time.time() - start_time
+        
+        monitor.record_prediction(
+            endpoint="recommend_by_game",
+            query=f"game_id:{game_id}",
+            recommendations=recommendations,
+            latency=latency
+        )
+        
+        return {
+            "game_id": game_id,
+            "recommendations": recommendations,
+            "latency_ms": latency * 1000
+        }
+        
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        monitor.record_error("recommend_by_game", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ========= Original endpoints (preserved) =========
 @app.post("/register", tags=["auth"])
 def register(username: str = Form(...), password: str = Form(...)):
     if username in USERS:
         raise HTTPException(status_code=400, detail="User already exists")
     USERS[username] = pwd_ctx.hash(password)
     return {"ok": True}
-
 
 @app.post("/token", tags=["auth"])
 def token(username: str = Form(...), password: str = Form(...)):
@@ -114,8 +295,6 @@ def token(username: str = Form(...), password: str = Form(...)):
     access_token = create_access_token({"sub": username})
     return {"access_token": access_token, "token_type": "bearer"}
 
-
-# ========= Games =========
 @app.get("/games/by-title/{title}", tags=["games"])
 def games_by_title(title: str, user: str = Depends(verify_token)):
     q = title.strip().lower()
@@ -133,40 +312,59 @@ def games_by_title(title: str, user: str = Depends(verify_token)):
     ]
     return {"results": results}
 
+# ========= Enhanced Monitoring Endpoints =========
+@app.get("/monitoring/summary", tags=["monitoring"])
+def monitoring_summary(user: str = Depends(verify_token)):
+    """Résumé complet du monitoring"""
+    monitor = get_monitor()
+    model = get_model()
+    
+    return {
+        "model": model.get_metrics(),
+        "monitoring": monitor.get_metrics_summary(),
+        "last_evaluation": monitor.last_evaluation
+    }
 
-# ========= Recos =========
-@app.get("/recommend/by-title/{title}", tags=["recommend"])
-def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
-    tok_q = tokenize(title)
-    scored = []
-    for g in GAMES:
-        score = 0.6 * jaccard(tok_q, tokenize(g["title"])) + 0.4 * jaccard(tok_q, tokenize(g["genres"]))
-        scored.append({"title": g["title"], "genres": g["genres"], "score": round(float(score), 4)})
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return {"recommendations": scored[:k]}
+@app.get("/monitoring/drift", tags=["monitoring"])
+def check_drift(user: str = Depends(verify_token)):
+    """Vérifie le drift du modèle"""
+    monitor = get_monitor()
+    
+    if len(monitor.confidence_history) < 100:
+        return {"status": "insufficient_data", "message": "Need at least 100 predictions"}
+    
+    drift_score = monitor._detect_drift()
+    
+    status = "stable"
+    if drift_score > 0.3:
+        status = "high_drift"
+    elif drift_score > 0.15:
+        status = "moderate_drift"
+    
+    return {
+        "drift_score": drift_score,
+        "status": status,
+        "recommendation": "Retrain model" if status == "high_drift" else "Monitor closely" if status == "moderate_drift" else "No action needed"
+    }
 
+# ========= Startup =========
+@app.on_event("startup")
+async def startup_event():
+    """Initialisation au démarrage"""
+    logger.info("Starting Games API with ML...")
+    
+    # Charger le modèle si disponible
+    model = get_model()
+    if os.path.exists("model/recommendation_model.pkl"):
+        if model.load_model():
+            logger.info(f"Model {model.model_version} loaded successfully")
+        else:
+            logger.warning("Failed to load saved model, will train on first request")
+    else:
+        logger.info("No saved model found, will train on first request")
+    
+    logger.info(f"API startup complete. {len(GAMES)} games available.")
 
-@app.get("/recommend/by-genre/{genre}", tags=["recommend"])
-def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
-    gq = genre.strip().lower()
-    filt = [g for g in GAMES if gq in g["genres"].lower()]
-    # tri simple : rating puis metacritic
-    filt.sort(key=lambda g: (g["rating"], g["metacritic"]), reverse=True)
-    recs = [{"title": g["title"], "genres": g["genres"], "score": float(g["rating"])} for g in filt[:k]]
-    return {"recommendations": recs}
-
-
-# ========= Optional root/HEAD (évite 405 dans les logs) =========
 @app.get("/", include_in_schema=False)
 def root():
-    return {"name": app.title, "version": app.version}
-
-@app.head("/", include_in_schema=False)
-def root_head():
-    return
-
-
-# ========= Startup log =========
-@app.on_event("startup")
-def on_startup():
-    logger.info("Application startup complete. %d jeux chargés.", len(GAMES))
+    return {"name": app.title, "
