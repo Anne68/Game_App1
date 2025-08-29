@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
 from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 
@@ -23,15 +24,6 @@ from monitoring_metrics import (
     prediction_latency,
     model_prediction_counter,
     get_monitor,
-)
-
-from passlib.context import CryptContext
-from passlib.exc import UnknownHashError  # <-- ajouter
-
-# accepte plusieurs formats historiques et « upgrade » automatiquement
-pwd_ctx = CryptContext(
-    schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"],
-    deprecated="auto",
 )
 
 # ---------------------------------------------------------------------
@@ -49,8 +41,14 @@ SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = settings.ALGORITHM
 ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
+# OAuth2 for Swagger
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Accepte plusieurs formats historiques et « upgrade » automatiquement
+pwd_ctx = CryptContext(
+    schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"],
+    deprecated="auto",
+)
 
 # ---------------------------------------------------------------------
 # FastAPI app
@@ -115,7 +113,6 @@ GAMES: List[Dict[str, Any]] = [
 # ---------------------------------------------------------------------
 # DB helpers (MySQL users)
 # ---------------------------------------------------------------------
-# --- helpers MySQL (remplacer l'existant) ---
 def get_db_conn():
     ssl = {"ssl": {"ca": settings.DB_SSL_CA}} if settings.DB_SSL_CA else {}
     return pymysql.connect(
@@ -131,7 +128,6 @@ def get_db_conn():
 def ensure_users_table():
     """Crée la table si absente et migre 'password' -> 'password_hash' si besoin."""
     with get_db_conn() as conn, conn.cursor() as cur:
-        # table absente → créer
         cur.execute("SHOW TABLES LIKE 'users';")
         if not cur.fetchone():
             cur.execute(
@@ -156,71 +152,61 @@ def ensure_users_table():
             has_legacy = cur.fetchone() is not None
             if has_legacy:
                 try:
-                    # migrer la colonne legacy
                     cur.execute("ALTER TABLE users CHANGE COLUMN password password_hash VARCHAR(255) NOT NULL;")
                     conn.commit()
                     logger.info("Migrated users.password -> users.password_hash")
                 except Exception as e:
-                    # pas bloquant : on utilisera 'password' en lecture/écriture
                     logger.warning("Could not migrate users table, will use legacy 'password' column. %s", e)
             else:
-                # table bizarre, ajoute la bonne colonne
                 cur.execute("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NOT NULL;")
                 conn.commit()
                 logger.info("Added users.password_hash column.")
-
-def users_password_column() -> str:
-    """Retourne la colonne à utiliser pour le mot de passe ('password_hash' ou 'password')."""
-    with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SHOW COLUMNS FROM users LIKE 'password_hash';")
-        if cur.fetchone():
-            return "password_hash"
-        cur.execute("SHOW COLUMNS FROM users LIKE 'password';")
-        if cur.fetchone():
-            return "password"
-    return "password_hash"  # fallback
-
-def get_user(username: str) -> Optional[dict]:
-    with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
-        return cur.fetchone()
-
-def create_user(username: str, password: str):
-    if get_user(username):
-        raise HTTPException(status_code=400, detail="User already exists")
-    hpwd = pwd_ctx.hash(password)
-    col = users_password_column()
-    with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute(f"INSERT INTO users(username, {col}) VALUES(%s,%s)", (username, hpwd))
-        conn.commit()
 
 def users_has_column(column: str) -> bool:
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute("SHOW COLUMNS FROM users LIKE %s;", (column,))
         return cur.fetchone() is not None
 
-def extract_stored_password(row: dict) -> tuple[str | None, str]:
-    """
-    Renvoie (colonne, valeur) pour la 1ère colonne contenant un mot de passe non vide,
-    en priorité 'hashed_password', sinon 'password_hash', sinon 'password' (fallback).
-    """
-    for col in ("hashed_password", "password_hash", "password"):
-        if col in row:
-            v = (row[col] or "").strip()
-            if v:
-                return col, v
-    return None, ""
+def users_password_column() -> str:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SHOW COLUMNS FROM users LIKE 'hashed_password';")
+        if cur.fetchone():
+            return "hashed_password"
+        cur.execute("SHOW COLUMNS FROM users LIKE 'password_hash';")
+        if cur.fetchone():
+            return "password_hash"
+        cur.execute("SHOW COLUMNS FROM users LIKE 'password';")
+        if cur.fetchone():
+            return "password"
+    return "password_hash"
+
+def get_user(username: str) -> Optional[dict]:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        return cur.fetchone()
 
 def update_user_password(username: str, new_hash: str) -> None:
     """
-    Ecrit le hash moderne dans 'hashed_password'. Si 'password_hash' existe, on la met aussi
-    (compatibilité), ou on peut la remettre à NULL selon préférence.
+    Écrit le hash moderne dans 'hashed_password'. Si 'password_hash' existe, on la met aussi.
     """
-    set_parts = ["hashed_password=%s"]
-    params = [new_hash]
+    set_parts = []
+    params: list[Any] = []
+
+    if users_has_column("hashed_password"):
+        set_parts.append("hashed_password=%s")
+        params.append(new_hash)
     if users_has_column("password_hash"):
         set_parts.append("password_hash=%s")
-        params.append(new_hash)  # ou None si tu veux la vider: params.append(None)
+        params.append(new_hash)
+
+    if not set_parts:
+        # dernier recours : créer la colonne password_hash et écrire
+        with get_db_conn() as conn, conn.cursor() as cur:
+            cur.execute("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NOT NULL;")
+            conn.commit()
+        set_parts.append("password_hash=%s")
+        params.append(new_hash)
+
     params.append(username)
     sql = f"UPDATE users SET {', '.join(set_parts)} WHERE username=%s"
     with get_db_conn() as conn, conn.cursor() as cur:
@@ -232,15 +218,20 @@ def migrate_legacy_passwords() -> int:
     if not (users_has_column("hashed_password") and users_has_column("password_hash")):
         return 0
     with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(
+            """
             UPDATE users
             SET hashed_password = password_hash
             WHERE (hashed_password IS NULL OR hashed_password = '')
               AND password_hash IS NOT NULL AND password_hash <> '';
-        """)
+            """
+        )
         affected = cur.rowcount or 0
         conn.commit()
         return affected
+
+def looks_like_hash(s: str) -> bool:
+    return isinstance(s, str) and s.startswith("$")
 
 # ---------------------------------------------------------------------
 # Auth helpers
@@ -264,40 +255,64 @@ def verify_token(token: str = Depends(oauth2_scheme)) -> str:
 # =======================
 # AUTH — routes /token + /auth/token
 # =======================
-from fastapi import Form, HTTPException
-
-# NB: laisse bien ceci pour Swagger
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
-
 def _issue_token_core(username: str, password: str):
-    # Récup du user depuis MySQL
-    u = get_user_by_username(username)            # -> dict | None
+    u = get_user(username)
     if not u:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-    # Compat colonnes (hashed_password recommandé)
-    pwd_hash = u.get("hashed_password") or u.get("password_hash")
-    if not pwd_hash:
+    stored = (u.get("hashed_password") or u.get("password_hash") or u.get("password") or "").strip()
+    if not stored:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-    # Vérif du mot de passe (passlib + bcrypt)
-    if not pwd_ctx.verify(password, pwd_hash):
+    ok = False
+    if looks_like_hash(stored):
+        try:
+            ok = pwd_ctx.verify(password, stored)
+        except UnknownHashError:
+            ok = False
+    else:
+        # ancien stockage en clair
+        ok = (stored == password)
+
+    if not ok:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-    # OK → JWT
+    # Upgrade en bcrypt si nécessaire
+    try:
+        scheme = pwd_ctx.identify(stored) if looks_like_hash(stored) else None
+    except Exception:
+        scheme = None
+    if scheme != "bcrypt":  # None, pbkdf2, sha256_crypt, plain…
+        update_user_password(username, pwd_ctx.hash(password))
+
     access_token = create_access_token({"sub": username})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# Route attendue par Swagger & Streamlit
 @app.post("/token", tags=["auth"])
 def token(username: str = Form(...), password: str = Form(...)):
     return _issue_token_core(username, password)
 
-# Alias si tu exposes aussi un préfixe /auth
 @app.post("/auth/token", tags=["auth"])
 def token_alias(username: str = Form(...), password: str = Form(...)):
     return _issue_token_core(username, password)
 
+@app.post("/register", tags=["auth"])
+def register(username: str = Form(...), password: str = Form(...)):
+    username = username.strip()
+    if get_user(username):
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    hpwd = pwd_ctx.hash(password)
+    col = users_password_column()
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"INSERT INTO users (username, {col}) VALUES (%s, %s)", (username, hpwd))
+        # si une 2e colonne existe, synchronise
+        if col != "hashed_password" and users_has_column("hashed_password"):
+            cur.execute("UPDATE users SET hashed_password=%s WHERE username=%s", (hpwd, username))
+        if col != "password_hash" and users_has_column("password_hash"):
+            cur.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hpwd, username))
+        conn.commit()
+    return {"ok": True}
 
 # ---------------------------------------------------------------------
 # Decorator (fix: preserve signature + support async)
@@ -316,7 +331,7 @@ def measure_latency(endpoint: str):
                     model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
                     raise
             async_wrapper.__name__ = func.__name__
-            async_wrapper.__signature__ = inspect.signature(func)  # <- crucial for FastAPI
+            async_wrapper.__signature__ = inspect.signature(func)
             return async_wrapper
         else:
             def sync_wrapper(*args, **kwargs):
@@ -330,7 +345,7 @@ def measure_latency(endpoint: str):
                     model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
                     raise
             sync_wrapper.__name__ = func.__name__
-            sync_wrapper.__signature__ = inspect.signature(func)    # <- crucial for FastAPI
+            sync_wrapper.__signature__ = inspect.signature(func)
             return sync_wrapper
     return decorator
 
@@ -454,46 +469,18 @@ def recommend_by_game(game_id: int, k: int = Query(10, ge=1, le=50), user: str =
 # --- Endpoints pour Streamlit UI ---
 @app.get("/recommend/by-title/{title}", tags=["recommend"])
 def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
-    # prend le 1er jeu qui “match” le titre, puis utilise le modèle par id
     matches = [g for g in GAMES if title.lower() in g["title"].lower()]
     if not matches:
         raise HTTPException(status_code=404, detail="Game not found")
-    return recommend_by_game(matches[0]["id"], k, user)  # réutilise la logique ci-dessus
+    return recommend_by_game(matches[0]["id"], k, user)
 
 @app.get("/recommend/by-genre/{genre}", tags=["recommend"])
 def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
     model = get_model()
     if not model.is_trained:
         model.train(GAMES)
-    # simple: utiliser la requête texte du modèle
     recos = model.predict(query=genre, k=k, min_confidence=0.0)
     return {"genre": genre, "recommendations": recos}
-
-# ---------------------------------------------------------------------
-# Auth endpoints (MySQL)
-# ---------------------------------------------------------------------
-def users_password_target_column() -> str:
-    # On privilégie 'hashed_password'
-    return "hashed_password" if users_has_column("hashed_password") else "password_hash"
-
-@app.post("/register", tags=["auth"])
-def register(username: str = Form(...), password: str = Form(...)):
-    username = username.strip()
-    if get_user(username):
-        raise HTTPException(status_code=400, detail="User already exists")
-
-    hpwd = pwd_ctx.hash(password)
-    col = users_password_target_column()
-
-    with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute(f"INSERT INTO users (username, {col}) VALUES (%s, %s)", (username, hpwd))
-        # si les deux colonnes existent, tu peux synchroniser :
-        if col == "hashed_password" and users_has_column("password_hash"):
-            cur.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hpwd, username))
-        conn.commit()
-
-    return {"ok": True}
-
 
 # ---------------------------------------------------------------------
 # Simple games search
@@ -546,16 +533,15 @@ async def startup_event():
 
         # (optionnel) migre password_hash -> hashed_password si la colonne legacy existe
         try:
-            if "migrate_legacy_passwords" in globals():
-                migrated = migrate_legacy_passwords()
-                if migrated:
-                    logger.info("Password migration: %d row(s) updated", migrated)
-                else:
-                    logger.info("Password migration: nothing to do")
+            migrated = migrate_legacy_passwords()
+            if migrated:
+                logger.info("Password migration: %d row(s) updated", migrated)
+            else:
+                logger.info("Password migration: nothing to do")
         except Exception as e:
             logger.warning("Password migration skipped (error): %s", e)
 
-    except Exception as e:
+    except Exception:
         logger.exception("Database initialization failed")
         raise
 
@@ -574,4 +560,3 @@ async def startup_event():
         logger.warning("Error while loading model: %s. Will train on first request.", e)
 
     logger.info("API startup complete. %d games available.", len(GAMES))
-
