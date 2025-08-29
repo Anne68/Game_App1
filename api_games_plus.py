@@ -261,6 +261,44 @@ def verify_token(token: str = Depends(oauth2_scheme)) -> str:
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+# =======================
+# AUTH — routes /token + /auth/token
+# =======================
+from fastapi import Form, HTTPException
+
+# NB: laisse bien ceci pour Swagger
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+def _issue_token_core(username: str, password: str):
+    # Récup du user depuis MySQL
+    u = get_user_by_username(username)            # -> dict | None
+    if not u:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    # Compat colonnes (hashed_password recommandé)
+    pwd_hash = u.get("hashed_password") or u.get("password_hash")
+    if not pwd_hash:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    # Vérif du mot de passe (passlib + bcrypt)
+    if not pwd_ctx.verify(password, pwd_hash):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    # OK → JWT
+    access_token = create_access_token({"sub": username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Route attendue par Swagger & Streamlit
+@app.post("/token", tags=["auth"])
+def token(username: str = Form(...), password: str = Form(...)):
+    return _issue_token_core(username, password)
+
+# Alias si tu exposes aussi un préfixe /auth
+@app.post("/auth/token", tags=["auth"])
+def token_alias(username: str = Form(...), password: str = Form(...)):
+    return _issue_token_core(username, password)
+
+
 # ---------------------------------------------------------------------
 # Decorator (fix: preserve signature + support async)
 # ---------------------------------------------------------------------
