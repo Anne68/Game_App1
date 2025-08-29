@@ -1,0 +1,12 @@
+# --- Client Streamlit uniquement ---
+streamlit==1.49.0
+requests>=2.32
+python-dotenv>=1.0
+
+# Si tu affiches des tableaux ou fais un peu de data :
+pandas==2.3.2
+numpy==2.3.2
+
+# Evite l’erreur "distutils" lors d’installations depuis sdist
+setuptools>=70
+wheel
