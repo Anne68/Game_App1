@@ -1,242 +1,270 @@
-# client_streamlit.py — UI Streamlit <-> API FastAPI
+# client_streamlit.py
 from __future__ import annotations
-
 import os
-from urllib.parse import quote
-
 import requests
 import pandas as pd
 import streamlit as st
 
-# =======================
-# Config & Session State
-# =======================
-st.set_page_config(page_title="Games UI", page_icon="🎮", layout="wide")
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="🎮 Games UI", page_icon="🎮", layout="wide")
 
-API_URL_DEFAULT = "https://game-app-y8be.onrender.com"  # ton service Render
-API_URL = (os.getenv("API_URL") or API_URL_DEFAULT).rstrip("/")
+API_BASE = (
+    st.secrets.get("API_BASE")
+    or os.getenv("API_BASE")
+    or "https://game-app-y8be.onrender.com"
+)
 
-if "token" not in st.session_state:
-    st.session_state["token"] = None
-if "username" not in st.session_state:
-    st.session_state["username"] = None
+DEFAULT_K = int(os.getenv("DEFAULT_K", "10"))
 
+# -----------------------------------------------------------------------------
+# Utils API
+# -----------------------------------------------------------------------------
+def _auth_headers() -> dict:
+    token = st.session_state.get("token")
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
-# =======================
-# HTTP helpers
-# =======================
-def _headers(with_auth: bool = True) -> dict:
-    h = {"Accept": "application/json"}
-    if with_auth and st.session_state["token"]:
-        h["Authorization"] = f"Bearer {st.session_state['token']}"
-    return h
+def api_get(path: str, timeout: float = 25.0):
+    url = f"{API_BASE}{path}"
+    r = requests.get(url, headers=_auth_headers(), timeout=timeout)
+    if r.status_code == 401:
+        raise PermissionError("Non autorisé. Connecte-toi d’abord.")
+    r.raise_for_status()
+    return r.json()
 
-def _parse_json(resp: requests.Response) -> dict:
-    ct = resp.headers.get("content-type", "")
-    return resp.json() if ct.startswith("application/json") else {"detail": resp.text}
+def api_post_form(path: str, data: dict, timeout: float = 25.0):
+    url = f"{API_BASE}{path}"
+    r = requests.post(url, data=data, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-def api_get(path: str, params: dict | None = None, with_auth: bool = True):
+# -----------------------------------------------------------------------------
+# Auth helpers
+# -----------------------------------------------------------------------------
+def do_login(username: str, password: str) -> bool:
     try:
-        r = requests.get(f"{API_URL}{path}", params=params, headers=_headers(with_auth), timeout=25)
-        return r.status_code, _parse_json(r)
-    except Exception as e:
-        return 0, {"detail": str(e)}
-
-def api_post_form(path: str, data: dict, with_auth: bool = False):
-    try:
-        r = requests.post(f"{API_URL}{path}", data=data, headers=_headers(with_auth), timeout=25)
-        return r.status_code, _parse_json(r)
-    except Exception as e:
-        return 0, {"detail": str(e)}
-
-def api_post_json(path: str, json: dict, with_auth: bool = True):
-    try:
-        r = requests.post(f"{API_URL}{path}", json=json, headers=_headers(with_auth), timeout=60)
-        return r.status_code, _parse_json(r)
-    except Exception as e:
-        return 0, {"detail": str(e)}
-
-def handle_401(code: int, payload: dict) -> bool:
-    if code == 401:
-        st.error("⛔ Session expirée / non autorisée. Merci de vous reconnecter.")
-        st.session_state["token"] = None
-        st.session_state["username"] = None
+        data = api_post_form("/token", {"username": username, "password": password})
+        st.session_state["token"] = data["access_token"]
+        st.session_state["username"] = username
         return True
-    return False
+    except requests.HTTPError as e:
+        msg = e.response.json().get("detail") if e.response is not None else str(e)
+        st.error(f"Échec de connexion : {msg}")
+        return False
 
-def show_not_found(code: int, payload: dict, msg: str) -> bool:
-    if code == 404:
-        st.info(msg)
+def do_register(username: str, password: str) -> bool:
+    try:
+        api_post_form("/register", {"username": username, "password": password})
+        st.success("Compte créé ✅ Tu peux te connecter maintenant.")
         return True
-    return False
+    except requests.HTTPError as e:
+        msg = e.response.json().get("detail") if e.response is not None else str(e)
+        st.error(f"Inscription impossible : {msg}")
+        return False
 
+# -----------------------------------------------------------------------------
+# UI header
+# -----------------------------------------------------------------------------
+st.markdown(
+    """
+    <style>
+      .tag { padding:4px 10px; border-radius:999px; font-size:.80rem; margin-right:.35rem; }
+      .tag-green { background:#E8FFF3; color:#137C4B; border:1px solid #9CE0C0; }
+      .muted { color:#6b7280; font-size:.9rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# =======================
-# Header + Sidebar
-# =======================
-left, right = st.columns([1, 1], vertical_alignment="center")
-with left:
+col_a, col_b = st.columns([1, 3])
+with col_a:
     st.title("🎮 Games UI")
-with right:
-    status = "✅ Connecté" if st.session_state["token"] else "🔒 Non connecté"
-    st.info(status)
+with col_b:
+    st.markdown(
+        """
+        <div style="margin-top:14px;">
+          <span class="tag tag-green">✅ Connecté</span> si tu vois des résultats.
+          <span class="tag">🆕 Inscription</span>
+          <span class="tag">🔑 Auth</span>
+          <span class="tag">🔎 Recherche</span>
+          <span class="tag">✨ Recos</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-st.sidebar.subheader("Backend")
-api_input = st.sidebar.text_input(
-    "API URL",
-    value=API_URL,
-    help="Ex: https://game-app-y8be.onrender.com (peut aussi être défini via la variable d'env API_URL).",
-)
-if api_input.strip():
-    API_URL = api_input.strip().rstrip("/")
+# -----------------------------------------------------------------------------
+# Sidebar: Auth
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.subheader("🔐 Authentification")
 
-col_a, col_b = st.sidebar.columns(2)
-if col_a.button("Test /healthz"):
-    code, payload = api_get("/healthz", with_auth=False)
-    (st.sidebar.success if code == 200 else st.sidebar.error)(f"{code} → {payload}")
+    if "token" not in st.session_state:
+        with st.form("login_form", clear_on_submit=False):
+            u = st.text_input("Utilisateur", key="login_user")
+            p = st.text_input("Mot de passe", type="password", key="login_pass")
+            ok = st.form_submit_button("Se connecter")
+        if ok:
+            if do_login(u.strip(), p):
+                st.toast("Connecté ✅", icon="✅")
 
-if col_b.button("Métriques modèle"):
-    if not st.session_state["token"]:
-        st.sidebar.warning("Connecte-toi d'abord.")
+        with st.expander("🆕 Créer un compte"):
+            with st.form("register_form", clear_on_submit=True):
+                ru = st.text_input("Utilisateur (nouveau)", key="reg_user")
+                rp = st.text_input("Mot de passe (nouveau)", type="password", key="reg_pass")
+                rok = st.form_submit_button("S’inscrire")
+            if rok:
+                if do_register(ru.strip(), rp):
+                    st.toast("Compte créé 🎉", icon="🎉")
     else:
-        c, p = api_get("/model/metrics")
-        if handle_401(c, p): ...
-        elif c == 200:
-            st.sidebar.json(p)
-        else:
-            st.sidebar.error(p.get("detail", p))
+        st.success(f"Connecté en tant que **{st.session_state['username']}**")
+        if st.button("Se déconnecter"):
+            st.session_state.pop("token", None)
+            st.session_state.pop("username", None)
+            st.rerun()
 
-with st.sidebar.expander("⚙️ Entraîner le modèle", expanded=False):
-    force = st.checkbox("Forcer ré-entraînement", value=False)
-    if st.button("Train now"):
-        if not st.session_state["token"]:
-            st.warning("Connecte-toi d'abord.")
-        else:
-            payload = {"force_retrain": bool(force)}
-            c, p = api_post_json("/model/train", payload, with_auth=True)
-            if handle_401(c, p): ...
-            elif c == 200:
-                st.success(f"✅ Entraîné — version {p.get('version')}, {round(p.get('duration', 0), 3)} s")
-            else:
-                st.error(p.get("detail", p))
+# -----------------------------------------------------------------------------
+# Tabs
+# -----------------------------------------------------------------------------
+tab_search, tab_reco = st.tabs(["🔎 Recherche", "✨ Recommandations"])
 
-
-# =======================
-# Auth UI
-# =======================
-def login_box(suffix: str = "main"):
-    st.subheader("🔑 Auth")
-    with st.form(f"login_form_{suffix}", clear_on_submit=False):
-        u = st.text_input("Username", key=f"login_u_{suffix}")
-        p = st.text_input("Password", type="password", key=f"login_p_{suffix}")
-        sub = st.form_submit_button("Login")
-    if sub:
-        code, payload = api_post_form("/token", {"username": u, "password": p}, with_auth=False)
-        if code == 200 and "access_token" in payload:
-            st.session_state["token"] = payload["access_token"]
-            st.session_state["username"] = u
-            st.success("Connecté !")
-        else:
-            st.error(payload.get("detail", payload))
-
-def signup_box(suffix: str = "main"):
-    st.subheader("🆕 Créer un compte")
-    with st.form(f"signup_form_{suffix}", clear_on_submit=False):
-        u = st.text_input("Username", key=f"signup_u_{suffix}")
-        p = st.text_input("Password", type="password", key=f"signup_p_{suffix}")
-        p2 = st.text_input("Confirmer mot de passe", type="password", key=f"signup_p2_{suffix}")
-        sub = st.form_submit_button("S'inscrire")
-    if sub:
-        if not u.strip() or not p:
-            st.warning("Renseigne un username + mot de passe.")
-            return
-        if p != p2:
-            st.error("Les mots de passe ne correspondent pas.")
-            return
-        c1, r1 = api_post_form("/register", {"username": u.strip(), "password": p}, with_auth=False)
-        if c1 == 200 and r1.get("ok"):
-            st.success("Compte créé ✅")
-            c2, r2 = api_post_form("/token", {"username": u.strip(), "password": p}, with_auth=False)
-            if c2 == 200 and "access_token" in r2:
-                st.session_state["token"] = r2["access_token"]
-                st.session_state["username"] = u.strip()
-                st.success("Connecté automatiquement 🎉")
-            else:
-                st.info("Compte créé. Tu peux te connecter.")
-        else:
-            st.error(r1.get("detail", r1))
-
-
-# =======================
-# UI Sections
-# =======================
-tab_signup, tab_auth, tab_search, tab_reco = st.tabs(
-    ["🆕 Inscription", "🔑 Auth", "🔎 Recherche", "✨ Recos"]
-)
-
-with tab_signup:
-    signup_box()
-
-with tab_auth:
-    login_box()
-
+# =============================================================================
+# 🔎 Recherche par titre
+# =============================================================================
 with tab_search:
     st.subheader("🔎 Recherche par titre")
-    q = st.text_input("Titre contient…", key="search_title")
-    if st.button("Chercher", key="btn_search_title"):
-        if not q.strip():
-            st.warning("Saisis un titre.")
-        else:
-            code, payload = api_get(f"/games/by-title/{quote(q.strip())}")
-            if handle_401(code, payload):
-                st.stop()
-            if code == 200:
-                df = pd.DataFrame(payload.get("results", []))
-                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("Aucun résultat.")
-            elif show_not_found(code, payload, "Aucun résultat."):
-                pass
+    q = st.text_input("Titre contient…", value="Mario")
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        k_for_quick = st.number_input("k (pour recos rapides)", 1, 50, min(DEFAULT_K, 10))
+    with c2:
+        if st.button("Chercher", use_container_width=False):
+            if not st.session_state.get("token"):
+                st.warning("Connecte-toi pour interroger l’API.")
             else:
-                st.error(payload.get("detail", payload))
+                with st.spinner("Recherche en cours…"):
+                    try:
+                        data = api_get(f"/games/by-title/{requests.utils.quote(q)}")
+                        rows = data.get("results", [])
+                        df = pd.DataFrame(rows)
+                        if df.empty:
+                            st.info("Aucun résultat.")
+                        else:
+                            st.dataframe(df, use_container_width=True, hide_index=True)
+                            st.caption("Clique une ligne pour obtenir des recos par **titre** ci-dessous 👇")
 
+                            # Petites actions en table
+                            for r in rows:
+                                cols = st.columns([5, 1])
+                                with cols[0]:
+                                    st.write(f"**{r['title']}** (id source RAWG : {r['id']})")
+                                with cols[1]:
+                                    if st.button("✨ Recos", key=f"reco_{r['id']}"):
+                                        st.session_state["reco_title_preset"] = r["title"]
+                                        st.session_state["reco_k_preset"] = int(k_for_quick)
+                                        st.switch_page("client_streamlit.py")
+                    except PermissionError as e:
+                        st.error(str(e))
+                    except requests.HTTPError as e:
+                        # 404/500 messages propres
+                        detail = e.response.json().get("detail") if e.response is not None else str(e)
+                        st.error(f"Erreur API: {detail}")
+                    except Exception as e:
+                        st.exception(e)
+
+# =============================================================================
+# ✨ Recommandations
+# =============================================================================
 with tab_reco:
-    st.subheader("✨ Recommandations")
+    sub_tab_title, sub_tab_genre = st.tabs(["Par **titre**", "Par **genre**"])
 
-    col1, col2 = st.columns(2)
+    # ------------------ Par titre ------------------
+    with sub_tab_title:
+        st.subheader("✨ Recos — par titre")
+        preset_title = st.session_state.pop("reco_title_preset", None)
+        preset_k = st.session_state.pop("reco_k_preset", DEFAULT_K)
+        title = st.text_input("Titre (ex. Mario)", value=preset_title or "Mario")
+        k = st.number_input("Combien de recommandations ?", min_value=1, max_value=50, value=preset_k)
 
-    with col1:
-        st.caption("Par **titre** (DB Alwaysdata)")
-        ti = st.text_input("Titre", key="reco_title")
-        k1 = st.number_input("k", min_value=1, max_value=50, value=10, step=1, key="k_title")
-        if st.button("Get recommendations (title)", key="btn_recos_title"):
-            if not ti.strip():
-                st.warning("Saisis un titre.")
+        col_go, _ = st.columns([1, 4])
+        if col_go.button("Obtenir des recommandations", type="primary"):
+            if not st.session_state.get("token"):
+                st.warning("Connecte-toi pour interroger l’API.")
             else:
-                code, payload = api_get(f"/recommend/by-title/{quote(ti.strip())}", params={"k": int(k1)})
-                if handle_401(code, payload):
-                    st.stop()
-                if code == 200:
-                    df = pd.DataFrame(payload.get("recommendations", []))
-                    st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("Aucune reco.")
-                elif show_not_found(code, payload, "Aucune reco."):
-                    pass
-                else:
-                    st.error(payload.get("detail", payload))
+                with st.spinner("Prédiction du modèle…"):
+                    try:
+                        # L’API entraîne au besoin, puis rec par titre
+                        data = api_get(f"/recommend/by-title/{requests.utils.quote(title)}?k={int(k)}")
+                        recs = data.get("recommendations", [])
+                        if not recs:
+                            st.info("Aucune reco trouvée.")
+                        else:
+                            # recs items: [{'id':..., 'title':..., 'score':...}, ...] (selon ton modèle)
+                            df = pd.DataFrame(recs)
+                            # Propreté des colonnes
+                            for c in ["id", "game_id", "game_id_rawg"]:
+                                if c in df.columns and "id" not in df.columns:
+                                    df.rename(columns={c: "id"}, inplace=True)
+                            if "score" in df.columns:
+                                df["score"] = (df["score"] * 100).round(1)
+                                df.rename(columns={"score": "confidence_%"}, inplace=True)
+                            st.dataframe(df, use_container_width=True, hide_index=True)
+                    except requests.HTTPError as e:
+                        if e.response is not None:
+                            try:
+                                detail = e.response.json().get("detail")
+                            except Exception:
+                                detail = e.response.text
+                        else:
+                            detail = str(e)
+                        # Message fréquent côté modèle scikit-learn
+                        if isinstance(detail, str) and "NaN" in detail:
+                            st.error("Le modèle a détecté des NaN dans les features. "
+                                     "Essaie d’abord une reco **par genre** (ci-dessous) pour déclencher un entraînement propre, "
+                                     "ou relance la recherche.")
+                        else:
+                            st.error(f"Erreur API: {detail}")
+                    except Exception as e:
+                        st.exception(e)
 
-    with col2:
-        st.caption("Par **genre** (ex: Action, RPG)")
-        ge = st.text_input("Genre", key="reco_genre")
-        k2 = st.number_input("k ", min_value=1, max_value=50, value=10, step=1, key="k_genre")
-        if st.button("Get recommendations (genre)", key="btn_recos_genre"):
-            if not ge.strip():
-                st.warning("Saisis un genre.")
+    # ------------------ Par genre ------------------
+    with sub_tab_genre:
+        st.subheader("✨ Recos — par genre")
+        genre = st.text_input("Genre (ex. RPG, Action, Indie…)", value="RPG")
+        k2 = st.number_input("k", min_value=1, max_value=50, value=DEFAULT_K, key="genre_k")
+        if st.button("Recommander par genre"):
+            if not st.session_state.get("token"):
+                st.warning("Connecte-toi pour interroger l’API.")
             else:
-                code, payload = api_get(f"/recommend/by-genre/{quote(ge.strip())}", params={"k": int(k2)})
-                if handle_401(code, payload):
-                    st.stop()
-                if code == 200:
-                    df = pd.DataFrame(payload.get("recommendations", []))
-                    st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("Aucune reco.")
-                elif show_not_found(code, payload, "Aucune reco."):
-                    pass
-                else:
-                    st.error(payload.get("detail", payload))
+                with st.spinner("Prédiction du modèle…"):
+                    try:
+                        data = api_get(f"/recommend/by-genre/{requests.utils.quote(genre)}?k={int(k2)}")
+                        recs = data.get("recommendations", [])
+                        if not recs:
+                            st.info("Aucune reco trouvée.")
+                        else:
+                            df = pd.DataFrame(recs)
+                            for c in ["id", "game_id", "game_id_rawg"]:
+                                if c in df.columns and "id" not in df.columns:
+                                    df.rename(columns={c: "id"}, inplace=True)
+                            if "score" in df.columns:
+                                df["score"] = (df["score"] * 100).round(1)
+                                df.rename(columns={"score": "confidence_%"}, inplace=True)
+                            st.dataframe(df, use_container_width=True, hide_index=True)
+                    except requests.HTTPError as e:
+                        if e.response is not None:
+                            try:
+                                detail = e.response.json().get("detail")
+                            except Exception:
+                                detail = e.response.text
+                        else:
+                            detail = str(e)
+                        st.error(f"Erreur API: {detail}")
+                    except Exception as e:
+                        st.exception(e)
+
+# Footer
+st.caption(
+    f"API: `{API_BASE}` · Astuce : définis `API_BASE` dans Secrets/ENV pour cibler un autre déploiement."
+)
