@@ -1,11 +1,24 @@
-# .env.example - Copier vers .env et configurer
+# === Security === 
+SECRET_KEY=change_me
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=60
 
-# Database (AlwaysData)
+# === Database (MySQL) — connexion à ton MySQL Windows (127.0.0.1:3307 vu depuis Docker) ===
 DB_HOST=mysql-anne.alwaysdata.net
 DB_PORT=3306
 DB_USER=anne
-DB_PASSWORD=@nnevi
+DB_PASSWORD=Vicky2@18
 DB_NAME=anne_games_db
+# SQLAlchemy / Alembic URL
+DB_URL=DB_URL=mysql+pymysql://api_render:<mot_de_passe>@mysql-anne.alwaysdata.net:3306/anne_games_db?charset=utf8mb4
+API_BASE = "https://game-app-y8be.onrender.com"
+API_PREFIX = ""
+TOKEN_PATH = "/token"
+
+
+# === CORS & Logs ===
+LOG_LEVEL=INFO
+ALLOW_ORIGINS=ALLOW_ORIGINS=https://gameapp1-okmessmvfrsrn2tsbdxcjm.streamlit.app,https://game-app1.onrender.com
 
 # API Configuration
 SECRET_KEY=your-secret-key-change-me-in-production
