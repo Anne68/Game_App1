@@ -6,7 +6,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES=60
 # === Database (MySQL) — connexion à ton MySQL Windows (127.0.0.1:3307 vu depuis Docker) ===
 DB_HOST=mysql-anne.alwaysdata.net
 DB_PORT=3306
-DB_USER=anne
+DB_USER=anne@2a00:b6e0:1:210:1::1
 DB_PASSWORD=Vicky2@18
 DB_NAME=anne_games_db
 # SQLAlchemy / Alembic URL
