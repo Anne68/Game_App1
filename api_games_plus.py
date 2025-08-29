@@ -615,22 +615,30 @@ async def startup_event():
 
     logger.info("Starting Games API with ML...")
 
-    # === DB init ===
+        # === DB init ===
     try:
-        ensure_users_table()
-        DB_READY = True
-        DB_LAST_ERROR = None
-        try:
-            n = count_games_in_db()
-            logger.info("Users table ready; games in DB: %s", n)
-        except Exception:
-            logger.info("Users table ready")
+        if settings.db_configured:
+            ensure_users_table()
+            DB_READY = True
+            DB_LAST_ERROR = None
+            try:
+                n = count_games_in_db()
+                logger.info("Users table ready; games in DB: %s", n)
+            except Exception:
+                logger.info("Users table ready")
+        else:
+            DB_READY = False
+            DB_LAST_ERROR = "Database not configured (set DB_* env vars)"
+            logger.warning(DB_LAST_ERROR)
+            if settings.DB_REQUIRED:
+                raise RuntimeError(DB_LAST_ERROR)
     except Exception as e:
         DB_READY = False
         DB_LAST_ERROR = str(e)
         logger.error("Database initialization failed (will continue without DB): %s", e)
         if settings.DB_REQUIRED:
             raise
+
 
     # === ML model ===
     model = get_model()
