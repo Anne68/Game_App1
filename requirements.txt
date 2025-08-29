@@ -13,6 +13,9 @@ cryptography==41.0.7
 pymysql==1.1.0
 python-dotenv==1.0.0
 
+# Settings (⇦ manquait)
+pydantic-settings==2.1.0
+
 # ML & data
 numpy==1.24.3
 pandas==2.1.4
