@@ -119,18 +119,56 @@ def get_db_conn():
     )
 
 def ensure_users_table():
+    """Crée la table si absente et migre 'password' -> 'password_hash' si besoin."""
     with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-              id INT AUTO_INCREMENT PRIMARY KEY,
-              username VARCHAR(190) UNIQUE NOT NULL,
-              password_hash VARCHAR(255) NOT NULL,
-              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """
-        )
-        conn.commit()
+        # table absente → créer
+        cur.execute("SHOW TABLES LIKE 'users';")
+        if not cur.fetchone():
+            cur.execute(
+                """
+                CREATE TABLE users (
+                  id INT AUTO_INCREMENT PRIMARY KEY,
+                  username VARCHAR(190) UNIQUE NOT NULL,
+                  password_hash VARCHAR(255) NOT NULL,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+            )
+            conn.commit()
+            logger.info("Created users table (password_hash).")
+            return
+
+        # table présente → vérifier colonnes
+        cur.execute("SHOW COLUMNS FROM users LIKE 'password_hash';")
+        has_hash = cur.fetchone() is not None
+        if not has_hash:
+            cur.execute("SHOW COLUMNS FROM users LIKE 'password';")
+            has_legacy = cur.fetchone() is not None
+            if has_legacy:
+                try:
+                    # migrer la colonne legacy
+                    cur.execute("ALTER TABLE users CHANGE COLUMN password password_hash VARCHAR(255) NOT NULL;")
+                    conn.commit()
+                    logger.info("Migrated users.password -> users.password_hash")
+                except Exception as e:
+                    # pas bloquant : on utilisera 'password' en lecture/écriture
+                    logger.warning("Could not migrate users table, will use legacy 'password' column. %s", e)
+            else:
+                # table bizarre, ajoute la bonne colonne
+                cur.execute("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NOT NULL;")
+                conn.commit()
+                logger.info("Added users.password_hash column.")
+
+def users_password_column() -> str:
+    """Retourne la colonne à utiliser pour le mot de passe ('password_hash' ou 'password')."""
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SHOW COLUMNS FROM users LIKE 'password_hash';")
+        if cur.fetchone():
+            return "password_hash"
+        cur.execute("SHOW COLUMNS FROM users LIKE 'password';")
+        if cur.fetchone():
+            return "password"
+    return "password_hash"  # fallback
 
 def get_user(username: str) -> Optional[dict]:
     with get_db_conn() as conn, conn.cursor() as cur:
@@ -141,8 +179,9 @@ def create_user(username: str, password: str):
     if get_user(username):
         raise HTTPException(status_code=400, detail="User already exists")
     hpwd = pwd_ctx.hash(password)
+    col = users_password_column()
     with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO users(username, password_hash) VALUES(%s,%s)", (username, hpwd))
+        cur.execute(f"INSERT INTO users(username, {col}) VALUES(%s,%s)", (username, hpwd))
         conn.commit()
 
 # ---------------------------------------------------------------------
