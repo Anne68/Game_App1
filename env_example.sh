@@ -4,7 +4,7 @@
 DB_HOST=mysql-anne.alwaysdata.net
 DB_PORT=3306
 DB_USER=anne
-DB_PASSWORD=your_password_here
+DB_PASSWORD=@nnevi
 DB_NAME=anne_games_db
 
 # API Configuration
