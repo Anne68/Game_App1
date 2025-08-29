@@ -57,6 +57,8 @@ class PredictionRequest(BaseModel):
     min_confidence: float = 0.1
 
 class ModelMetricsResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}  # << ajoute cette ligne
+
     model_version: str
     is_trained: bool
     total_predictions: int
@@ -64,6 +66,7 @@ class ModelMetricsResponse(BaseModel):
     last_training: Optional[str]
     games_count: int
     feature_dimension: int
+
 
 # ========= Demo Data =========
 GAMES: List[Dict] = [
