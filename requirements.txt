@@ -1,12 +1,12 @@
 # --- Client Streamlit uniquement ---
 streamlit==1.49.0
 requests>=2.32
-python-dotenv>=1.0
+python-dotenv==1.0.0
 
-# Si tu affiches des tableaux ou fais un peu de data :
-pandas==2.3.2
-numpy==2.3.2
+# Data (alignés NumPy 1.26)
+pandas==2.1.4
+numpy==1.26.4
 
-# Evite l’erreur "distutils" lors d’installations depuis sdist
+# Build helpers
 setuptools>=70
 wheel
