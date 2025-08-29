@@ -5,9 +5,9 @@ un client Streamlit, la conteneurisation Docker et un pipeline CI.
 
 ## Démarrage rapide (local)
 ```bash
-cp .env.example .env
-pip install -r requirements.txt
-uvicorn api_games_plus:app --reload
+git add README.md
+git commit -m "test: trigger CI/CD pipeline"
+git push origin main
 ```
 
 Swagger: http://127.0.0.1:8000/docs
