@@ -18,7 +18,8 @@ from pydantic import BaseModel
 
 # Import des modules ML
 from model_manager import get_model, RecommendationModel
-from monitoring import get_monitor, measure_latency
+from monitoring_metrics import get_monitor, measure_latency
+
 
 logger = logging.getLogger("games-api-ml")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
