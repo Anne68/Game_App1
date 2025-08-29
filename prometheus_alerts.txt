@@ -1,17 +1,18 @@
-# prometheus/alerts.yml
+# 2.2 Créer prometheus/alerts.yml
+cat > prometheus/alerts.yml << 'EOF'
 groups:
   - name: model_alerts
     interval: 30s
     rules:
       # Alerte si le modèle n'est pas entraîné
       - alert: ModelNotTrained
-        expr: model_info{} == 0
+        expr: model_games_count == 0
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Model not trained"
-          description: "The ML model has not been trained for {{ $value }} minutes"
+          description: "The ML model has not been trained"
       
       # Alerte sur la latence élevée
       - alert: HighPredictionLatency
@@ -26,44 +27,15 @@ groups:
       # Alerte sur le taux d'erreur
       - alert: HighErrorRate
         expr: |
-          rate(model_predictions_total{status="error"}[5m]) > 0.05
+          rate(model_predictions_total{status="error"}[5m]) / 
+          rate(model_predictions_total[5m]) > 0.05
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "High error rate in predictions"
           description: "Error rate is {{ $value | humanizePercentage }}"
-      
-      # Alerte sur la confiance faible
-      - alert: LowModelConfidence
-        expr: model_accuracy < 0.5
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Low model confidence"
-          description: "Model accuracy is {{ $value }}"
-      
-      # Alerte sur le drift
-      - alert: ModelDrift
-        expr: prediction_drift_score > 0.3
-        for: 15m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Model drift detected"
-          description: "Drift score is {{ $value }} (threshold: 0.3)"
-      
-      # Alerte sur la mémoire
-      - alert: HighModelMemoryUsage
-        expr: model_memory_bytes > 1073741824  # 1GB
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High model memory usage"
-          description: "Model using {{ $value | humanize1024 }}B of memory"
-  
+
   - name: api_alerts
     interval: 30s
     rules:
@@ -76,26 +48,4 @@ groups:
         annotations:
           summary: "API is down"
           description: "Games API has been down for {{ $value }} minutes"
-      
-      # Trafic élevé
-      - alert: HighTraffic
-        expr: rate(http_requests_total[5m]) > 100
-        for: 5m
-        labels:
-          severity: info
-        annotations:
-          summary: "High traffic detected"
-          description: "Request rate is {{ $value }} req/s"
-      
-      # Temps de réponse élevé
-      - alert: HighResponseTime
-        expr: |
-          histogram_quantile(0.95, 
-            rate(http_request_duration_seconds_bucket[5m])
-          ) > 2
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High API response time"
-          description: "P95 response time is {{ $value }}s"
+EOF
