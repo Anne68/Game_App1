@@ -26,10 +26,11 @@ from settings import get_settings
 logger = logging.getLogger("games-api-ml")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
-# ========= Config =========
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
+# ========= Config via settings.py =========
+settings = get_settings()
+SECRET_KEY = settings.SECRET_KEY
+ALGORITHM = settings.ALGORITHM
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -43,7 +44,7 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in settings.ALLOW_ORIGINS.split(",") if o.strip()] or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -81,9 +82,7 @@ GAMES: List[Dict] = [
     {"id": 7, "title": "Disco Elysium", "genres": "RPG, Narrative", "rating": 4.7, "metacritic": 91, "platforms": ["PC", "PS4", "Xbox One"]},
 ]
 
-# ========= MySQL helpers (settings.py doit fournir DB_HOST/PORT/USER/PASSWORD/NAME/DB_SSL_CA) =========
-settings = get_settings()
-
+# ========= MySQL helpers =========
 def _get_db_conn():
     """Connexion PyMySQL basée sur settings.py (SSL optionnel)."""
     ssl_params = {"ca": settings.DB_SSL_CA} if getattr(settings, "DB_SSL_CA", None) else None
@@ -327,8 +326,12 @@ def recommend_by_genre(
 @app.post("/register", tags=["auth"])
 def register(username: str = Form(...), password: str = Form(...)):
     """Crée un utilisateur dans la base MySQL (table `users`)."""
-    if len(password) < 8:
-        raise HTTPException(status_code=400, detail="Password too short (min 8)")
+    if len(password) < settings.PASSWORD_MIN_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Password too short (min {settings.PASSWORD_MIN_LENGTH})")
+    # (optionnel) regex de complexité
+    # import re
+    # if not re.match(settings.PASSWORD_REGEX, password):
+    #     raise HTTPException(status_code=400, detail="Password does not meet complexity requirements")
     if _get_user(username):
         raise HTTPException(status_code=400, detail="User already exists")
     hashed = pwd_ctx.hash(password)
