@@ -194,6 +194,40 @@ def create_user(username: str, password: str):
         cur.execute(f"INSERT INTO users(username, {col}) VALUES(%s,%s)", (username, hpwd))
         conn.commit()
 
+def users_has_column(column: str) -> bool:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SHOW COLUMNS FROM users LIKE %s;", (column,))
+        return cur.fetchone() is not None
+
+def extract_stored_password(row: dict) -> tuple[str | None, str]:
+    """
+    Renvoie (colonne, valeur) pour la 1ère colonne contenant un mot de passe non vide,
+    en priorité 'hashed_password', sinon 'password_hash', sinon 'password' (fallback).
+    """
+    for col in ("hashed_password", "password_hash", "password"):
+        if col in row:
+            v = (row[col] or "").strip()
+            if v:
+                return col, v
+    return None, ""
+
+def update_user_password(username: str, new_hash: str) -> None:
+    """
+    Ecrit le hash moderne dans 'hashed_password'. Si 'password_hash' existe, on la met aussi
+    (compatibilité), ou on peut la remettre à NULL selon préférence.
+    """
+    set_parts = ["hashed_password=%s"]
+    params = [new_hash]
+    if users_has_column("password_hash"):
+        set_parts.append("password_hash=%s")
+        params.append(new_hash)  # ou None si tu veux la vider: params.append(None)
+    params.append(username)
+    sql = f"UPDATE users SET {', '.join(set_parts)} WHERE username=%s"
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        conn.commit()
+
+
 # ---------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------
