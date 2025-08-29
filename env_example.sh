@@ -7,7 +7,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES=60
 DB_HOST=mysql-anne.alwaysdata.net
 DB_PORT=3306
 DB_USER=anne
-DB_PASSWORD=Vicky2@18
+DB_PASSWORD=Vicky@18
 DB_NAME=anne_games_db
 # SQLAlchemy / Alembic URL
 DB_URL=DB_URL=mysql+pymysql://api_render:<mot_de_passe>@mysql-anne.alwaysdata.net:3306/anne_games_db?charset=utf8mb4
