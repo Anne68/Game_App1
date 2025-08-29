@@ -1,15 +1,44 @@
-# client_streamlit.py
+# client_streamlit.py (version complète)
+
 import os
 import time
 import requests
 import pandas as pd
 import streamlit as st
 
-# -------------------- Config --------------------
 st.set_page_config(page_title="🎮 Games UI", page_icon="🎮", layout="wide")
 API_URL = os.getenv("ST_API_URL", "https://game-app-y8be.onrender.com").rstrip("/")
 
-# -------------------- Helpers HTTP --------------------
+# ---------- CSS pour les cartes ----------
+st.markdown("""
+<style>
+.card {
+  border: 1px solid rgba(200,200,200,.18);
+  background: rgba(255,255,255,.03);
+  border-radius: 18px;
+  padding: 14px 16px;
+  height: 100%;
+}
+.card h3 {
+  margin: 0 0 6px 0; font-size: 1.05rem;
+}
+.rowmeta { display:flex; gap:10px; margin:.35rem 0 .6rem 0; flex-wrap:wrap; }
+.badge {
+  font-size: .78rem; padding: 4px 8px; border-radius: 999px;
+  background: rgba(125,125,255,.15); border:1px solid rgba(125,125,255,.25);
+}
+.badge.price { background: rgba(120,200,120,.15); border-color: rgba(120,200,120,.25);}
+.badge.gray  { background: rgba(255,255,255,.07); border-color: rgba(255,255,255,.15);}
+.platforms { margin:.25rem 0 .6rem 0; }
+.platforms .chip {
+  display:inline-block; margin:2px 6px 2px 0; padding:3px 8px; border-radius:999px;
+  font-size:.78rem; background: rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15);
+}
+.small { opacity:.7; font-size:.8rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- Helpers HTTP ----------
 def api_headers():
     tok = st.session_state.get("token")
     return {"Authorization": f"Bearer {tok}"} if tok else {}
@@ -19,16 +48,6 @@ def api_get(path, params=None):
     if r.status_code == 401:
         st.error("Non autorisé — connecte-toi d’abord.")
         return {}
-    if not r.ok:
-        try:
-            st.error(r.json())
-        except Exception:
-            st.error(r.text)
-        return {}
-    return r.json()
-
-def api_post(path, data=None):
-    r = requests.post(f"{API_URL}{path}", headers=api_headers(), data=data or {}, timeout=30)
     if not r.ok:
         try:
             st.error(r.json())
@@ -55,7 +74,7 @@ def register(username, password):
         except Exception:
             st.error(r.text)
 
-# -------------------- UI --------------------
+# ---------- UI ----------
 st.title("🎮 Games UI")
 
 with st.sidebar:
@@ -80,15 +99,50 @@ with st.sidebar:
 
 tabs = st.tabs(["🆕 Inscription", "🔑 Auth", "🔎 Recherche", "✨ Recos"])
 
-# ----- Onglet Inscription (raccourci) -----
 with tabs[0]:
     st.caption("Tu peux aussi créer un compte dans la barre latérale.")
 
-# ----- Onglet Auth (raccourci) -----
 with tabs[1]:
     st.caption("Connecte-toi via la barre latérale pour débloquer les appels API protégés.")
 
-# ----- Onglet Recherche -----
+# ---------- Composant carte ----------
+def render_game_card(g: dict):
+    title = g.get("title") or "Sans titre"
+    price = g.get("best_price") or "N/A"
+    rating = g.get("rating")
+    metac = g.get("metacritic")
+    plats = g.get("platforms") or []
+
+    # texte pour badges
+    rating_txt = f"{rating:.2f}" if isinstance(rating, (int, float)) else "N/A"
+    metac_txt  = f"{int(metac)}" if isinstance(metac, (int, float)) else "N/A"
+
+    # chips plateformes
+    chips = " ".join([f"<span class='chip'>{p}</span>" for p in plats])
+
+    with st.container():
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown(f"<h3>{title}</h3>", unsafe_allow_html=True)
+
+        st.markdown(f"<div class='platforms'>{chips}</div>", unsafe_allow_html=True)
+
+        st.markdown(
+            "<div class='rowmeta'>"
+            f"<span class='badge price'>💶 {price}</span>"
+            f"<span class='badge'>⭐ {rating_txt}</span>"
+            f"<span class='badge gray'>📰 Metacritic: {metac_txt}</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        link = g.get("site_url")
+        if link:
+            st.link_button("Voir l’offre", link, use_container_width=True)
+        else:
+            st.caption("Aucune offre disponible")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------- Onglet Recherche ----------
 with tabs[2]:
     st.subheader("🔎 Recherche par titre")
     col1, col2 = st.columns([3, 1])
@@ -105,40 +159,17 @@ with tabs[2]:
         else:
             data = api_get(f"/games/by-title/{requests.utils.quote(q)}")
             rows = data.get("results", [])
-            df = pd.DataFrame(rows)
-
-            if df.empty:
+            if not rows:
                 st.info("Aucun résultat.")
             else:
-                # Garder uniquement les colonnes souhaitées
-                desired = ["title", "best_price", "rating", "metacritic", "site_url"]
-                for c in desired:
-                    if c not in df.columns:
-                        df[c] = None
-                df_view = df[desired].copy()
-                df_view.rename(columns={
-                    "title": "Titre",
-                    "best_price": "Prix",
-                    "rating": "Note",
-                    "metacritic": "Metacritic",
-                    "site_url": "Lien"
-                }, inplace=True)
+                cols_per_row = 3
+                for i in range(0, len(rows), cols_per_row):
+                    cols = st.columns(cols_per_row)
+                    for j, game in enumerate(rows[i:i+cols_per_row]):
+                        with cols[j]:
+                            render_game_card(game)
 
-                st.dataframe(
-                    df_view,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Titre": st.column_config.TextColumn("Titre"),
-                        "Prix": st.column_config.TextColumn("Prix"),
-                        "Note": st.column_config.NumberColumn("Note", format="%.2f"),
-                        "Metacritic": st.column_config.NumberColumn("Metacritic", format="%d"),
-                        "Lien": st.column_config.LinkColumn("Lien offre", display_text="Voir"),
-                    },
-                )
-                st.caption("Astuce : clique « Voir » pour ouvrir l’offre du meilleur prix (si disponible).")
-
-# ----- Onglet Recos -----
+# ---------- Onglet Recos ----------
 with tabs[3]:
     st.subheader("✨ Recommandations")
     q = st.text_input("Prompt (genre, mot-clé…)", value="RPG")
@@ -148,7 +179,6 @@ with tabs[3]:
             st.warning("Connecte-toi d’abord.")
         else:
             payload = {"query": q, "k": k, "min_confidence": 0.0}
-            t0 = time.time()
             r = requests.post(f"{API_URL}/recommend/ml", headers=api_headers(), json=payload, timeout=60)
             if not r.ok:
                 try:
