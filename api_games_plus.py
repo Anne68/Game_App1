@@ -106,6 +106,7 @@ GAMES: List[Dict[str, Any]] = [
 # ---------------------------------------------------------------------
 # DB helpers (MySQL users)
 # ---------------------------------------------------------------------
+# --- helpers MySQL (remplacer l'existant) ---
 def get_db_conn():
     ssl = {"ssl": {"ca": settings.DB_SSL_CA}} if settings.DB_SSL_CA else {}
     return pymysql.connect(
@@ -383,13 +384,25 @@ def register(username: str = Form(...), password: str = Form(...)):
     create_user(username.strip(), password)
     return {"ok": True}
 
+
 @app.post("/token", tags=["auth"])
 def token(username: str = Form(...), password: str = Form(...)):
     u = get_user(username.strip())
-    if not u or not pwd_ctx.verify(password, u["password_hash"]):
+    if not u:
+        # éviter de révéler si l'utilisateur existe
         raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    pwd_col = "password_hash" if "password_hash" in u else ("password" if "password" in u else None)
+    if not pwd_col:
+        logger.error("User row has no password column. Keys: %s", list(u.keys()))
+        raise HTTPException(status_code=500, detail="Server password column missing")
+
+    if not pwd_ctx.verify(password, u[pwd_col]):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
     access_token = create_access_token({"sub": username.strip()})
     return {"access_token": access_token, "token_type": "bearer"}
+
 
 # ---------------------------------------------------------------------
 # Simple games search
