@@ -3,7 +3,7 @@
 # Database (AlwaysData)
 DB_HOST=mysql-anne.alwaysdata.net
 DB_PORT=3306
-DB_USER=anne_user
+DB_USER=anne
 DB_PASSWORD=your_password_here
 DB_NAME=anne_games_db
 
