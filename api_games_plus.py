@@ -60,8 +60,8 @@ DB_LAST_ERROR: Optional[str] = None
 # ---------------------------------------------------------------------
 app = FastAPI(
     title="Games API ML (C9→C13)",
-    version="2.3.0",
-    description="API avec modèle ML, monitoring avancé et MySQL pour les utilisateurs",
+    version="2.4.0",
+    description="API avec modèle ML, monitoring avancé et MySQL (AlwaysData)",
 )
 
 # CORS
@@ -123,7 +123,7 @@ def get_db_conn():
         **_ssl_kwargs(),
     )
 
-# ---------- USERS TABLE (comme avant) ----------
+# ---------- USERS TABLE ----------
 def ensure_users_table():
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute("SHOW TABLES LIKE 'users';")
@@ -176,7 +176,6 @@ def get_user(username: str) -> Optional[dict]:
 def create_user(username: str, password: str) -> None:
     hpwd = pwd_ctx.hash(password)
     with get_db_conn() as conn, conn.cursor() as cur:
-        # écrit toujours dans hashed_password + garde password_hash synchro si présent
         cur.execute("INSERT INTO users(username, hashed_password) VALUES(%s,%s)", (username, hpwd))
         if users_has_column("password_hash"):
             cur.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hpwd, username))
@@ -202,32 +201,53 @@ def update_user_password(username: str, new_hash: str) -> None:
         cur.execute(sql, tuple(params))
         conn.commit()
 
-# ---------- GAMES (lecture depuis alwaysdata) ----------
+# ---------- GAMES (AlwaysData) ----------
 def count_games_in_db() -> int:
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) AS n FROM games WHERE COALESCE(title,'') <> ''")
         row = cur.fetchone()
         return int(row["n"]) if row else 0
 
+def _safe_float(x) -> float:
+    try:
+        if x is None:
+            return 0.0
+        v = float(x)
+        if v != v:  # NaN
+            return 0.0
+        return v
+    except Exception:
+        return 0.0
+
+def _safe_int(x) -> int:
+    try:
+        if x is None:
+            return 0
+        return int(x)
+    except Exception:
+        try:
+            v = float(x)
+            return 0 if v != v else int(v)
+        except Exception:
+            return 0
+
 def _parse_platforms(value: Optional[str]) -> List[str]:
     if not value:
         return []
-    # tes données sont en texte "PC, PS4, ...": on normalise
-    return [p.strip() for p in value.split(",") if p.strip()]
+    return [p.strip() for p in str(value).split(",") if p.strip()]
 
 def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """
-    Retourne les jeux au format attendu par le modèle :
-    [{'id': <game_id_rawg>, 'title': ..., 'genres': ..., 'rating': ..., 'metacritic': ..., 'platforms': [..]}, ...]
+    Retourne les jeux au format attendu par le modèle (aucun NaN).
     """
     sql = """
         SELECT
             game_id_rawg AS id,
-            title,
-            genres,
-            rating,
-            metacritic,
-            platforms
+            COALESCE(title, '')        AS title,
+            COALESCE(genres, '')       AS genres,
+            COALESCE(rating, 0)        AS rating,
+            COALESCE(metacritic, 0)    AS metacritic,
+            COALESCE(platforms, '')    AS platforms
         FROM games
         WHERE COALESCE(title,'') <> ''
     """
@@ -241,20 +261,21 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     games: List[Dict[str, Any]] = []
     for r in rows:
         games.append({
-            "id": int(r["id"]),
-            "title": r["title"],
+            "id": _safe_int(r["id"]),
+            "title": r["title"] or "",
             "genres": r.get("genres") or "",
-            "rating": float(r["rating"]) if r.get("rating") is not None else None,
-            "metacritic": int(r["metacritic"]) if r.get("metacritic") is not None else None,
+            "rating": _safe_float(r.get("rating")),
+            "metacritic": _safe_int(r.get("metacritic")),
             "platforms": _parse_platforms(r.get("platforms")),
         })
+
     if not games:
         raise RuntimeError("Aucun jeu exploitable trouvé dans la table 'games'.")
     return games
 
 def find_games_by_title(q: str, limit: int = 1) -> List[Dict[str, Any]]:
     """
-    Recherche case-insensitive par titre. Retourne [{id, title}, ...] avec id = game_id_rawg.
+    Recherche case-insensitive par titre. Retourne [{id, title}] avec id = game_id_rawg.
     """
     like = f"%{q.strip().lower()}%"
     sql = """
@@ -351,17 +372,22 @@ Instrumentator().instrument(app).expose(app, include_in_schema=True)
 def _ensure_model_trained_with_db(force: bool = False):
     """
     Entraîne le modèle sur les jeux de la BDD si non entraîné (ou forcé).
-    Mappe game_id_rawg -> id pour correspondre aux attentes du modèle.
+    Nettoyage anti-NaN déjà fait dans fetch_games_for_ml.
     """
     model = get_model()
-    if (not model.is_trained) or force:
+    if model.is_trained and not force:
+        return
+    try:
         games = fetch_games_for_ml()
         model.train(games)
-        # on peut sauvegarder à la fin du premier entraînement
         try:
             model.save_model()
         except Exception as e:
             logger.warning("Could not save model: %s", e)
+    except ValueError as e:
+        msg = str(e)
+        logger.error("Training failed: %s", msg)
+        raise HTTPException(status_code=500, detail=msg)
 
 # ---------------------------------------------------------------------
 # Model management
@@ -425,35 +451,41 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     get_monitor().record_prediction("recommend_ml", request.query, recommendations, latency)
     return {"query": request.query, "recommendations": recommendations, "latency_ms": latency * 1000, "model_version": model.model_version}
 
-@app.get("/recommend/by-game/{game_id}", tags=["recommend"])
-@measure_latency("recommend_by_game")
-def recommend_by_game(game_id: int, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
-    _ensure_model_trained_with_db()
-    model = get_model()
-
-    start_time = time.time()
-    try:
-        recommendations = model.predict_by_game_id(game_id, k)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    latency = time.time() - start_time
-    get_monitor().record_prediction("recommend_by_game", f"game_id:{game_id}", recommendations, latency)
-    return {"game_id": game_id, "recommendations": recommendations, "latency_ms": latency * 1000}
+# ❌ Endpoint par ID supprimé
+# @app.get("/recommend/by-game/{game_id}", ...): supprimé comme demandé
 
 @app.get("/recommend/by-title/{title}", tags=["recommend"])
+@measure_latency("recommend_by_title")
 def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
-    # recherche dans la BDD
     matches = find_games_by_title(title, limit=1)
     if not matches:
         raise HTTPException(status_code=404, detail="Game not found")
     _ensure_model_trained_with_db()
-    return recommend_by_game(int(matches[0]["id"]), k, user)
+
+    model = get_model()
+    game_id = int(matches[0]["id"])
+    start_time = time.time()
+    try:
+        recos = model.predict_by_game_id(game_id, k)
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg.lower() or "unknown game" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        logger.exception("Prediction error:")
+        raise HTTPException(status_code=500, detail=msg)
+    latency = time.time() - start_time
+    get_monitor().record_prediction("recommend_by_title", f"title:{title}|id:{game_id}", recos, latency)
+    return {"title": title, "seed_game_id": game_id, "recommendations": recos, "latency_ms": latency * 1000}
 
 @app.get("/recommend/by-genre/{genre}", tags=["recommend"])
 def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
     _ensure_model_trained_with_db()
     model = get_model()
-    recos = model.predict(query=genre, k=k, min_confidence=0.0)
+    try:
+        recos = model.predict(query=genre, k=k, min_confidence=0.0)
+    except ValueError as e:
+        logger.exception("Prediction error:")
+        raise HTTPException(status_code=500, detail=str(e))
     return {"genre": genre, "recommendations": recos}
 
 # ---------------------------------------------------------------------
@@ -522,7 +554,6 @@ def register(username: str = Form(...), password: str = Form(...)):
 @app.get("/games/by-title/{title}", tags=["games"])
 def games_by_title(title: str, user: str = Depends(verify_token)):
     rows = find_games_by_title(title, limit=25)
-    # harmonise la sortie
     results = [{"id": int(r["id"]), "title": r["title"]} for r in rows]
     return {"results": results}
 
