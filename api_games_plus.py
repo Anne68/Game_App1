@@ -112,7 +112,12 @@ def healthz():
 
 @app.get("/", include_in_schema=False)
 def root():
-    return {"name": app.title, "version": app.version, "status": "ok"}
+    return {
+        "name": app.title,
+        "version": app.version,
+        "status": "ok"
+    }
+
 
 
 # Prometheus metrics avec Instrumentator
