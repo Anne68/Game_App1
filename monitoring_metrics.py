@@ -1,249 +1,223 @@
-# monitoring.py - Métriques personnalisées pour le monitoring du modèle
+# monitoring_metrics.py - Métriques & monitoring pour l'API ML
 from __future__ import annotations
 
+import asyncio
 import time
 import logging
-from typing import Dict, Optional, Callable
-from datetime import datetime, timedelta
 from collections import deque
-from prometheus_client import Counter, Histogram, Gauge, Info
+from datetime import datetime
+from typing import Callable, Dict, List, Optional, Any
+
 import numpy as np
+from prometheus_client import Counter, Gauge, Histogram, Info
 
 logger = logging.getLogger("monitoring")
 
-# ========= Métriques Prometheus pour ML =========
+# ========= Prometheus metrics =========
+# Compteurs
+model_training_counter = Counter(
+    "model_training_total", "Number of model trainings executed"
+)
+model_prediction_counter = Counter(
+    "model_predictions_total",
+    "Number of predictions",
+    labelnames=("endpoint", "status"),
+)
+model_error_counter = Counter(
+    "model_errors_total", "Number of model errors", labelnames=("endpoint",)
+)
 
-# Métriques de base
-model_info = Info('model_info', 'Information about the model')
-model_training_counter = Counter('model_trainings_total', 'Total number of model trainings')
-model_prediction_counter = Counter('model_predictions_total', 'Total number of predictions', ['endpoint', 'status'])
-model_load_counter = Counter('model_loads_total', 'Total number of model loads', ['status'])
+# Latence (par endpoint)
+prediction_latency = Histogram(
+    "prediction_latency_seconds",
+    "Latency of recommendation endpoints (seconds)",
+    labelnames=("endpoint",),
+    buckets=(0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0),
+)
 
-# Métriques de performance
-prediction_latency = Histogram('prediction_latency_seconds', 'Latency of model predictions', ['endpoint'])
-training_duration = Histogram('training_duration_seconds', 'Duration of model training')
-model_confidence = Histogram('model_confidence_score', 'Confidence scores of predictions', buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0))
+# Info & gauges
+model_version_info = Info("model_version", "Current model version")
+model_accuracy_gauge = Gauge("model_accuracy", "Current model accuracy (eval)")
+model_feature_dimension = Gauge("model_feature_dimension", "Number of features in the model")
+model_games_count = Gauge("model_games_count", "Number of games used for training")
+recommendation_diversity = Gauge("recommendation_diversity", "Diversity score of recommendations")
+recommendation_coverage = Gauge("recommendation_coverage", "Coverage of catalog in recommendations")
+feature_drift_gauge = Gauge("feature_drift_score", "Feature drift score compared to training data")
+prediction_drift_gauge = Gauge("prediction_drift_score", "Prediction drift score based on confidence history")
+model_memory_usage = Gauge("model_memory_bytes", "Approx model memory usage (bytes)")
+model_last_training_time = Gauge("model_last_training_timestamp", "Last training timestamp (unix seconds)")
 
-# Métriques de qualité
-model_accuracy_gauge = Gauge('model_accuracy', 'Current model accuracy')
-model_feature_dimension = Gauge('model_feature_dimension', 'Number of features in the model')
-model_games_count = Gauge('model_games_count', 'Number of games in the training set')
-recommendation_diversity = Gauge('recommendation_diversity', 'Diversity score of recommendations')
-recommendation_coverage = Gauge('recommendation_coverage', 'Coverage of catalog in recommendations')
+# ========= Decorator (fix 422) =========
+from functools import wraps
 
-# Métriques de drift
-feature_drift_gauge = Gauge('feature_drift_score', 'Feature drift score compared to training data')
-prediction_drift_gauge = Gauge('prediction_drift_score', 'Prediction drift score')
+def measure_latency(endpoint: str):
+    """Mesure la latence en préservant la signature (compat FastAPI)."""
+    def decorator(func: Callable):
+        if asyncio.iscoroutinefunction(func):
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = await func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            return async_wrapper
+        else:
+            @wraps(func)
+            def sync_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            return sync_wrapper
+    return decorator
 
-# Métriques système
-model_memory_usage = Gauge('model_memory_bytes', 'Memory usage of the model in bytes')
-model_last_training_timestamp = Gauge('model_last_training_timestamp', 'Timestamp of last model training')
+# ========= Monitor singleton =========
+class _Monitor:
+    def __init__(self) -> None:
+        self.confidence_history: deque[float] = deque(maxlen=1000)
+        self.last_evaluation: Optional[Dict[str, Any]] = None
+        self.total_predictions: int = 0
+        self.avg_confidence: float = 0.0
+        self.model_version: str = "unknown"
+        self.last_training_iso: Optional[str] = None
 
-
-class ModelMonitor:
-    """Classe pour monitorer le modèle de recommandation"""
-    
-    def __init__(self, window_size: int = 1000):
-        self.window_size = window_size
-        self.prediction_history = deque(maxlen=window_size)
-        self.confidence_history = deque(maxlen=window_size)
-        self.latency_history = deque(maxlen=window_size)
-        self.training_data_stats = None
-        self.last_evaluation = None
-        self.start_time = time.time()
-        
-    def record_training(self, model_version: str, games_count: int, feature_dim: int, duration: float, metrics: Dict):
-        """Enregistre les métriques d'entraînement"""
+    def record_training(
+        self,
+        model_version: str,
+        games_count: int,
+        feature_dim: int,
+        duration: float,
+        metrics: Optional[Dict[str, Any]] = None,
+    ) -> None:
         model_training_counter.inc()
-        training_duration.observe(duration)
+        model_version_info.info({"version": model_version})
+        self.model_version = model_version
+        self.last_training_iso = datetime.utcnow().isoformat()
+
         model_games_count.set(games_count)
         model_feature_dimension.set(feature_dim)
-        model_last_training_timestamp.set(time.time())
-        
-        # Mise à jour des infos du modèle
-        model_info.info({
-            'version': model_version,
-            'games_count': str(games_count),
-            'feature_dim': str(feature_dim),
-            'last_training': datetime.utcnow().isoformat()
-        })
-        
-        # Sauvegarder les stats pour la détection de drift
-        self.training_data_stats = metrics.get('validation_metrics', {})
-        
-        logger.info(f"Training recorded: v{model_version}, {games_count} games, {feature_dim} features, {duration:.2f}s")
-    
-    def record_prediction(self, endpoint: str, query: str, recommendations: list, latency: float):
-        """Enregistre les métriques de prédiction"""
-        model_prediction_counter.labels(endpoint=endpoint, status='success').inc()
-        prediction_latency.labels(endpoint=endpoint).observe(latency)
-        
-        # Enregistrer les scores de confiance
-        if recommendations:
-            confidences = [r.get('confidence', 0) for r in recommendations]
-            avg_confidence = np.mean(confidences)
-            model_confidence.observe(avg_confidence)
-            self.confidence_history.append(avg_confidence)
-            
-            # Calculer la diversité
-            diversity = self._calculate_diversity(recommendations)
+        model_last_training_time.set(time.time())
+
+        if metrics:
+            acc = float(metrics.get("accuracy", 0.0))
+            model_accuracy_gauge.set(acc)
+
+        mem = float(metrics.get("memory_bytes", 0.0)) if metrics else 0.0
+        model_memory_usage.set(mem)
+
+        logger.info(
+            "Training recorded: version=%s games=%s feat=%s duration=%.3fs",
+            model_version, games_count, feature_dim, duration
+        )
+
+    def record_prediction(
+        self,
+        endpoint: str,
+        query: str,
+        recommendations: List[Dict[str, Any]],
+        latency: float,
+    ) -> None:
+        try:
+            confs: List[float] = []
+            for r in recommendations or []:
+                if "confidence" in r:
+                    confs.append(float(r["confidence"]))
+                elif "score" in r:
+                    confs.append(float(r["score"]))
+            mean_conf = float(np.mean(confs)) if confs else 0.0
+            self.confidence_history.append(mean_conf)
+            self.total_predictions += 1
+            self.avg_confidence = (0.95 * self.avg_confidence + 0.05 * mean_conf) if self.total_predictions > 1 else mean_conf
+
+            ids = [r.get("id") for r in (recommendations or []) if r.get("id") is not None]
+            unique_ids = len(set(ids))
+            diversity = (unique_ids / max(1, len(ids))) if ids else 0.0
             recommendation_diversity.set(diversity)
-        
-        self.prediction_history.append({
-            'timestamp': time.time(),
-            'endpoint': endpoint,
-            'query': query,
-            'num_results': len(recommendations),
-            'latency': latency
-        })
-        
-        self.latency_history.append(latency)
-        
-        # Détecter le drift si on a assez d'historique
-        if len(self.confidence_history) >= 100:
-            drift_score = self._detect_drift()
-            prediction_drift_gauge.set(drift_score)
-    
-    def record_error(self, endpoint: str, error: str):
-        """Enregistre une erreur de prédiction"""
-        model_prediction_counter.labels(endpoint=endpoint, status='error').inc()
-        logger.error(f"Prediction error on {endpoint}: {error}")
-    
-    def record_model_load(self, success: bool, model_size_bytes: Optional[int] = None):
-        """Enregistre le chargement d'un modèle"""
-        status = 'success' if success else 'failure'
-        model_load_counter.labels(status=status).inc()
-        
-        if success and model_size_bytes:
-            model_memory_usage.set(model_size_bytes)
-    
-    def _calculate_diversity(self, recommendations: list) -> float:
-        """Calcule la diversité des recommandations (basée sur les genres)"""
-        if not recommendations:
-            return 0.0
-        
-        genres = set()
-        for rec in recommendations:
-            if 'genres' in rec:
-                genres.update(g.strip() for g in rec['genres'].split(','))
-        
-        # Diversité = nombre de genres uniques / nombre de recommandations
-        return len(genres) / len(recommendations) if recommendations else 0.0
-    
-    def _detect_drift(self) -> float:
-        """Détecte le drift dans les prédictions"""
-        if len(self.confidence_history) < 100:
-            return 0.0
-        
-        # Comparer la distribution récente vs historique
-        recent = list(self.confidence_history)[-50:]
-        historical = list(self.confidence_history)[-100:-50]
-        
-        # Test de Kolmogorov-Smirnov simplifié
-        recent_mean = np.mean(recent)
-        historical_mean = np.mean(historical)
-        drift_score = abs(recent_mean - historical_mean)
-        
-        return min(drift_score, 1.0)
-    
-    def calculate_coverage(self, total_games: int, recommended_games: set) -> float:
-        """Calcule la couverture du catalogue"""
-        if total_games == 0:
-            return 0.0
-        coverage = len(recommended_games) / total_games
+            recommendation_coverage.set(diversity)
+
+            model_prediction_counter.labels(endpoint=endpoint, status="ok").inc()
+            prediction_latency.labels(endpoint=endpoint).observe(latency)
+        except Exception as e:
+            logger.exception("record_prediction failed: %s", e)
+            model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+
+    def record_error(self, endpoint: str, message: str) -> None:
+        model_error_counter.labels(endpoint=endpoint).inc()
+        logger.error("Error on %s: %s", endpoint, message)
+
+    def evaluate_model(self, model, test_queries: List[str]) -> Dict[str, Any]:
+        scores: List[float] = []
+        ids_set: set = set()
+        for q in test_queries:
+            try:
+                recs = model.predict(q, k=10, min_confidence=0.0)
+                for r in recs:
+                    if "confidence" in r:
+                        scores.append(float(r["confidence"]))
+                    elif "score" in r:
+                        scores.append(float(r["score"]))
+                    if r.get("id") is not None:
+                        ids_set.add(r["id"])
+            except Exception as e:
+                self.record_error("evaluate_model", str(e))
+
+        avg_score = float(np.mean(scores)) if scores else 0.0
+        model_accuracy_gauge.set(avg_score)
+
+        coverage = 0.0
+        try:
+            if getattr(model, "games_df", None) is not None and not model.games_df.empty:
+                catalog = int(model.games_df["id"].nunique())
+                coverage = len(ids_set) / max(1, catalog)
+        except Exception:
+            pass
         recommendation_coverage.set(coverage)
-        return coverage
-    
-    def get_metrics_summary(self) -> Dict:
-        """Retourne un résumé des métriques"""
-        uptime = time.time() - self.start_time
-        
-        summary = {
-            "uptime_seconds": uptime,
-            "total_predictions": len(self.prediction_history),
-            "avg_latency_ms": np.mean(self.latency_history) * 1000 if self.latency_history else 0,
-            "p95_latency_ms": np.percentile(self.latency_history, 95) * 1000 if self.latency_history else 0,
-            "avg_confidence": np.mean(self.confidence_history) if self.confidence_history else 0,
-            "predictions_per_minute": len(self.prediction_history) / (uptime / 60) if uptime > 0 else 0
+
+        self.last_evaluation = {
+            "time": datetime.utcnow().isoformat(),
+            "avg_confidence": avg_score,
+            "unique_ids": len(ids_set),
+            "coverage": coverage,
+            "tested_queries": test_queries,
         }
-        
-        # Ajouter les métriques récentes (dernière heure)
-        one_hour_ago = time.time() - 3600
-        recent_predictions = [p for p in self.prediction_history if p['timestamp'] > one_hour_ago]
-        
-        if recent_predictions:
-            summary["recent_predictions_1h"] = len(recent_predictions)
-            summary["recent_avg_latency_ms"] = np.mean([p['latency'] for p in recent_predictions]) * 1000
-        
-        return summary
-    
-    def evaluate_model(self, model, test_queries: list) -> Dict:
-        """Évalue le modèle avec des requêtes de test"""
-        results = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "test_queries": len(test_queries),
-            "successes": 0,
-            "failures": 0,
-            "avg_confidence": 0,
-            "avg_results": 0
+        prediction_drift_gauge.set(self._detect_drift())
+        return self.last_evaluation
+
+    def get_metrics_summary(self) -> Dict[str, Any]:
+        return {
+            "model_version": self.model_version,
+            "is_trained": True,
+            "total_predictions": self.total_predictions,
+            "avg_confidence": round(self.avg_confidence, 6),
+            "last_training": self.last_training_iso,
+            "confidence_hist_len": len(self.confidence_history),
         }
-        
-        confidences = []
-        result_counts = []
-        
-        for query in test_queries:
-            try:
-                start = time.time()
-                recommendations = model.predict(query, k=10)
-                latency = time.time() - start
-                
-                results["successes"] += 1
-                result_counts.append(len(recommendations))
-                
-                if recommendations:
-                    query_confidences = [r.get('confidence', 0) for r in recommendations]
-                    confidences.extend(query_confidences)
-                    
-            except Exception as e:
-                results["failures"] += 1
-                logger.error(f"Evaluation failed for query '{query}': {e}")
-        
-        if confidences:
-            results["avg_confidence"] = float(np.mean(confidences))
-            model_accuracy_gauge.set(results["avg_confidence"])
-        
-        if result_counts:
-            results["avg_results"] = float(np.mean(result_counts))
-        
-        self.last_evaluation = results
-        return results
 
+    def _detect_drift(self) -> float:
+        """Score [0..1] basé sur la variance récente des confiances."""
+        if len(self.confidence_history) < 50:
+            return 0.0
+        arr = np.array(self.confidence_history, dtype=float)
+        recent = arr[-100:] if len(arr) >= 100 else arr
+        var = float(np.var(recent))
+        score = var / (1.0 + var)
+        return float(min(max(score, 0.0), 1.0))
 
-# Singleton pour le monitor
-_monitor_instance: Optional[ModelMonitor] = None
+# Singleton
+_MONITOR: Optional[_Monitor] = None
 
-def get_monitor() -> ModelMonitor:
-    """Retourne l'instance singleton du monitor"""
-    global _monitor_instance
-    if _monitor_instance is None:
-        _monitor_instance = ModelMonitor()
-    return _monitor_instance
-
-
-# Décorateur pour mesurer la latence
-def measure_latency(endpoint: str):
-    """Décorateur pour mesurer la latence d'une fonction"""
-    def decorator(func: Callable):
-        def wrapper(*args, **kwargs):
-            start = time.time()
-            try:
-                result = func(*args, **kwargs)
-                latency = time.time() - start
-                prediction_latency.labels(endpoint=endpoint).observe(latency)
-                return result
-            except Exception as e:
-                latency = time.time() - start
-                model_prediction_counter.labels(endpoint=endpoint, status='error').inc()
-                raise e
-        return wrapper
-    return decorator
+def get_monitor() -> _Monitor:
+    global _MONITOR
+    if _MONITOR is None:
+        _MONITOR = _Monitor()
+    return _MONITOR
