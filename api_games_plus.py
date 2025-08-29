@@ -227,6 +227,20 @@ def update_user_password(username: str, new_hash: str) -> None:
         cur.execute(sql, tuple(params))
         conn.commit()
 
+def migrate_legacy_passwords() -> int:
+    """Copie password_hash -> hashed_password si besoin."""
+    if not (users_has_column("hashed_password") and users_has_column("password_hash")):
+        return 0
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            UPDATE users
+            SET hashed_password = password_hash
+            WHERE (hashed_password IS NULL OR hashed_password = '')
+              AND password_hash IS NOT NULL AND password_hash <> '';
+        """)
+        affected = cur.rowcount or 0
+        conn.commit()
+        return affected
 
 # ---------------------------------------------------------------------
 # Auth helpers
