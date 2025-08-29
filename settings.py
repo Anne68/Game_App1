@@ -1,12 +1,8 @@
-# settings.py
 from __future__ import annotations
-
 from functools import lru_cache
 from typing import Optional
-
 from pydantic import field_validator, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -15,31 +11,29 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ========= Database =========
+    # DB
     DB_HOST: str
-    DB_PORT: int = 3306            # AlwaysData / MySQL par défaut
+    DB_PORT: int = 3306
     DB_USER: str
     DB_PASSWORD: str
     DB_NAME: str
-    DB_SSL_CA: Optional[str] = None  # facultatif
+    DB_SSL_CA: Optional[str] = None
 
-    # ========= API / CORS =========
+    # API / CORS
     ALLOW_ORIGINS: str = "*"
     LOG_LEVEL: str = "INFO"
 
-    # ========= Auth / JWT =========
-    # défaut de DEV pour éviter un crash si la variable d'env manque.
-    # En prod, définis toujours SECRET_KEY dans Render.
-    SECRET_KEY: str = Field(default="dev-secret-change-me")
+    # Auth / JWT
+    SECRET_KEY: str = Field(default="dev-secret-change-me")  # <-- défaut dev
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
 
-    # ========= Security =========
+    # Security
     PASSWORD_MIN_LENGTH: int = 8
     PASSWORD_REGEX: str = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$"
 
-    # ========= Monitoring =========
+    # Monitoring
     PROMETHEUS_ENABLED: bool = True
 
     @field_validator("ALLOW_ORIGINS", mode="before")
@@ -53,7 +47,6 @@ class Settings(BaseSettings):
         parts = [p.strip() for p in s.split(",")]
         parts = [p for p in parts if p]
         return ",".join(parts) if parts else "*"
-
 
 @lru_cache
 def get_settings() -> Settings:
