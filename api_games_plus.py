@@ -19,6 +19,7 @@ from passlib.exc import UnknownHashError
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 
+# FIX: Import correct des modules
 from settings import get_settings
 from model_manager import get_model
 from monitoring_metrics import (
@@ -44,7 +45,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
-# Passlib : accepte anciens formats et produit du bcrypt
 pwd_ctx = CryptContext(
     schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"],
     deprecated="auto",
@@ -125,7 +125,6 @@ def get_db_conn():
         write_timeout=10,
         **_ssl_kwargs(),
     )
-
 
 # ---------- USERS TABLE ----------
 def ensure_users_table():
@@ -238,9 +237,7 @@ def _safe_int(x, default: int = 0) -> int:
         return default
 
 def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    """
-    Renvoie une liste de jeux nettoyés pour le modèle.
-    """
+    """Renvoie une liste de jeux nettoyés pour le modèle."""
     sql = """
         SELECT
             game_id_rawg AS id,
@@ -274,10 +271,7 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     return games
 
 def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
-    """
-    Recherche case-insensitive par titre.
-    Retourne: [{id, title, rating, metacritic, best_price, best_shop, site_url, platforms}, ...]
-    """
+    """Recherche case-insensitive par titre."""
     like = f"%{q.strip().lower()}%"
     sql = """
         SELECT
@@ -378,7 +372,7 @@ def root():
 Instrumentator().instrument(app).expose(app, include_in_schema=True)
 
 # ---------------------------------------------------------------------
-# Model training helpers (utilise la BDD)
+# Model training helpers
 # ---------------------------------------------------------------------
 def _ensure_model_trained_with_db(force: bool = False):
     model = get_model()
@@ -478,14 +472,12 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
         "model_version": model.model_version,
     }
 
-# NOTE: endpoint /recommend/by-game supprimé (demande utilisateur).
 @app.get("/recommend/by-title/{title}", tags=["recommend"])
 def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
     matches = find_games_by_title(title, limit=1)
     if not matches:
         raise HTTPException(status_code=404, detail="Game not found")
     _ensure_model_trained_with_db()
-    # On utilise l'ID interne du modèle, mais l’endpoint public reste “par titre”.
     model = get_model()
     try:
         recos = model.predict_by_game_id(int(matches[0]["id"]), k)
@@ -501,7 +493,7 @@ def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = 
     return {"genre": genre, "recommendations": recos}
 
 # ---------------------------------------------------------------------
-# Auth endpoints (MySQL)
+# Auth endpoints
 # ---------------------------------------------------------------------
 def _issue_token_core(username: str, password: str):
     if not DB_READY:
@@ -561,7 +553,7 @@ def register(username: str = Form(...), password: str = Form(...)):
     return {"ok": True}
 
 # ---------------------------------------------------------------------
-# Games search (BDD)
+# Games search
 # ---------------------------------------------------------------------
 @app.get("/games/by-title/{title}", tags=["games"])
 def games_by_title(title: str, user: str = Depends(verify_token)):
@@ -615,7 +607,6 @@ async def startup_event():
 
     logger.info("Starting Games API with ML...")
 
-        # === DB init ===
     try:
         if settings.db_configured:
             ensure_users_table()
@@ -639,8 +630,6 @@ async def startup_event():
         if settings.DB_REQUIRED:
             raise
 
-
-    # === ML model ===
     model = get_model()
     model_path = os.path.join("model", "recommendation_model.pkl")
     try:
