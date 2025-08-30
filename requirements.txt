@@ -1,11 +1,10 @@
-# --- Client Streamlit uniquement ---
 streamlit==1.49.0
 requests>=2.32
 python-dotenv==1.0.0
 
-# Data (alignés NumPy 1.26)
-pandas==2.1.4
-numpy==1.26.4
+# Data - versions compatibles Python 3.13
+pandas>=2.2.0
+numpy>=1.26.0
 
 # Build helpers
 setuptools>=70
