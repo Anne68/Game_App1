@@ -1,7 +1,7 @@
 # test_api.py - Tests pour l'API avec intégration ML
 import pytest
 from fastapi.testclient import TestClient
-from api_games_plus.py import app
+from api_games_plus import app
 import json
 
 client = TestClient(app)
