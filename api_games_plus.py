@@ -19,6 +19,103 @@ from passlib.exc import UnknownHashError
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 
+# Ajouter ces lignes à votre api_games_plus.py existant
+
+# APRÈS les imports existants, ajouter :
+try:
+    from compliance.standards_compliance import SecurityValidator, AccessibilityValidator
+    COMPLIANCE_AVAILABLE = True
+except ImportError:
+    COMPLIANCE_AVAILABLE = False
+    logger.warning("Compliance module not available")
+
+# APRÈS la création de l'app FastAPI, ajouter :
+if COMPLIANCE_AVAILABLE:
+    # Setup compliance
+    app.state.security_validator = SecurityValidator()
+    app.state.accessibility_validator = AccessibilityValidator()
+    logger.info("Compliance modules loaded")
+
+# MODIFIER la fonction register existante :
+@app.post("/register", tags=["auth"])
+def register(username: str = Form(...), password: str = Form(...)):
+    if not DB_READY:
+        raise HTTPException(status_code=503, detail="Database unavailable: cannot register now")
+    
+    # NOUVEAU: Validation sécurité si disponible
+    if COMPLIANCE_AVAILABLE:
+        security_validator = app.state.security_validator
+        username = security_validator.sanitize_input(username.strip())
+        
+        password_validation = security_validator.validate_password(password)
+        if not password_validation["valid"]:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Password does not meet security requirements",
+                    "issues": password_validation["issues"],
+                    "strength": password_validation["strength"]
+                }
+            )
+    else:
+        username = username.strip()
+    
+    # Le reste de la fonction reste identique
+    if get_user(username):
+        raise HTTPException(status_code=400, detail="User already exists")
+    try:
+        create_user(username, password)
+    except Exception as e:
+        logger.error("DB error on register: %s", e)
+        raise HTTPException(status_code=503, detail="Database error during register")
+    return {"ok": True}
+
+# MODIFIER la fonction recommend_ml existante :
+@app.post("/recommend/ml", tags=["recommend"])
+@measure_latency("recommend_ml")
+def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    
+    # NOUVEAU: Sanitization si disponible
+    clean_query = request.query.strip()
+    if COMPLIANCE_AVAILABLE:
+        security_validator = app.state.security_validator
+        clean_query = security_validator.sanitize_input(clean_query)
+    
+    if not clean_query:
+        raise HTTPException(status_code=400, detail="Query is empty")
+
+    start_time = time.time()
+    try:
+        recommendations = model.predict(
+            query=clean_query,
+            k=request.k,
+            min_confidence=request.min_confidence
+        )
+    except ValueError as e:
+        logger.warning("Prediction error: %s", e)
+        raise HTTPException(status_code=400, detail=f"Bad input for model: {e}")
+    except Exception:
+        logger.exception("Prediction failed")
+        raise HTTPException(status_code=500, detail="Prediction failed")
+
+    latency = time.time() - start_time
+    get_monitor().record_prediction("recommend_ml", clean_query, recommendations, latency)
+    
+    response = {
+        "query": clean_query,
+        "recommendations": recommendations,
+        "latency_ms": latency * 1000,
+        "model_version": model.model_version,
+    }
+    
+    # NOUVEAU: Enhancement accessibilité si disponible
+    if COMPLIANCE_AVAILABLE:
+        accessibility_validator = app.state.accessibility_validator
+        response = accessibility_validator.enhance_response_accessibility(response)
+    
+    return response
 # FIX: Import correct des modules
 from settings import get_settings
 from model_manager import get_model
