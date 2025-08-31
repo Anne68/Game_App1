@@ -19,103 +19,6 @@ from passlib.exc import UnknownHashError
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 
-# Ajouter ces lignes à votre api_games_plus.py existant
-
-# APRÈS les imports existants, ajouter :
-try:
-    from compliance.standards_compliance import SecurityValidator, AccessibilityValidator
-    COMPLIANCE_AVAILABLE = True
-except ImportError:
-    COMPLIANCE_AVAILABLE = False
-    logger.warning("Compliance module not available")
-
-# APRÈS la création de l'app FastAPI, ajouter :
-if COMPLIANCE_AVAILABLE:
-    # Setup compliance
-    app.state.security_validator = SecurityValidator()
-    app.state.accessibility_validator = AccessibilityValidator()
-    logger.info("Compliance modules loaded")
-
-# MODIFIER la fonction register existante :
-@app.post("/register", tags=["auth"])
-def register(username: str = Form(...), password: str = Form(...)):
-    if not DB_READY:
-        raise HTTPException(status_code=503, detail="Database unavailable: cannot register now")
-    
-    # NOUVEAU: Validation sécurité si disponible
-    if COMPLIANCE_AVAILABLE:
-        security_validator = app.state.security_validator
-        username = security_validator.sanitize_input(username.strip())
-        
-        password_validation = security_validator.validate_password(password)
-        if not password_validation["valid"]:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": "Password does not meet security requirements",
-                    "issues": password_validation["issues"],
-                    "strength": password_validation["strength"]
-                }
-            )
-    else:
-        username = username.strip()
-    
-    # Le reste de la fonction reste identique
-    if get_user(username):
-        raise HTTPException(status_code=400, detail="User already exists")
-    try:
-        create_user(username, password)
-    except Exception as e:
-        logger.error("DB error on register: %s", e)
-        raise HTTPException(status_code=503, detail="Database error during register")
-    return {"ok": True}
-
-# MODIFIER la fonction recommend_ml existante :
-@app.post("/recommend/ml", tags=["recommend"])
-@measure_latency("recommend_ml")
-def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
-    _ensure_model_trained_with_db()
-    model = get_model()
-    
-    # NOUVEAU: Sanitization si disponible
-    clean_query = request.query.strip()
-    if COMPLIANCE_AVAILABLE:
-        security_validator = app.state.security_validator
-        clean_query = security_validator.sanitize_input(clean_query)
-    
-    if not clean_query:
-        raise HTTPException(status_code=400, detail="Query is empty")
-
-    start_time = time.time()
-    try:
-        recommendations = model.predict(
-            query=clean_query,
-            k=request.k,
-            min_confidence=request.min_confidence
-        )
-    except ValueError as e:
-        logger.warning("Prediction error: %s", e)
-        raise HTTPException(status_code=400, detail=f"Bad input for model: {e}")
-    except Exception:
-        logger.exception("Prediction failed")
-        raise HTTPException(status_code=500, detail="Prediction failed")
-
-    latency = time.time() - start_time
-    get_monitor().record_prediction("recommend_ml", clean_query, recommendations, latency)
-    
-    response = {
-        "query": clean_query,
-        "recommendations": recommendations,
-        "latency_ms": latency * 1000,
-        "model_version": model.model_version,
-    }
-    
-    # NOUVEAU: Enhancement accessibilité si disponible
-    if COMPLIANCE_AVAILABLE:
-        accessibility_validator = app.state.accessibility_validator
-        response = accessibility_validator.enhance_response_accessibility(response)
-    
-    return response
 # FIX: Import correct des modules
 from settings import get_settings
 from model_manager import get_model
@@ -126,10 +29,19 @@ from monitoring_metrics import (
 )
 
 # ---------------------------------------------------------------------
-# Logging
+# Logging SETUP (MUST be early)
 # ---------------------------------------------------------------------
 logger = logging.getLogger("games-api-ml")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+
+# Compliance import avec fallback gracieux
+try:
+    from compliance.standards_compliance import SecurityValidator, AccessibilityValidator
+    COMPLIANCE_AVAILABLE = True
+    logger.info("Compliance module loaded successfully")
+except ImportError as e:
+    COMPLIANCE_AVAILABLE = False
+    logger.warning(f"Compliance module not available: {e}")
 
 # ---------------------------------------------------------------------
 # Settings & Security
@@ -170,6 +82,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Setup compliance si disponible
+if COMPLIANCE_AVAILABLE:
+    try:
+        app.state.security_validator = SecurityValidator()
+        app.state.accessibility_validator = AccessibilityValidator()
+        logger.info("Compliance validators attached to app state")
+    except Exception as e:
+        logger.error(f"Failed to setup compliance validators: {e}")
+        COMPLIANCE_AVAILABLE = False
 
 # ---------------------------------------------------------------------
 # Models (Pydantic)
@@ -460,6 +382,7 @@ def healthz():
         "model_loaded": model.is_trained,
         "model_version": model.model_version,
         "monitoring": monitor.get_metrics_summary(),
+        "compliance_enabled": COMPLIANCE_AVAILABLE,
     }
 
 @app.get("/", include_in_schema=False)
@@ -536,20 +459,32 @@ def evaluate_model(test_queries: List[str] = Query(default=["RPG", "Action", "In
     return monitor.evaluate_model(model, test_queries)
 
 # ---------------------------------------------------------------------
-# Recommendations (ML)
+# Recommendations (ML) avec compliance
 # ---------------------------------------------------------------------
 @app.post("/recommend/ml", tags=["recommend"])
 @measure_latency("recommend_ml")
 def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     _ensure_model_trained_with_db()
     model = get_model()
-    if not request.query.strip():
+    
+    # Nettoyage de base
+    clean_query = request.query.strip()
+    
+    # Nettoyage avec compliance si disponible
+    if COMPLIANCE_AVAILABLE:
+        try:
+            security_validator = app.state.security_validator
+            clean_query = security_validator.sanitize_input(clean_query)
+        except Exception as e:
+            logger.warning(f"Compliance sanitization failed: {e}")
+    
+    if not clean_query:
         raise HTTPException(status_code=400, detail="Query is empty")
 
     start_time = time.time()
     try:
         recommendations = model.predict(
-            query=request.query.strip(),
+            query=clean_query,
             k=request.k,
             min_confidence=request.min_confidence
         )
@@ -561,13 +496,24 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
         raise HTTPException(status_code=500, detail="Prediction failed")
 
     latency = time.time() - start_time
-    get_monitor().record_prediction("recommend_ml", request.query, recommendations, latency)
-    return {
-        "query": request.query,
+    get_monitor().record_prediction("recommend_ml", clean_query, recommendations, latency)
+    
+    response = {
+        "query": clean_query,
         "recommendations": recommendations,
         "latency_ms": latency * 1000,
         "model_version": model.model_version,
     }
+    
+    # Enhancement accessibilité si disponible
+    if COMPLIANCE_AVAILABLE:
+        try:
+            accessibility_validator = app.state.accessibility_validator
+            response = accessibility_validator.enhance_response_accessibility(response)
+        except Exception as e:
+            logger.warning(f"Accessibility enhancement failed: {e}")
+    
+    return response
 
 @app.get("/recommend/by-title/{title}", tags=["recommend"])
 def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
@@ -590,7 +536,7 @@ def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = 
     return {"genre": genre, "recommendations": recos}
 
 # ---------------------------------------------------------------------
-# Auth endpoints
+# Auth endpoints avec compliance
 # ---------------------------------------------------------------------
 def _issue_token_core(username: str, password: str):
     if not DB_READY:
@@ -639,7 +585,29 @@ def token_alias(username: str = Form(...), password: str = Form(...)):
 def register(username: str = Form(...), password: str = Form(...)):
     if not DB_READY:
         raise HTTPException(status_code=503, detail="Database unavailable: cannot register now")
+    
+    # Nettoyage de base
     username = username.strip()
+    
+    # Validation avec compliance si disponible
+    if COMPLIANCE_AVAILABLE:
+        try:
+            security_validator = app.state.security_validator
+            username = security_validator.sanitize_input(username)
+            
+            password_validation = security_validator.validate_password(password)
+            if not password_validation["valid"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "Password does not meet security requirements",
+                        "issues": password_validation["issues"],
+                        "strength": password_validation["strength"]
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"Compliance validation failed: {e}")
+    
     if get_user(username):
         raise HTTPException(status_code=400, detail="User already exists")
     try:
@@ -654,7 +622,16 @@ def register(username: str = Form(...), password: str = Form(...)):
 # ---------------------------------------------------------------------
 @app.get("/games/by-title/{title}", tags=["games"])
 def games_by_title(title: str, user: str = Depends(verify_token)):
-    rows = find_games_by_title(title, limit=25)
+    # Nettoyage du titre avec compliance si disponible
+    clean_title = title.strip()
+    if COMPLIANCE_AVAILABLE:
+        try:
+            security_validator = app.state.security_validator
+            clean_title = security_validator.sanitize_input(clean_title)
+        except Exception as e:
+            logger.warning(f"Title sanitization failed: {e}")
+    
+    rows = find_games_by_title(clean_title, limit=25)
     results = []
     for r in rows:
         raw_plats = r.get("platforms") or ""
@@ -678,7 +655,16 @@ def games_by_title(title: str, user: str = Depends(verify_token)):
 def monitoring_summary(user: str = Depends(verify_token)):
     monitor = get_monitor()
     model = get_model()
-    return {"model": model.get_metrics(), "monitoring": monitor.get_metrics_summary(), "last_evaluation": monitor.last_evaluation}
+    return {
+        "model": model.get_metrics(), 
+        "monitoring": monitor.get_metrics_summary(), 
+        "last_evaluation": monitor.last_evaluation,
+        "compliance_status": {
+            "enabled": COMPLIANCE_AVAILABLE,
+            "security_validator": hasattr(app.state, 'security_validator'),
+            "accessibility_validator": hasattr(app.state, 'accessibility_validator')
+        }
+    }
 
 @app.get("/monitoring/drift", tags=["monitoring"])
 def check_drift(user: str = Depends(verify_token)):
@@ -691,9 +677,59 @@ def check_drift(user: str = Depends(verify_token)):
         status = "high_drift"
     elif drift_score > 0.15:
         status = "moderate_drift"
-    return {"drift_score": drift_score, "status": status,
-            "recommendation": "Retrain model" if status == "high_drift"
-            else "Monitor closely" if status == "moderate_drift" else "No action needed"}
+    return {
+        "drift_score": drift_score, 
+        "status": status,
+        "recommendation": "Retrain model" if status == "high_drift"
+        else "Monitor closely" if status == "moderate_drift" else "No action needed"
+    }
+
+# ---------------------------------------------------------------------
+# Compliance endpoints (nouveaux pour E4)
+# ---------------------------------------------------------------------
+@app.get("/compliance/status", tags=["compliance"])
+def compliance_status(user: str = Depends(verify_token)):
+    """Status de la conformité E4"""
+    if not COMPLIANCE_AVAILABLE:
+        return {
+            "compliance_enabled": False,
+            "message": "Compliance module not available",
+            "standards": []
+        }
+    
+    return {
+        "compliance_enabled": True,
+        "message": "E4 compliance standards active",
+        "standards": [
+            {
+                "name": "Security Standards",
+                "status": "active",
+                "features": ["Input sanitization", "Password validation", "Injection protection"]
+            },
+            {
+                "name": "Accessibility Standards", 
+                "status": "active",
+                "features": ["ARIA labels", "Screen reader support", "WCAG 2.1 AA compliance"]
+            }
+        ]
+    }
+
+@app.post("/compliance/validate-password", tags=["compliance"])
+def validate_password_endpoint(password: str = Form(...), user: str = Depends(verify_token)):
+    """Validation de mot de passe selon standards E4"""
+    if not COMPLIANCE_AVAILABLE:
+        return {"error": "Compliance module not available"}
+    
+    try:
+        security_validator = app.state.security_validator
+        result = security_validator.validate_password(password)
+        return {
+            "validation_result": result,
+            "standards": "E4 Security Requirements"
+        }
+    except Exception as e:
+        logger.error(f"Password validation failed: {e}")
+        return {"error": "Validation failed"}
 
 # ---------------------------------------------------------------------
 # Startup
@@ -702,7 +738,7 @@ def check_drift(user: str = Depends(verify_token)):
 async def startup_event():
     global DB_READY, DB_LAST_ERROR
 
-    logger.info("Starting Games API with ML...")
+    logger.info("Starting Games API with ML and E4 compliance...")
 
     try:
         if settings.db_configured:
@@ -739,5 +775,11 @@ async def startup_event():
             logger.info("No saved model found; will train on first request")
     except Exception as e:
         logger.warning("Error while loading model: %s. Will train on first request.", e)
+
+    # Log compliance status
+    if COMPLIANCE_AVAILABLE:
+        logger.info("E4 Compliance standards active")
+    else:
+        logger.warning("E4 Compliance standards not available")
 
     logger.info("API startup complete.")
