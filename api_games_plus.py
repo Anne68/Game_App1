@@ -417,7 +417,7 @@ def healthz():
     else:
         logger.warning("E4 Compliance standards not available")
 
-    logger.info("API startup complete.")()
+    logger.info("API startup complete.")
     monitor = get_monitor()
     return {
         "status": "healthy" if (DB_READY or not settings.DB_REQUIRED) else "degraded",
