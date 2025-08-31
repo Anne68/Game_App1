@@ -34,7 +34,7 @@ from monitoring_metrics import (
 logger = logging.getLogger("games-api-ml")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
-# Compliance import avec fallback gracieux
+# Compliance import avec fallback gracieux (AVANT de l'utiliser)
 try:
     from compliance.standards_compliance import SecurityValidator, AccessibilityValidator
     COMPLIANCE_AVAILABLE = True
@@ -66,7 +66,7 @@ DB_READY: bool = False
 DB_LAST_ERROR: Optional[str] = None
 
 # ---------------------------------------------------------------------
-# FastAPI app
+# FastAPI app - CRÉER L'APP D'ABORD
 # ---------------------------------------------------------------------
 app = FastAPI(
     title="Games API ML (C9→C13)",
@@ -83,15 +83,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Setup compliance si disponible
-if COMPLIANCE_AVAILABLE:
-    try:
-        app.state.security_validator = SecurityValidator()
-        app.state.accessibility_validator = AccessibilityValidator()
-        logger.info("Compliance validators attached to app state")
-    except Exception as e:
-        logger.error(f"Failed to setup compliance validators: {e}")
-        COMPLIANCE_AVAILABLE = False
+# Setup compliance APRÈS création de l'app
+def setup_compliance():
+    """Setup compliance validators si disponible"""
+    if COMPLIANCE_AVAILABLE:
+        try:
+            app.state.security_validator = SecurityValidator()
+            app.state.accessibility_validator = AccessibilityValidator()
+            logger.info("Compliance validators attached to app state")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to setup compliance validators: {e}")
+            return False
+    else:
+        logger.info("Compliance not available - continuing without")
+        return False
+
+# Initialiser compliance maintenant que app existe
+COMPLIANCE_ENABLED = setup_compliance()
 
 # ---------------------------------------------------------------------
 # Models (Pydantic)
@@ -368,11 +377,47 @@ def measure_latency(endpoint: str):
     return decorator
 
 # ---------------------------------------------------------------------
+# Helper functions pour compliance
+# ---------------------------------------------------------------------
+def get_security_validator():
+    """Récupère le security validator de manière sûre"""
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'security_validator'):
+        return app.state.security_validator
+    return None
+
+def get_accessibility_validator():
+    """Récupère l'accessibility validator de manière sûre"""
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'accessibility_validator'):
+        return app.state.accessibility_validator
+    return None
+
+# ---------------------------------------------------------------------
 # System & monitoring
 # ---------------------------------------------------------------------
 @app.get("/healthz", tags=["system"])
 def healthz():
     model = get_model()
+    model_path = os.path.join("model", "recommendation_model.pkl")
+    try:
+        if os.path.exists(model_path):
+            if model.load_model():
+                logger.info("Model %s loaded successfully", getattr(model, "model_version", "unknown"))
+            else:
+                logger.info("No saved model found; will train on first request")
+        else:
+            logger.info("No saved model found; will train on first request")
+    except Exception as e:
+        logger.warning("Error while loading model: %s. Will train on first request.", e)
+
+    # Log compliance status
+    if COMPLIANCE_ENABLED:
+        logger.info("E4 Compliance standards active")
+        logger.info(f"Security validator: {get_security_validator() is not None}")
+        logger.info(f"Accessibility validator: {get_accessibility_validator() is not None}")
+    else:
+        logger.warning("E4 Compliance standards not available")
+
+    logger.info("API startup complete.")()
     monitor = get_monitor()
     return {
         "status": "healthy" if (DB_READY or not settings.DB_REQUIRED) else "degraded",
@@ -382,7 +427,7 @@ def healthz():
         "model_loaded": model.is_trained,
         "model_version": model.model_version,
         "monitoring": monitor.get_metrics_summary(),
-        "compliance_enabled": COMPLIANCE_AVAILABLE,
+        "compliance_enabled": COMPLIANCE_ENABLED,
     }
 
 @app.get("/", include_in_schema=False)
@@ -471,9 +516,9 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     clean_query = request.query.strip()
     
     # Nettoyage avec compliance si disponible
-    if COMPLIANCE_AVAILABLE:
+    security_validator = get_security_validator()
+    if security_validator:
         try:
-            security_validator = app.state.security_validator
             clean_query = security_validator.sanitize_input(clean_query)
         except Exception as e:
             logger.warning(f"Compliance sanitization failed: {e}")
@@ -506,9 +551,9 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     }
     
     # Enhancement accessibilité si disponible
-    if COMPLIANCE_AVAILABLE:
+    accessibility_validator = get_accessibility_validator()
+    if accessibility_validator:
         try:
-            accessibility_validator = app.state.accessibility_validator
             response = accessibility_validator.enhance_response_accessibility(response)
         except Exception as e:
             logger.warning(f"Accessibility enhancement failed: {e}")
@@ -590,9 +635,9 @@ def register(username: str = Form(...), password: str = Form(...)):
     username = username.strip()
     
     # Validation avec compliance si disponible
-    if COMPLIANCE_AVAILABLE:
+    security_validator = get_security_validator()
+    if security_validator:
         try:
-            security_validator = app.state.security_validator
             username = security_validator.sanitize_input(username)
             
             password_validation = security_validator.validate_password(password)
@@ -624,9 +669,9 @@ def register(username: str = Form(...), password: str = Form(...)):
 def games_by_title(title: str, user: str = Depends(verify_token)):
     # Nettoyage du titre avec compliance si disponible
     clean_title = title.strip()
-    if COMPLIANCE_AVAILABLE:
+    security_validator = get_security_validator()
+    if security_validator:
         try:
-            security_validator = app.state.security_validator
             clean_title = security_validator.sanitize_input(clean_title)
         except Exception as e:
             logger.warning(f"Title sanitization failed: {e}")
@@ -660,9 +705,9 @@ def monitoring_summary(user: str = Depends(verify_token)):
         "monitoring": monitor.get_metrics_summary(), 
         "last_evaluation": monitor.last_evaluation,
         "compliance_status": {
-            "enabled": COMPLIANCE_AVAILABLE,
-            "security_validator": hasattr(app.state, 'security_validator'),
-            "accessibility_validator": hasattr(app.state, 'accessibility_validator')
+            "enabled": COMPLIANCE_ENABLED,
+            "security_validator": get_security_validator() is not None,
+            "accessibility_validator": get_accessibility_validator() is not None
         }
     }
 
@@ -690,7 +735,7 @@ def check_drift(user: str = Depends(verify_token)):
 @app.get("/compliance/status", tags=["compliance"])
 def compliance_status(user: str = Depends(verify_token)):
     """Status de la conformité E4"""
-    if not COMPLIANCE_AVAILABLE:
+    if not COMPLIANCE_ENABLED:
         return {
             "compliance_enabled": False,
             "message": "Compliance module not available",
@@ -703,12 +748,12 @@ def compliance_status(user: str = Depends(verify_token)):
         "standards": [
             {
                 "name": "Security Standards",
-                "status": "active",
+                "status": "active" if get_security_validator() else "inactive",
                 "features": ["Input sanitization", "Password validation", "Injection protection"]
             },
             {
                 "name": "Accessibility Standards", 
-                "status": "active",
+                "status": "active" if get_accessibility_validator() else "inactive",
                 "features": ["ARIA labels", "Screen reader support", "WCAG 2.1 AA compliance"]
             }
         ]
@@ -717,11 +762,11 @@ def compliance_status(user: str = Depends(verify_token)):
 @app.post("/compliance/validate-password", tags=["compliance"])
 def validate_password_endpoint(password: str = Form(...), user: str = Depends(verify_token)):
     """Validation de mot de passe selon standards E4"""
-    if not COMPLIANCE_AVAILABLE:
+    security_validator = get_security_validator()
+    if not security_validator:
         return {"error": "Compliance module not available"}
     
     try:
-        security_validator = app.state.security_validator
         result = security_validator.validate_password(password)
         return {
             "validation_result": result,
@@ -763,23 +808,4 @@ async def startup_event():
         if settings.DB_REQUIRED:
             raise
 
-    model = get_model()
-    model_path = os.path.join("model", "recommendation_model.pkl")
-    try:
-        if os.path.exists(model_path):
-            if model.load_model():
-                logger.info("Model %s loaded successfully", getattr(model, "model_version", "unknown"))
-            else:
-                logger.info("No saved model found; will train on first request")
-        else:
-            logger.info("No saved model found; will train on first request")
-    except Exception as e:
-        logger.warning("Error while loading model: %s. Will train on first request.", e)
-
-    # Log compliance status
-    if COMPLIANCE_AVAILABLE:
-        logger.info("E4 Compliance standards active")
-    else:
-        logger.warning("E4 Compliance standards not available")
-
-    logger.info("API startup complete.")
+    model = get_model
