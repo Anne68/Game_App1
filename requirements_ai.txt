@@ -1,0 +1,8 @@
+# requirements_ai_minimal.txt - Version minimale pour commencer
+torch>=2.1.0 --index-url https://download.pytorch.org/whl/cpu
+transformers>=4.35.0
+sentence-transformers>=2.2.2
+scikit-learn>=1.3.2
+numpy>=1.26.4
+pandas>=2.1.4
+shap>=0.43.0
