@@ -1,12 +1,10 @@
 # compliance/__init__.py
 """
-Module de conformité pour E4 - Compétence C17
-Standards de sécurité et d'accessibilité
+Module de conformité E4 - Version minimale pour déploiement
 """
 
 __version__ = "1.0.0"
 
-# Import sécurisé des composants
 try:
     from .standards_compliance import SecurityValidator, AccessibilityValidator
     __all__ = ['SecurityValidator', 'AccessibilityValidator']
