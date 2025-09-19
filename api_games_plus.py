@@ -198,3 +198,64 @@ def recommend_by_genre(
 
 @app.post("/token", tags=["auth"])
 def token(username: str = Form(...), password: str = Form(...)):
+    """Authentification et génération de token JWT"""
+    if not DB_READY:
+        if settings.DEMO_LOGIN_ENABLED and username == settings.DEMO_USERNAME and password == settings.DEMO_PASSWORD:
+            access_token = create_access_token({"sub": username})
+            return {"access_token": access_token, "token_type": "bearer", "mode": "demo"}
+        raise HTTPException(status_code=503, detail="Database unavailable: cannot authenticate")
+
+    try:
+        u = get_user(username)
+    except Exception as e:
+        logger.error("DB error on login: %s", e)
+        raise HTTPException(status_code=503, detail="Database error during login")
+
+    if not u:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    stored_password = u.get('hashed_password', '')
+    if not stored_password:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    try:
+        if not pwd_ctx.verify(password, stored_password):
+            raise HTTPException(status_code=401, detail="Incorrect username or password")
+    except UnknownHashError:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    access_token = create_access_token({"sub": username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/register", tags=["auth"])
+def register(username: str = Form(...), password: str = Form(...)):
+    """Inscription d'un nouvel utilisateur"""
+    if not DB_READY:
+        raise HTTPException(status_code=503, detail="Database unavailable: cannot register now")
+    
+    username = username.strip()
+    security_validator = get_security_validator()
+    if security_validator:
+        try:
+            username = security_validator.sanitize_input(username)
+            password_validation = security_validator.validate_password(password)
+            if not password_validation["valid"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "Password does not meet security requirements",
+                        "issues": password_validation["issues"],
+                        "strength": password_validation["strength"]
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"Compliance validation failed: {e}")
+    
+    if get_user(username):
+        raise HTTPException(status_code=400, detail="User already exists")
+    try:
+        create_user(username, password)
+    except Exception as e:
+        logger.error("DB error on register: %s", e)
+        raise HTTPException(status_code=503, detail="Database error during register")
+    return {"ok": True}
