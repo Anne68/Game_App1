@@ -234,6 +234,22 @@ def _safe_int(x, default: int = 0) -> int:
         return default
 
 def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Récupère les jeux pour le ML. Si pas de DB, utilise des données par défaut.
+    """
+    if not DB_READY:
+        # Données par défaut pour fonctionner sans DB
+        logger.info("Using default games data (no database available)")
+        return [
+            {"id": 1, "title": "The Witcher 3", "genres": "RPG Action", "rating": 4.9, "metacritic": 93, "platforms": ["PC", "PS4"]},
+            {"id": 2, "title": "Hades", "genres": "Action Roguelike", "rating": 4.8, "metacritic": 93, "platforms": ["PC", "Switch"]},
+            {"id": 3, "title": "Stardew Valley", "genres": "Simulation RPG", "rating": 4.7, "metacritic": 89, "platforms": ["PC", "Switch"]},
+            {"id": 4, "title": "Celeste", "genres": "Platformer Indie", "rating": 4.6, "metacritic": 94, "platforms": ["PC", "Switch"]},
+            {"id": 5, "title": "Doom Eternal", "genres": "Action FPS", "rating": 4.5, "metacritic": 88, "platforms": ["PC", "PS4"]},
+            {"id": 6, "title": "Hollow Knight", "genres": "Metroidvania Indie", "rating": 4.7, "metacritic": 90, "platforms": ["PC", "Switch"]},
+            {"id": 7, "title": "Cyberpunk 2077", "genres": "RPG Action", "rating": 4.0, "metacritic": 76, "platforms": ["PC", "PS4", "Xbox"]},
+        ]
+
     sql = """
         SELECT
             game_id_rawg AS id,
@@ -267,6 +283,25 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     return games
 
 def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
+    """
+    Recherche de jeux par titre. Si pas de DB, utilise les données par défaut.
+    """
+    if not DB_READY:
+        # Recherche simple dans les données par défaut
+        default_games = fetch_games_for_ml()
+        q_lower = q.strip().lower()
+        results = []
+        for game in default_games:
+            if q_lower in game["title"].lower():
+                results.append({
+                    "id": game["id"],
+                    "title": game["title"],
+                    "rating": game["rating"],
+                    "metacritic": game["metacritic"],
+                    "platforms": ",".join(game["platforms"]) if isinstance(game["platforms"], list) else game["platforms"]
+                })
+        return results[:limit]
+
     like = f"%{q.strip().lower()}%"
     sql = """
         SELECT
@@ -378,6 +413,7 @@ def healthz():
         "model_version": model.model_version,
         "monitoring": monitor.get_metrics_summary(),
         "compliance_enabled": COMPLIANCE_ENABLED,
+        "demo_mode": not DB_READY and settings.DEMO_LOGIN_ENABLED,
     }
 
 @app.get("/", include_in_schema=False)
@@ -552,7 +588,7 @@ def recommend_random_cluster(sample: int = Query(12, ge=1, le=200), user: str = 
 def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
     """
     Similarité stricte sur les titres (TF-IDF caractères).
-    Différent de /recommend/similar-game (qui utilise KNN à partir d’un jeu existant).
+    Différent de /recommend/similar-game (qui utilise KNN à partir d'un jeu existant).
     """
     _ensure_model_trained_with_db()
     model = get_model()
@@ -659,7 +695,10 @@ def games_by_title(title: str, user: str = Depends(verify_token)):
     results = []
     for r in rows:
         raw_plats = r.get("platforms") or ""
-        platforms = [p.strip() for p in raw_plats.split(",") if p.strip()]
+        if isinstance(raw_plats, list):
+            platforms = raw_plats
+        else:
+            platforms = [p.strip() for p in raw_plats.split(",") if p.strip()]
         results.append({
             "id": int(r["id"]),
             "title": r["title"],
@@ -736,28 +775,67 @@ async def startup_event():
     global DB_READY, DB_LAST_ERROR
     logger.info("Starting Games API with ML and E4 compliance...")
 
+    # Nouveau: gestion gracieuse de la base de données
     try:
-        if settings.db_configured:
+        if settings.db_configured and settings.DB_REQUIRED:
+            # Mode strict: la DB est obligatoire
             ensure_users_table()
             DB_READY = True
             DB_LAST_ERROR = None
+            logger.info("Database connected successfully (required mode)")
+        elif settings.db_configured:
+            # Mode gracieux: tenter la connexion DB mais continuer sans si échec
             try:
-                n = count_games_in_db()
-                logger.info("Users table ready; games in DB: %s", n)
-            except Exception:
-                logger.info("Users table ready")
+                ensure_users_table()
+                DB_READY = True
+                DB_LAST_ERROR = None
+                logger.info("Database connected successfully (optional mode)")
+                try:
+                    n = count_games_in_db()
+                    logger.info("Games in DB: %s", n)
+                except Exception:
+                    logger.info("Users table ready")
+            except Exception as e:
+                DB_READY = False
+                DB_LAST_ERROR = str(e)
+                logger.warning(f"Database connection failed (continuing without DB): {e}")
+                if settings.DEMO_LOGIN_ENABLED:
+                    logger.info("Demo mode enabled - API will work with limited functionality")
+                else:
+                    logger.warning("Demo mode disabled - authentication will not work")
         else:
+            # Pas de configuration DB
             DB_READY = False
             DB_LAST_ERROR = "Database not configured (set DB_* env vars)"
-            logger.warning(DB_LAST_ERROR)
-            if settings.DB_REQUIRED:
-                raise RuntimeError(DB_LAST_ERROR)
+            logger.info("Database not configured - using demo mode")
     except Exception as e:
         DB_READY = False
         DB_LAST_ERROR = str(e)
-        logger.error("Database initialization failed (will continue without DB): %s", e)
+        logger.error(f"Database initialization failed: {e}")
         if settings.DB_REQUIRED:
+            logger.error("DB_REQUIRED=true but database failed - stopping startup")
             raise
+        else:
+            logger.info("DB_REQUIRED=false - continuing without database")
 
+    # Charger le modèle ML (indépendamment de la DB)
     model = get_model()
-    # (chargement lazy via /healthz ou aux premières requêtes de reco)
+    model_path = os.path.join("model", "recommendation_model.pkl")
+    try:
+        if os.path.exists(model_path):
+            if model.load_model():
+                logger.info("Model loaded from disk: %s", model.model_version)
+            else:
+                logger.info("Model file exists but loading failed - will train on first request")
+        else:
+            logger.info("No saved model found - will train on first request")
+    except Exception as e:
+        logger.warning("Error loading model: %s - will train on first request", e)
+
+    # Compliance setup
+    if COMPLIANCE_ENABLED:
+        logger.info("E4 Compliance standards active")
+    else:
+        logger.warning("E4 Compliance standards not available")
+
+    logger.info("API startup complete - Status: %s", "healthy" if (DB_READY or not settings.DB_REQUIRED) else "degraded")
