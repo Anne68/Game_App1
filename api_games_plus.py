@@ -18,7 +18,6 @@ from passlib.exc import UnknownHashError
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 
-# FIX: Import correct des modules
 from settings import get_settings
 from model_manager import get_model
 from monitoring_metrics import (
@@ -43,19 +42,17 @@ settings = get_settings()
 SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = settings.ALGORITHM
 ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
-pwd_ctx = CryptContext(
-    schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"],
-    deprecated="auto",
-)
+pwd_ctx = CryptContext(schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"], deprecated="auto")
 
 DB_READY: bool = False
 DB_LAST_ERROR: Optional[str] = None
 
 app = FastAPI(
     title="Games API ML (C9→C13)",
-    version="2.4.0",
-    description="API avec modèle ML, monitoring avancé et MySQL pour les utilisateurs",
+    version="2.5.0",
+    description="API avec modèle ML, monitoring avancé et MySQL (AlwaysData) pour les utilisateurs",
 )
 
 app.add_middleware(
@@ -66,7 +63,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------- Compliance -----------------
+# ----------------- Compliance helpers -----------------
 def setup_compliance():
     if COMPLIANCE_AVAILABLE:
         try:
@@ -77,11 +74,20 @@ def setup_compliance():
         except Exception as e:
             logger.error(f"Failed to setup compliance validators: {e}")
             return False
-    else:
-        logger.info("Compliance not available - continuing without")
-        return False
+    logger.info("Compliance not available - continuing without")
+    return False
 
 COMPLIANCE_ENABLED = setup_compliance()
+
+def get_security_validator():
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'security_validator'):
+        return app.state.security_validator
+    return None
+
+def get_accessibility_validator():
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'accessibility_validator'):
+        return app.state.accessibility_validator
+    return None
 
 # ----------------- Models -----------------
 class TrainRequest(BaseModel):
@@ -114,9 +120,8 @@ class TrainResponse(BaseModel):
     duration: Optional[float] = None
     result: Optional[Dict[str, Any]] = None
 
-# ----------------- Utils settings -----------------
+# ----------------- Utils -----------------
 def get_setting_bool(name: str, default: bool = False) -> bool:
-    """Lit un bool depuis settings avec parsing de chaînes."""
     try:
         v = getattr(settings, name, None)
         if v is None:
@@ -129,7 +134,6 @@ def get_setting_bool(name: str, default: bool = False) -> bool:
 
 # ----------------- DB helpers -----------------
 def _ssl_kwargs() -> dict:
-    # Supporte SSL simple (CA) et mTLS si DB_SSL_CERT/DB_SSL_KEY sont fournis
     ssl_dict: Dict[str, str] = {}
     if getattr(settings, "DB_SSL_CA", None):
         ssl_dict["ca"] = settings.DB_SSL_CA
@@ -169,11 +173,10 @@ def ensure_users_table():
                 """
             )
             conn.commit()
-            logger.info("Created users table with 'hashed_password'.")
+            logger.info("Created users table.")
             return
         cur.execute("SHOW COLUMNS FROM users LIKE 'hashed_password';")
-        has_hashed = cur.fetchone() is not None
-        if not has_hashed:
+        if not cur.fetchone():
             cur.execute("ALTER TABLE users ADD COLUMN hashed_password VARCHAR(255) NOT NULL;")
             conn.commit()
             logger.info("Added 'hashed_password' column.")
@@ -189,7 +192,6 @@ def get_user(username: str) -> Optional[dict]:
         return cur.fetchone()
 
 def create_user(username: str, password: str) -> int:
-    """Crée l'utilisateur avec hash sécurisé. Retourne l'id inséré (ou existant)."""
     hpwd = pwd_ctx.hash(password)
     with get_db_conn() as conn, conn.cursor() as cur:
         try:
@@ -199,15 +201,11 @@ def create_user(username: str, password: str) -> int:
             )
             user_id = int(cur.lastrowid)
             if users_has_column("password_hash"):
-                cur.execute(
-                    "UPDATE users SET password_hash=%s WHERE id=%s",
-                    (hpwd, user_id),
-                )
+                cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (hpwd, user_id))
             conn.commit()
-            logger.info("User '%s' created with id=%s", username, user_id)
+            logger.info("User '%s' created (id=%s)", username, user_id)
             return user_id
-        except pymysql.err.IntegrityError as e:
-            logger.warning("User '%s' already exists (integrity). %s", username, e)
+        except pymysql.err.IntegrityError:
             cur.execute("SELECT id FROM users WHERE username=%s", (username,))
             row = cur.fetchone()
             return int(row["id"]) if row and "id" in row else 0
@@ -241,7 +239,7 @@ def count_games_in_db() -> int:
 def _parse_platforms(value: Optional[str]) -> List[str]:
     if not value:
         return []
-    return [p.strip() for p in value.split(",") if p.strip()]
+    return [p.strip() for p in str(value).split(",") if p.strip()]
 
 def _safe_float(x, default: float = 0.0) -> float:
     try:
@@ -263,9 +261,14 @@ def _safe_int(x, default: int = 0) -> int:
     except Exception:
         return default
 
+# ---------- IMPORTANT: lire TOUJOURS la BDD (pas de fallback, sauf USE_DEMO_GAMES=true) ----------
 def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    if not DB_READY:
-        logger.info("Using default games data (no database available)")
+    use_demo = get_setting_bool("USE_DEMO_GAMES", False)
+    if not DB_READY and not use_demo:
+        raise RuntimeError("Database not ready and USE_DEMO_GAMES is false")
+
+    if not DB_READY and use_demo:
+        logger.warning("DB not ready. Falling back to demo games because USE_DEMO_GAMES=true")
         return [
             {"id": 1, "title": "The Witcher 3", "genres": "RPG Action", "rating": 4.9, "metacritic": 93, "platforms": ["PC", "PS4"]},
             {"id": 2, "title": "Hades", "genres": "Action Roguelike", "rating": 4.8, "metacritic": 93, "platforms": ["PC", "Switch"]},
@@ -275,6 +278,7 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
             {"id": 6, "title": "Hollow Knight", "genres": "Metroidvania Indie", "rating": 4.7, "metacritic": 90, "platforms": ["PC", "Switch"]},
             {"id": 7, "title": "Cyberpunk 2077", "genres": "RPG Action", "rating": 4.0, "metacritic": 76, "platforms": ["PC", "PS4", "Xbox"]},
         ]
+
     sql = """
         SELECT
             game_id_rawg AS id,
@@ -288,9 +292,11 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     if limit and limit > 0:
         sql += " LIMIT %s"
+
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute(sql, (limit,) if limit else None)
         rows = cur.fetchall() or []
+
     games: List[Dict[str, Any]] = []
     for r in rows:
         games.append({
@@ -301,12 +307,18 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
             "metacritic": _safe_int(r.get("metacritic"), 0),
             "platforms": _parse_platforms(r.get("platforms")),
         })
+
+    logger.info("Loaded %s games from DB", len(games))
     if not games:
         raise RuntimeError("Aucun jeu exploitable trouvé dans la table 'games'.")
     return games
 
 def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
-    if not DB_READY:
+    use_demo = get_setting_bool("USE_DEMO_GAMES", False)
+    if not DB_READY and not use_demo:
+        raise RuntimeError("Database not ready and USE_DEMO_GAMES is false")
+    if not DB_READY and use_demo:
+        # recherche simple dans la démo
         default_games = fetch_games_for_ml()
         q_lower = q.strip().lower()
         results = []
@@ -320,6 +332,7 @@ def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
                     "platforms": ",".join(game["platforms"]) if isinstance(game["platforms"], list) else game["platforms"]
                 })
         return results[:limit]
+
     like = f"%{q.strip().lower()}%"
     sql = """
         SELECT
@@ -387,16 +400,6 @@ def measure_latency(endpoint: str):
             return sync_wrapper
     return decorator
 
-def get_security_validator():
-    if COMPLIANCE_ENABLED and hasattr(app.state, 'security_validator'):
-        return app.state.security_validator
-    return None
-
-def get_accessibility_validator():
-    if COMPLIANCE_ENABLED and hasattr(app.state, 'accessibility_validator'):
-        return app.state.accessibility_validator
-    return None
-
 # ----------------- System & monitoring -----------------
 @app.get("/healthz", tags=["system"])
 def healthz():
@@ -420,7 +423,6 @@ def healthz():
     else:
         logger.warning("E4 Compliance standards not available")
 
-    logger.info("API startup complete.")
     monitor = get_monitor()
     return {
         "status": "healthy" if (DB_READY or not settings.DB_REQUIRED) else "degraded",
@@ -431,14 +433,13 @@ def healthz():
         "model_version": model.model_version,
         "monitoring": monitor.get_metrics_summary(),
         "compliance_enabled": COMPLIANCE_ENABLED,
-        "demo_mode": not DB_READY and settings.DEMO_LOGIN_ENABLED,
     }
 
 @app.get("/", include_in_schema=False)
 def root():
     return {"name": app.title, "version": app.version, "status": "ok"}
 
-# ✅ NOUVELLE ROUTE HEAD /
+# Health probe Render HEAD /
 @app.head("/", include_in_schema=False)
 def head_root():
     return Response(status_code=200)
@@ -472,7 +473,6 @@ def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: 
     games = fetch_games_for_ml()
     result = model.train(games)
     duration = time.time() - start_time
-
     monitor = get_monitor()
     monitor.record_training(
         model_version=version,
@@ -512,7 +512,6 @@ def evaluate_model(test_queries: List[str] = Query(default=["RPG", "Action", "In
 def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     _ensure_model_trained_with_db()
     model = get_model()
-
     clean_query = request.query.strip()
     sec = get_security_validator()
     if sec:
@@ -520,63 +519,44 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
             clean_query = sec.sanitize_input(clean_query)
         except Exception as e:
             logger.warning(f"Compliance sanitization failed: {e}")
-
     if not clean_query:
         raise HTTPException(status_code=400, detail="Query is empty")
-
     start_time = time.time()
     try:
-        recommendations = model.predict(
-            query=clean_query,
-            k=request.k,
-            min_confidence=request.min_confidence
-        )
+        recommendations = model.predict(query=clean_query, k=request.k, min_confidence=request.min_confidence)
     except ValueError as e:
-        logger.warning("Prediction error: %s", e)
         raise HTTPException(status_code=400, detail=f"Bad input for model: {e}")
     except Exception:
         logger.exception("Prediction failed")
         raise HTTPException(status_code=500, detail="Prediction failed")
-
     latency = time.time() - start_time
     get_monitor().record_prediction("recommend_ml", clean_query, recommendations, latency)
-
     response = {
         "query": clean_query,
         "recommendations": recommendations,
         "latency_ms": latency * 1000,
         "model_version": model.model_version,
     }
-
     acc = get_accessibility_validator()
     if acc:
         try:
             response = acc.enhance_response_accessibility(response)
         except Exception as e:
             logger.warning(f"Accessibility enhancement failed: {e}")
-
     return response
 
-# ----- Nouveaux endpoints -----
 @app.post("/recommend/similar-game", tags=["recommend"])
 def recommend_similar_game(payload: SimilarGameRequest, user: str = Depends(verify_token)):
-    """
-    KNN sur un jeu spécifique:
-      - fournir game_id OU title
-    """
     _ensure_model_trained_with_db()
     model = get_model()
-
     game_id = payload.game_id
     if not game_id and payload.title:
         matches = find_games_by_title(payload.title, limit=1)
         if not matches:
             raise HTTPException(status_code=404, detail="Game not found with given title")
         game_id = int(matches[0]["id"])
-
     if not game_id:
         raise HTTPException(status_code=400, detail="Provide either 'game_id' or 'title'")
-
     try:
         recs = model.predict_by_game_id(int(game_id), k=max(1, payload.k))
         return {"source_id": int(game_id), "recommendations": recs, "model_version": model.model_version}
@@ -607,10 +587,6 @@ def recommend_random_cluster(sample: int = Query(12, ge=1, le=200), user: str = 
 
 @app.get("/recommend/by-title/{title}", tags=["recommend"])
 def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
-    """
-    Similarité stricte sur les titres (TF-IDF caractères).
-    Différent de /recommend/similar-game (qui utilise KNN à partir d'un jeu existant).
-    """
     _ensure_model_trained_with_db()
     model = get_model()
     try:
@@ -626,7 +602,7 @@ def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = 
     recos = model.recommend_by_genre(genre, k=k)
     return {"genre": genre, "recommendations": recos}
 
-# ----------------- Auth endpoints (corrigés avec auto-create) -----------------
+# ----------------- Auth (auto-create au login) -----------------
 def _issue_token_core(username: str, password: str):
     if not DB_READY:
         if settings.DEMO_LOGIN_ENABLED and username == settings.DEMO_USERNAME and password == settings.DEMO_PASSWORD:
@@ -636,26 +612,23 @@ def _issue_token_core(username: str, password: str):
 
     auto_create = get_setting_bool("AUTO_CREATE_USER_ON_LOGIN", True)
 
-    # tentative de récupération
     try:
         u = get_user(username)
     except Exception as e:
         logger.error("DB error on login lookup: %s", e)
         raise HTTPException(status_code=503, detail="Database error during login")
 
-    # auto-création si absent
     if not u and auto_create:
         logger.info("Auto-creating user '%s' on first login", username)
         try:
             sec = get_security_validator()
             if sec:
-                # Valide la complexité, peut lever une erreur 400 si insuffisant
-                validation = sec.validate_password(password)
-                if not validation.get("valid", True):
+                pv = sec.validate_password(password)
+                if not pv.get("valid", True):
                     raise HTTPException(status_code=400, detail={
                         "message": "Password does not meet security requirements",
-                        "issues": validation.get("issues", []),
-                        "strength": validation.get("strength"),
+                        "issues": pv.get("issues", []),
+                        "strength": pv.get("strength"),
                     })
                 username = sec.sanitize_input(username)
             create_user(username, password)
@@ -700,132 +673,35 @@ def token_alias(username: str = Form(...), password: str = Form(...)):
 def register(username: str = Form(...), password: str = Form(...)):
     if not DB_READY:
         raise HTTPException(status_code=503, detail="Database unavailable: cannot register now")
-
     try:
         ensure_users_table()
     except Exception as e:
         logger.error("DB error ensuring users table: %s", e)
         raise HTTPException(status_code=503, detail="Database error preparing table")
-
     username = username.strip()
     sec = get_security_validator()
     if sec:
         try:
             username = sec.sanitize_input(username)
-            password_validation = sec.validate_password(password)
-            if not password_validation["valid"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "message": "Password does not meet security requirements",
-                        "issues": password_validation["issues"],
-                        "strength": password_validation["strength"]
-                    }
-                )
+            pv = sec.validate_password(password)
+            if not pv["valid"]:
+                raise HTTPException(status_code=400, detail={
+                    "message": "Password does not meet security requirements",
+                    "issues": pv["issues"],
+                    "strength": pv["strength"]
+                })
         except HTTPException:
             raise
         except Exception as e:
             logger.warning(f"Compliance validation failed: {e}")
-
     if get_user(username):
         raise HTTPException(status_code=400, detail="User already exists")
-
     try:
         user_id = create_user(username, password)
     except Exception as e:
         logger.error("DB error on register: %s", e)
         raise HTTPException(status_code=503, detail="Database error during register")
-
     return {"ok": True, "user_id": user_id}
-
-# ----------------- Games search & monitoring -----------------
-@app.get("/games/by-title/{title}", tags=["games"])
-def games_by_title(title: str, user: str = Depends(verify_token)):
-    clean_title = title.strip()
-    sec = get_security_validator()
-    if sec:
-        try:
-            clean_title = sec.sanitize_input(clean_title)
-        except Exception as e:
-            logger.warning(f"Title sanitization failed: {e}")
-
-    rows = find_games_by_title(clean_title, limit=25)
-    results = []
-    for r in rows:
-        raw_plats = r.get("platforms") or ""
-        if isinstance(raw_plats, list):
-            platforms = raw_plats
-        else:
-            platforms = [p.strip() for p in raw_plats.split(",") if p.strip()]
-        results.append({
-            "id": int(r["id"]),
-            "title": r["title"],
-            "rating": r.get("rating"),
-            "metacritic": r.get("metacritic"),
-            "platforms": platforms,
-        })
-    return {"results": results}
-
-@app.get("/monitoring/summary", tags=["monitoring"])
-def monitoring_summary(user: str = Depends(verify_token)):
-    monitor = get_monitor()
-    model = get_model()
-    return {
-        "model": model.get_metrics(),
-        "monitoring": monitor.get_metrics_summary(),
-        "last_evaluation": monitor.last_evaluation,
-        "compliance_status": {
-            "enabled": COMPLIANCE_ENABLED,
-            "security_validator": get_security_validator() is not None,
-            "accessibility_validator": get_accessibility_validator() is not None
-        }
-    }
-
-@app.get("/monitoring/drift", tags=["monitoring"])
-def check_drift(user: str = Depends(verify_token)):
-    monitor = get_monitor()
-    if len(monitor.confidence_history) < 100:
-        return {"status": "insufficient_data", "message": "Need at least 100 predictions"}
-    drift_score = monitor._detect_drift()
-    status = "stable"
-    if drift_score > 0.3:
-        status = "high_drift"
-    elif drift_score > 0.15:
-        status = "moderate_drift"
-    return {
-        "drift_score": drift_score,
-        "status": status,
-        "recommendation": "Retrain model" if status == "high_drift"
-        else "Monitor closely" if status == "moderate_drift" else "No action needed"
-    }
-
-# ----------------- Compliance status -----------------
-@app.get("/compliance/status", tags=["compliance"])
-def compliance_status(user: str = Depends(verify_token)):
-    if not COMPLIANCE_ENABLED:
-        return {"compliance_enabled": False, "message": "Compliance module not available", "standards": []}
-    return {
-        "compliance_enabled": True,
-        "message": "E4 compliance standards active",
-        "standards": [
-            {"name": "Security Standards", "status": "active" if get_security_validator() else "inactive",
-             "features": ["Input sanitization", "Password validation", "Injection protection"]},
-            {"name": "Accessibility Standards", "status": "active" if get_accessibility_validator() else "inactive",
-             "features": ["ARIA labels", "Screen reader support", "WCAG 2.1 AA compliance"]}
-        ]
-    }
-
-@app.post("/compliance/validate-password", tags=["compliance"])
-def validate_password_endpoint(password: str = Form(...), user: str = Depends(verify_token)):
-    sec = get_security_validator()
-    if not sec:
-        return {"error": "Compliance module not available"}
-    try:
-        result = sec.validate_password(password)
-        return {"validation_result": result, "standards": "E4 Security Requirements"}
-    except Exception as e:
-        logger.error(f"Password validation failed: {e}")
-        return {"error": "Validation failed"}
 
 # ----------------- Startup -----------------
 @app.on_event("startup")
@@ -833,7 +709,6 @@ async def startup_event():
     global DB_READY, DB_LAST_ERROR
     logger.info("Starting Games API with ML and E4 compliance...")
 
-    # Gestion gracieuse de la base de données
     try:
         if settings.db_configured and settings.DB_REQUIRED:
             ensure_users_table()
@@ -855,10 +730,6 @@ async def startup_event():
                 DB_READY = False
                 DB_LAST_ERROR = str(e)
                 logger.warning(f"Database connection failed (continuing without DB): {e}")
-                if settings.DEMO_LOGIN_ENABLED:
-                    logger.info("Demo mode enabled - API will work with limited functionality")
-                else:
-                    logger.warning("Demo mode disabled - authentication will not work")
         else:
             DB_READY = False
             DB_LAST_ERROR = "Database not configured (set DB_* env vars)"
@@ -870,10 +741,8 @@ async def startup_event():
         if settings.DB_REQUIRED:
             logger.error("DB_REQUIRED=true but database failed - stopping startup")
             raise
-        else:
-            logger.info("DB_REQUIRED=false - continuing without database")
 
-    # Charger le modèle ML (indépendamment de la DB)
+    # Charger modèle s'il existe
     model = get_model()
     model_path = os.path.join("model", "recommendation_model.pkl")
     try:
@@ -887,10 +756,5 @@ async def startup_event():
     except Exception as e:
         logger.warning("Error loading model: %s - will train on first request", e)
 
-    # Compliance setup
     if COMPLIANCE_ENABLED:
         logger.info("E4 Compliance standards active")
-    else:
-        logger.warning("E4 Compliance standards not available")
-
-    logger.info("API startup complete - Status: %s", "healthy" if (DB_READY or not settings.DB_REQUIRED) else "degraded")
