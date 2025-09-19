@@ -6,9 +6,9 @@ import pickle
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
-
 import numpy as np
 import pandas as pd
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.neighbors import NearestNeighbors
@@ -17,12 +17,10 @@ from sklearn.cluster import KMeans
 
 logger = logging.getLogger("model-manager")
 
-
 class RecommendationModel:
     """
     Modèle de recommandation avec pipeline :
-      TF-IDF (titre+genres+plateformes) -> SVD (optionnel, auto-ajusté) -> KMeans (clusters) -> KNN (NearestNeighbors)
-
+      TF-IDF (titre+genres+plateformes) -> SVD -> KMeans (8 clusters) -> KNN (NearestNeighbors)
     Méthodes spécialisées :
       - predict(query)
       - predict_by_game_id(game_id)
@@ -40,31 +38,28 @@ class RecommendationModel:
             max_features=5000,
             ngram_range=(1, 2),
             stop_words="english",
-            lowercase=True,
+            lowercase=True
         )
-        # SVD peut être None si dataset trop petit
-        self.svd: Optional[TruncatedSVD] = TruncatedSVD(n_components=128, random_state=42)
+        self.svd = TruncatedSVD(n_components=128, random_state=42)
 
         # Titre seul (pour similarité stricte par titre)
         self.title_vectorizer = TfidfVectorizer(
             max_features=8000,
             analyzer="char",
             ngram_range=(3, 5),
-            lowercase=True,
+            lowercase=True
         )
 
-        # Clustering et KNN (valeurs finales ajustées à l'entraînement)
-        self.kmeans: Optional[KMeans] = KMeans(n_clusters=8, random_state=42, n_init="auto")
-        self.knn: Optional[NearestNeighbors] = NearestNeighbors(metric="cosine", n_neighbors=50, algorithm="auto")
+        # Clustering et KNN
+        self.kmeans = KMeans(n_clusters=8, random_state=42, n_init="auto")
+        self.knn = NearestNeighbors(metric="cosine", n_neighbors=50, algorithm="auto")
 
-        # Données / features
-        self.game_features: Optional[np.ndarray] = None           # espace final pour KNN (cluster_space concat numériques)
-        self.features_reduced: Optional[np.ndarray] = None        # sortie SVD OU TF-IDF brut
-        self.cluster_space: Optional[np.ndarray] = None           # espace texte utilisé par KMeans (normalisé)
-        self.tfidf_matrix: Optional[np.ndarray] = None            # TF-IDF brut (sparse)
+        # Données/features
+        self.game_features: Optional[np.ndarray] = None          # features réduites + numériques
+        self.features_reduced: Optional[np.ndarray] = None       # uniquement SVD
+        self.tfidf_matrix: Optional[np.ndarray] = None           # TF-IDF brut (sparse)
         self.cluster_labels: Optional[np.ndarray] = None
         self.games_df: Optional[pd.DataFrame] = None
-        self.title_tfidf = None
         self.is_trained: bool = False
 
         # Caches
@@ -77,7 +72,7 @@ class RecommendationModel:
             "avg_confidence": 0.0,
             "last_training": None,
             "model_version": model_version,
-            "feature_dim": 0,
+            "feature_dim": 0
         }
 
     # -----------------------------
@@ -87,19 +82,10 @@ class RecommendationModel:
         df = pd.DataFrame(games)
 
         # Texte combiné pour le contenu
-        def _plat(x):
-            if isinstance(x, list):
-                return " ".join([str(v) for v in x])
-            return str(x or "")
-
-        df["platforms_str"] = df.get("platforms", []).apply(_plat) if "platforms" in df else ""
-        df["combined_features"] = (
-            df.get("title", "").fillna("")
-            + " "
-            + df.get("genres", "").fillna("")
-            + " "
-            + df["platforms_str"].fillna("")
-        )
+        df["platforms_str"] = df["platforms"].apply(lambda x: " ".join(x) if isinstance(x, list) else str(x or ""))
+        df["combined_features"] = (df["title"].fillna("") + " " +
+                                   df["genres"].fillna("") + " " +
+                                   df["platforms_str"].fillna(""))
 
         # Normalisation numérique robuste (évite division par zéro)
         for col in ["rating", "metacritic"]:
@@ -117,116 +103,65 @@ class RecommendationModel:
         df["rating_norm"] = norm_col(df["rating"])
         df["metacritic_norm"] = norm_col(df["metacritic"])
 
-        # S'assurer d'avoir un id int
-        if "id" not in df:
-            raise ValueError("Each game must have an 'id' field.")
-        df["id"] = df["id"].astype(int)
-
         return df
 
     # -----------------------------
-    # Entraînement (robuste)
+    # Entraînement
     # -----------------------------
     def train(self, games: List[Dict]) -> Dict:
         logger.info(f"Training model v{self.model_version} with {len(games)} games")
-        if not games:
-            raise ValueError("No games to train on")
 
         self.games_df = self.prepare_features(games)
 
-        # 1) TF-IDF (contenu)
+        # TF-IDF contenu -> SVD
         self.tfidf_matrix = self.vectorizer.fit_transform(self.games_df["combined_features"])
-        n_samples, n_features = self.tfidf_matrix.shape
+        self.features_reduced = self.svd.fit_transform(self.tfidf_matrix)
 
-        # 2) Choix robuste des composantes SVD
-        target = 128
-        max_allowed = max(2, n_features - 1)
-        n_comp = min(target, max_allowed)
-        use_svd = n_comp >= 2 and n_features >= 3
-
-        if use_svd:
-            try:
-                self.svd = TruncatedSVD(n_components=n_comp, random_state=42)
-                self.features_reduced = self.svd.fit_transform(self.tfidf_matrix)
-                logger.info("SVD applied with n_components=%s (n_features=%s)", n_comp, n_features)
-            except ValueError as e:
-                logger.warning("SVD failed (%s). Falling back to raw TF-IDF.", e)
-                self.svd = None
-                self.features_reduced = self.tfidf_matrix
-        else:
-            self.svd = None
-            self.features_reduced = self.tfidf_matrix
-            logger.info("SVD bypassed (n_features=%s). Using raw TF-IDF.", n_features)
-
-        # 3) Normalisation L2 de l'espace texte (utilisé pour KMeans) + conversion dense
-        X = self.features_reduced
-        if hasattr(X, "toarray"):  # sparse
-            X = X.toarray()
-        norms = np.linalg.norm(X, axis=1, keepdims=True)
-        norms[norms == 0.0] = 1.0
-        X = X / norms
-        self.cluster_space = X  # espace texte normalisé
-
-        # 4) Concaténer les numériques normalisés pour l'espace KNN
+        # Concat avec numériques
         numeric = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float)
-        self.game_features = np.hstack([self.cluster_space, numeric])
+        self.game_features = np.hstack([self.features_reduced, numeric])
 
-        # 5) Adapter n_clusters à n_samples (au moins 2 et au plus 8, pas plus que n_samples)
-        if n_samples < 2:
-            # cas limite : un seul jeu -> cluster unique 0
-            self.kmeans = KMeans(n_clusters=1, random_state=42, n_init="auto")
-            self.cluster_labels = np.zeros((n_samples,), dtype=int)
-        else:
-            n_clusters = min(8, max(2, n_samples // 5))  # approx 5 jeux par cluster
-            n_clusters = min(n_clusters, n_samples)      # jamais > n_samples
-            self.kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
-            self.cluster_labels = self.kmeans.fit_predict(self.cluster_space)
-
-        # 6) KNN configuré selon le nb d'échantillons
-        self.knn = NearestNeighbors(metric="cosine", n_neighbors=min(50, max(2, n_samples)))
+        # KMeans + KNN
+        self.cluster_labels = self.kmeans.fit_predict(self.features_reduced)
         self.knn.fit(self.game_features)
 
-        # 7) Vectoriseur de titres pour similarité stricte
+        # Vectoriseur de titres pour similarité stricte titres
         self.title_tfidf = self.title_vectorizer.fit_transform(self.games_df["title"].fillna(""))
 
-        # 8) Index id -> ligne
+        # Index rapides
         self._id_to_index = {int(row.id): idx for idx, row in self.games_df[["id"]].itertuples(index=True)}
         self._neighbors_cache.clear()
 
-        # 9) Métriques
         self.is_trained = True
         self.metrics["last_training"] = datetime.utcnow().isoformat()
         self.metrics["feature_dim"] = int(self.game_features.shape[1])
 
         validation = self._validate_model()
-        logger.info(
-            "Model trained. Features=%s, clusters=%s",
-            self.game_features.shape,
-            0 if self.cluster_labels is None else len(np.unique(self.cluster_labels)),
-        )
+        logger.info(f"Model trained. Features: {self.game_features.shape}, clusters: {len(np.unique(self.cluster_labels))}")
         return {
             "status": "success",
             "model_version": self.model_version,
             "games_count": len(games),
             "feature_dim": int(self.game_features.shape[1]),
-            "validation_metrics": validation,
+            "validation_metrics": validation
         }
 
     def _validate_model(self) -> Dict:
         if not self.is_trained or self.game_features is None:
             return {"error": "Model not trained"}
+
+        # Mesure de compacité inter/intra cluster simple
         try:
-            if self.kmeans is None or self.cluster_space is None or self.cluster_labels is None:
-                return {"note": "validation skipped"}
-            centers = self.kmeans.cluster_centers_  # même espace que cluster_space
+            centers = self.kmeans.cluster_centers_  # espace réduit
+            # Distance moyenne jeu->centre de son cluster
             dists = []
-            for i, z in enumerate(self.cluster_space):
+            for i, z in enumerate(self.features_reduced):
                 c = centers[self.cluster_labels[i]]
                 dists.append(np.linalg.norm(z - c))
             return {
                 "mean_distance_to_center": float(np.mean(dists)),
                 "std_distance_to_center": float(np.std(dists)),
-                "max_distance_to_center": float(np.max(dists)),
+                "max_distance_to_center": float(np.max(dists))
             }
         except Exception:
             return {"note": "validation skipped"}
@@ -237,10 +172,7 @@ class RecommendationModel:
     def _neighbors_for_index(self, idx: int, k: int) -> List[Tuple[int, float]]:
         if idx in self._neighbors_cache and len(self._neighbors_cache[idx]) >= k:
             return self._neighbors_cache[idx][:k]
-        distances, indices = self.knn.kneighbors(
-            [self.game_features[idx]],
-            n_neighbors=min(k + 1, len(self.game_features)),
-        )
+        distances, indices = self.knn.kneighbors([self.game_features[idx]], n_neighbors=min(k + 1, len(self.game_features)))
         # Exclure soi-même (distance zéro)
         pairs = [(int(j), float(1.0 - distances[0][t])) for t, j in enumerate(indices[0]) if int(j) != idx]
         self._neighbors_cache[idx] = pairs
@@ -251,29 +183,17 @@ class RecommendationModel:
         if not self.is_trained:
             raise ValueError("Model not trained")
 
-        # Projeter la requête dans l'espace texte utilisé
+        # Projeter la requête dans l'espace
         q_tfidf = self.vectorizer.transform([query])
-        if self.svd is not None:
-            q_red = self.svd.transform(q_tfidf)
-        else:
-            # même traitement que cluster_space : dense + L2
-            q_red = q_tfidf.toarray()
-            nrm = np.linalg.norm(q_red, axis=1, keepdims=True)
-            nrm[nrm == 0.0] = 1.0
-            q_red = q_red / nrm
-
-        # Concaténer numériques (moyenne du dataset pour positionner la requête)
+        q_red = self.svd.transform(q_tfidf)
         avg_num = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float).mean(axis=0)
         q_feat = np.hstack([q_red[0], avg_num])
 
         # KNN global
-        distances, indices = self.knn.kneighbors(
-            [q_feat],
-            n_neighbors=min(max(2, k * 3), len(self.game_features)),
-        )
-        recs: List[Dict] = []
+        distances, indices = self.knn.kneighbors([q_feat], n_neighbors=min(k * 3, len(self.game_features)))
+        recs = []
         for t, j in enumerate(indices[0]):
-            score = 1.0 - float(distances[0][t])  # similarité cos
+            score = 1.0 - float(distances[0][t])  # convertir distance cos en similarité
             if score < min_confidence:
                 continue
             row = self.games_df.iloc[int(j)]
@@ -284,11 +204,12 @@ class RecommendationModel:
                 "confidence": score,
                 "rating": float(row["rating"]),
                 "metacritic": int(row["metacritic"]),
-                "cluster": int(self.cluster_labels[int(j)]) if self.cluster_labels is not None else 0,
+                "cluster": int(self.cluster_labels[int(j)])
             })
             if len(recs) >= k:
                 break
 
+        # métriques
         self._update_metrics(recs, k)
         return recs
 
@@ -298,9 +219,10 @@ class RecommendationModel:
             raise ValueError("Model not trained")
         if game_id not in self._id_to_index:
             raise ValueError(f"Game with id {game_id} not found")
+
         idx = self._id_to_index[game_id]
         pairs = self._neighbors_for_index(idx, k)
-        recs: List[Dict] = []
+        recs = []
         for j, score in pairs:
             row = self.games_df.iloc[j]
             recs.append({
@@ -310,7 +232,7 @@ class RecommendationModel:
                 "confidence": score,
                 "rating": float(row["rating"]),
                 "metacritic": int(row["metacritic"]),
-                "cluster": int(self.cluster_labels[j]) if self.cluster_labels is not None else 0,
+                "cluster": int(self.cluster_labels[j])
             })
         self._update_metrics(recs, k)
         return recs
@@ -322,8 +244,8 @@ class RecommendationModel:
         q = self.title_vectorizer.transform([query_title])
         sims = cosine_similarity(q, self.title_tfidf)[0]
         order = np.argsort(sims)[::-1]
-        recs: List[Dict] = []
-        for idx in order[: k * 2]:
+        recs = []
+        for idx in order[:k * 2]:
             score = float(sims[idx])
             if score < min_confidence:
                 continue
@@ -335,7 +257,7 @@ class RecommendationModel:
                 "confidence": score,
                 "rating": float(row["rating"]),
                 "metacritic": int(row["metacritic"]),
-                "cluster": int(self.cluster_labels[int(idx)]) if self.cluster_labels is not None else 0,
+                "cluster": int(self.cluster_labels[int(idx)])
             })
             if len(recs) >= k:
                 break
@@ -352,17 +274,14 @@ class RecommendationModel:
     def get_cluster_games(self, cluster_id: int, sample: Optional[int] = None) -> List[Dict]:
         if not self.is_trained:
             raise ValueError("Model not trained")
-        if self.kmeans is None or self.cluster_labels is None:
-            raise ValueError("Clustering unavailable for current model")
-        if cluster_id < 0 or cluster_id >= int(self.kmeans.n_clusters):
-            raise ValueError(f"Cluster id must be in [0, {int(self.kmeans.n_clusters) - 1}]")
-
+        if cluster_id < 0 or cluster_id >= self.kmeans.n_clusters:
+            raise ValueError(f"Cluster id must be in [0, {self.kmeans.n_clusters-1}]")
         idxs = np.where(self.cluster_labels == cluster_id)[0]
-        if sample is not None and sample > 0 and sample < len(idxs):
-            rng = np.random.default_rng(42)
-            idxs = rng.choice(idxs, size=sample, replace=False)
-
-        out: List[Dict] = []
+        if sample is not None and sample > 0:
+            if sample < len(idxs):
+                rng = np.random.default_rng(42)
+                idxs = rng.choice(idxs, size=sample, replace=False)
+        out = []
         for i in idxs:
             row = self.games_df.iloc[int(i)]
             out.append({
@@ -370,48 +289,47 @@ class RecommendationModel:
                 "title": row["title"],
                 "genres": row["genres"],
                 "rating": float(row["rating"]),
-                "metacritic": int(row["metacritic"]),
+                "metacritic": int(row["metacritic"])
             })
         return out
 
     def _top_terms_per_cluster(self, top_n: int = 10) -> List[Dict]:
-        """Approximation: moyenne TF-IDF par cluster, top features textuelles."""
-        if self.tfidf_matrix is None or self.cluster_labels is None:
+        """
+        Approximation: moyenne TF-IDF par cluster, top features textuelles.
+        """
+        if self.tfidf_matrix is None:
             return []
         terms = np.array(self.vectorizer.get_feature_names_out())
         result = []
-        for c in range(int(self.kmeans.n_clusters) if self.kmeans is not None else 0):
+        for c in range(self.kmeans.n_clusters):
             idxs = np.where(self.cluster_labels == c)[0]
             if len(idxs) == 0:
                 result.append({"cluster": c, "size": 0, "top_terms": []})
                 continue
-            mean_vec = self.tfidf_matrix[idxs].mean(axis=0).A1  # sparse -> dense vector
+            # moyenne TF-IDF cluster (sparse -> dense mean via .mean(axis=0))
+            mean_vec = self.tfidf_matrix[idxs].mean(axis=0).A1
             top_idx = np.argsort(mean_vec)[::-1][:top_n]
             result.append({
                 "cluster": c,
                 "size": int(len(idxs)),
-                "top_terms": terms[top_idx].tolist(),
+                "top_terms": terms[top_idx].tolist()
             })
         return result
 
     def cluster_explore(self, top_n_terms: int = 10) -> Dict:
         if not self.is_trained:
             raise ValueError("Model not trained")
-        if self.cluster_labels is None or self.kmeans is None:
-            return {"n_clusters": 0, "sizes": [], "top_terms": []}
-        sizes = np.bincount(self.cluster_labels, minlength=int(self.kmeans.n_clusters)).tolist()
+        sizes = np.bincount(self.cluster_labels, minlength=self.kmeans.n_clusters).tolist()
         return {
             "n_clusters": int(self.kmeans.n_clusters),
             "sizes": sizes,
-            "top_terms": self._top_terms_per_cluster(top_n_terms),
+            "top_terms": self._top_terms_per_cluster(top_n_terms)
         }
 
     def random_cluster(self, sample: int = 12) -> Dict:
         if not self.is_trained:
             raise ValueError("Model not trained")
-        if self.kmeans is None:
-            raise ValueError("Clustering unavailable for current model")
-        c = int(np.random.default_rng().integers(0, int(self.kmeans.n_clusters)))
+        c = int(np.random.default_rng().integers(0, self.kmeans.n_clusters))
         games = self.get_cluster_games(c, sample=sample)
         return {"cluster": c, "sample": games}
 
@@ -428,10 +346,9 @@ class RecommendationModel:
                 "kmeans": self.kmeans,
                 "knn": self.knn,
                 "title_vectorizer": self.title_vectorizer,
-                "title_tfidf": self.title_tfidf,
+                "title_tfidf": getattr(self, "title_tfidf", None),
                 "tfidf_matrix": self.tfidf_matrix,
                 "features_reduced": self.features_reduced,
-                "cluster_space": self.cluster_space,
                 "game_features": self.game_features,
                 "cluster_labels": self.cluster_labels,
                 "games_df": self.games_df,
@@ -450,22 +367,20 @@ class RecommendationModel:
         try:
             with open(filepath, "rb") as f:
                 m = pickle.load(f)
-            self.model_version = m.get("version", self.model_version)
-            self.vectorizer = m["vectorizer"]
-            self.svd = m.get("svd")
-            self.kmeans = m.get("kmeans")
-            self.knn = m.get("knn")
-            self.title_vectorizer = m["title_vectorizer"]
-            self.title_tfidf = m.get("title_tfidf")
-            self.tfidf_matrix = m.get("tfidf_matrix")
-            self.features_reduced = m.get("features_reduced")
-            self.cluster_space = m.get("cluster_space")
-            self.game_features = m.get("game_features")
-            self.cluster_labels = m.get("cluster_labels")
-            self.games_df = m.get("games_df")
-            self.metrics = m.get("metrics", self.metrics)
 
-            # Reconstituer l'index id -> ligne
+            self.model_version = m["version"]
+            self.vectorizer = m["vectorizer"]
+            self.svd = m["svd"]
+            self.kmeans = m["kmeans"]
+            self.knn = m["knn"]
+            self.title_vectorizer = m["title_vectorizer"]
+            self.title_tfidf = m["title_tfidf"]
+            self.tfidf_matrix = m["tfidf_matrix"]
+            self.features_reduced = m["features_reduced"]
+            self.game_features = m["game_features"]
+            self.cluster_labels = m["cluster_labels"]
+            self.games_df = m["games_df"]
+            self.metrics = m["metrics"]
             self._id_to_index = {int(row.id): idx for idx, row in self.games_df[["id"]].itertuples(index=True)}
             self._neighbors_cache.clear()
             self.is_trained = True
@@ -486,8 +401,7 @@ class RecommendationModel:
         return {
             **self.metrics,
             "is_trained": self.is_trained,
-            "games_count": len(self.games_df) if self.games_df is not None else 0,
-            "feature_dim": int(self.game_features.shape[1]) if self.game_features is not None else 0,
+            "games_count": len(self.games_df) if self.games_df is not None else 0
         }
 
 
