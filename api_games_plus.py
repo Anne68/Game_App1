@@ -7,6 +7,7 @@ import logging
 import inspect
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Tuple
+
 import pymysql
 from fastapi import FastAPI, HTTPException, Depends, Form, Query, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -113,11 +114,29 @@ class TrainResponse(BaseModel):
     duration: Optional[float] = None
     result: Optional[Dict[str, Any]] = None
 
+# ----------------- Utils settings -----------------
+def get_setting_bool(name: str, default: bool = False) -> bool:
+    """Lit un bool depuis settings avec parsing de chaînes."""
+    try:
+        v = getattr(settings, name, None)
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return default
+
 # ----------------- DB helpers -----------------
 def _ssl_kwargs() -> dict:
-    if settings.DB_SSL_CA:
-        return {"ssl": {"ca": settings.DB_SSL_CA}}
-    return {"ssl": {}}
+    # Supporte SSL simple (CA) et mTLS si DB_SSL_CERT/DB_SSL_KEY sont fournis
+    ssl_dict: Dict[str, str] = {}
+    if getattr(settings, "DB_SSL_CA", None):
+        ssl_dict["ca"] = settings.DB_SSL_CA
+    if getattr(settings, "DB_SSL_CERT", None) and getattr(settings, "DB_SSL_KEY", None):
+        ssl_dict["cert"] = settings.DB_SSL_CERT
+        ssl_dict["key"] = settings.DB_SSL_KEY
+    return {"ssl": ssl_dict} if ssl_dict else {}
 
 def get_db_conn():
     if not settings.db_configured:
@@ -169,13 +188,29 @@ def get_user(username: str) -> Optional[dict]:
         cur.execute("SELECT * FROM users WHERE username=%s", (username,))
         return cur.fetchone()
 
-def create_user(username: str, password: str) -> None:
+def create_user(username: str, password: str) -> int:
+    """Crée l'utilisateur avec hash sécurisé. Retourne l'id inséré (ou existant)."""
     hpwd = pwd_ctx.hash(password)
     with get_db_conn() as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO users(username, hashed_password) VALUES(%s,%s)", (username, hpwd))
-        if users_has_column("password_hash"):
-            cur.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hpwd, username))
-        conn.commit()
+        try:
+            cur.execute(
+                "INSERT INTO users(username, hashed_password) VALUES(%s,%s)",
+                (username, hpwd),
+            )
+            user_id = int(cur.lastrowid)
+            if users_has_column("password_hash"):
+                cur.execute(
+                    "UPDATE users SET password_hash=%s WHERE id=%s",
+                    (hpwd, user_id),
+                )
+            conn.commit()
+            logger.info("User '%s' created with id=%s", username, user_id)
+            return user_id
+        except pymysql.err.IntegrityError as e:
+            logger.warning("User '%s' already exists (integrity). %s", username, e)
+            cur.execute("SELECT id FROM users WHERE username=%s", (username,))
+            row = cur.fetchone()
+            return int(row["id"]) if row and "id" in row else 0
 
 def extract_stored_password(row: dict) -> Tuple[Optional[str], str]:
     for col in ("hashed_password", "password_hash", "password"):
@@ -410,12 +445,6 @@ def head_root():
 
 Instrumentator().instrument(app).expose(app, include_in_schema=True)
 
-# -----------------
-# ⚠️ Suite du fichier : Training, endpoints ML, auth, monitoring, compliance, startup, etc.
-# -----------------
-# (inchangés par rapport à ta version actuelle)
-
-
 # ----------------- Training & metrics -----------------
 def _ensure_model_trained_with_db(force: bool = False):
     model = get_model()
@@ -440,7 +469,6 @@ def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: 
     version = request.version or f"api-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     model = get_model()
     model.model_version = version
-
     games = fetch_games_for_ml()
     result = model.train(games)
     duration = time.time() - start_time
@@ -484,8 +512,8 @@ def evaluate_model(test_queries: List[str] = Query(default=["RPG", "Action", "In
 def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     _ensure_model_trained_with_db()
     model = get_model()
-    clean_query = request.query.strip()
 
+    clean_query = request.query.strip()
     sec = get_security_validator()
     if sec:
         try:
@@ -530,7 +558,6 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     return response
 
 # ----- Nouveaux endpoints -----
-
 @app.post("/recommend/similar-game", tags=["recommend"])
 def recommend_similar_game(payload: SimilarGameRequest, user: str = Depends(verify_token)):
     """
@@ -599,7 +626,7 @@ def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = 
     recos = model.recommend_by_genre(genre, k=k)
     return {"genre": genre, "recommendations": recos}
 
-# ----------------- Auth endpoints (inchangés) -----------------
+# ----------------- Auth endpoints (corrigés avec auto-create) -----------------
 def _issue_token_core(username: str, password: str):
     if not DB_READY:
         if settings.DEMO_LOGIN_ENABLED and username == settings.DEMO_USERNAME and password == settings.DEMO_PASSWORD:
@@ -607,11 +634,37 @@ def _issue_token_core(username: str, password: str):
             return {"access_token": access_token, "token_type": "bearer", "mode": "demo"}
         raise HTTPException(status_code=503, detail="Database unavailable: cannot authenticate")
 
+    auto_create = get_setting_bool("AUTO_CREATE_USER_ON_LOGIN", True)
+
+    # tentative de récupération
     try:
         u = get_user(username)
     except Exception as e:
-        logger.error("DB error on login: %s", e)
+        logger.error("DB error on login lookup: %s", e)
         raise HTTPException(status_code=503, detail="Database error during login")
+
+    # auto-création si absent
+    if not u and auto_create:
+        logger.info("Auto-creating user '%s' on first login", username)
+        try:
+            sec = get_security_validator()
+            if sec:
+                # Valide la complexité, peut lever une erreur 400 si insuffisant
+                validation = sec.validate_password(password)
+                if not validation.get("valid", True):
+                    raise HTTPException(status_code=400, detail={
+                        "message": "Password does not meet security requirements",
+                        "issues": validation.get("issues", []),
+                        "strength": validation.get("strength"),
+                    })
+                username = sec.sanitize_input(username)
+            create_user(username, password)
+            u = get_user(username)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Auto-create user failed: %s", e)
+            raise HTTPException(status_code=503, detail="Database error creating user")
 
     if not u:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
@@ -647,6 +700,13 @@ def token_alias(username: str = Form(...), password: str = Form(...)):
 def register(username: str = Form(...), password: str = Form(...)):
     if not DB_READY:
         raise HTTPException(status_code=503, detail="Database unavailable: cannot register now")
+
+    try:
+        ensure_users_table()
+    except Exception as e:
+        logger.error("DB error ensuring users table: %s", e)
+        raise HTTPException(status_code=503, detail="Database error preparing table")
+
     username = username.strip()
     sec = get_security_validator()
     if sec:
@@ -662,17 +722,21 @@ def register(username: str = Form(...), password: str = Form(...)):
                         "strength": password_validation["strength"]
                     }
                 )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.warning(f"Compliance validation failed: {e}")
 
     if get_user(username):
         raise HTTPException(status_code=400, detail="User already exists")
+
     try:
-        create_user(username, password)
+        user_id = create_user(username, password)
     except Exception as e:
         logger.error("DB error on register: %s", e)
         raise HTTPException(status_code=503, detail="Database error during register")
-    return {"ok": True}
+
+    return {"ok": True, "user_id": user_id}
 
 # ----------------- Games search & monitoring -----------------
 @app.get("/games/by-title/{title}", tags=["games"])
@@ -769,16 +833,14 @@ async def startup_event():
     global DB_READY, DB_LAST_ERROR
     logger.info("Starting Games API with ML and E4 compliance...")
 
-    # Nouveau: gestion gracieuse de la base de données
+    # Gestion gracieuse de la base de données
     try:
         if settings.db_configured and settings.DB_REQUIRED:
-            # Mode strict: la DB est obligatoire
             ensure_users_table()
             DB_READY = True
             DB_LAST_ERROR = None
             logger.info("Database connected successfully (required mode)")
         elif settings.db_configured:
-            # Mode gracieux: tenter la connexion DB mais continuer sans si échec
             try:
                 ensure_users_table()
                 DB_READY = True
@@ -798,7 +860,6 @@ async def startup_event():
                 else:
                     logger.warning("Demo mode disabled - authentication will not work")
         else:
-            # Pas de configuration DB
             DB_READY = False
             DB_LAST_ERROR = "Database not configured (set DB_* env vars)"
             logger.info("Database not configured - using demo mode")
