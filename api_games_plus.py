@@ -28,10 +28,13 @@ from monitoring_metrics import (
     get_monitor,
 )
 
+# ---------------------------------------------------------------------
+# Logging SETUP (MUST be early)
+# ---------------------------------------------------------------------
 logger = logging.getLogger("games-api-ml")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
-# Compliance (optionnel)
+# Compliance import avec fallback gracieux (AVANT de l'utiliser)
 try:
     from compliance.standards_compliance import SecurityValidator, AccessibilityValidator
     COMPLIANCE_AVAILABLE = True
@@ -40,6 +43,9 @@ except ImportError as e:
     COMPLIANCE_AVAILABLE = False
     logger.warning(f"Compliance module not available: {e}")
 
+# ---------------------------------------------------------------------
+# Settings & Security
+# ---------------------------------------------------------------------
 settings = get_settings()
 
 SECRET_KEY = settings.SECRET_KEY
@@ -53,15 +59,22 @@ pwd_ctx = CryptContext(
     deprecated="auto",
 )
 
+# ---------------------------------------------------------------------
+# Flags DB
+# ---------------------------------------------------------------------
 DB_READY: bool = False
 DB_LAST_ERROR: Optional[str] = None
 
+# ---------------------------------------------------------------------
+# FastAPI app - CRÉER L'APP D'ABORD
+# ---------------------------------------------------------------------
 app = FastAPI(
     title="Games API ML (C9→C13)",
-    version="2.4.0",
+    version="2.3.1",
     description="API avec modèle ML, monitoring avancé et MySQL pour les utilisateurs",
 )
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o for o in settings.ALLOW_ORIGINS.split(",") if o] or ["*"],
@@ -70,7 +83,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Setup compliance APRÈS création de l'app
 def setup_compliance():
+    """Setup compliance validators si disponible"""
     if COMPLIANCE_AVAILABLE:
         try:
             app.state.security_validator = SecurityValidator()
@@ -84,9 +99,12 @@ def setup_compliance():
         logger.info("Compliance not available - continuing without")
         return False
 
+# Initialiser compliance maintenant que app existe
 COMPLIANCE_ENABLED = setup_compliance()
 
-# ----------------- Models -----------------
+# ---------------------------------------------------------------------
+# Models (Pydantic)
+# ---------------------------------------------------------------------
 class TrainRequest(BaseModel):
     version: Optional[str] = None
     force_retrain: bool = False
@@ -95,11 +113,6 @@ class PredictionRequest(BaseModel):
     query: str
     k: int = 10
     min_confidence: float = 0.1
-
-class SimilarGameRequest(BaseModel):
-    game_id: Optional[int] = None
-    title: Optional[str] = None
-    k: int = 10
 
 class ModelMetricsResponse(BaseModel):
     model_config = {"protected_namespaces": ()}
@@ -117,7 +130,9 @@ class TrainResponse(BaseModel):
     duration: Optional[float] = None
     result: Optional[Dict[str, Any]] = None
 
-# ----------------- DB helpers -----------------
+# ---------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------
 def _ssl_kwargs() -> dict:
     if settings.DB_SSL_CA:
         return {"ssl": {"ca": settings.DB_SSL_CA}}
@@ -139,6 +154,7 @@ def get_db_conn():
         **_ssl_kwargs(),
     )
 
+# ---------- USERS TABLE ----------
 def ensure_users_table():
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute("SHOW TABLES LIKE 'users';")
@@ -160,9 +176,23 @@ def ensure_users_table():
         cur.execute("SHOW COLUMNS FROM users LIKE 'hashed_password';")
         has_hashed = cur.fetchone() is not None
         if not has_hashed:
-            cur.execute("ALTER TABLE users ADD COLUMN hashed_password VARCHAR(255) NOT NULL;")
-            conn.commit()
-            logger.info("Added 'hashed_password' column.")
+            cur.execute("SHOW COLUMNS FROM users LIKE 'password_hash';")
+            has_legacy_hash = cur.fetchone() is not None
+            if has_legacy_hash:
+                cur.execute("ALTER TABLE users ADD COLUMN hashed_password VARCHAR(255) NULL;")
+                cur.execute("""
+                    UPDATE users
+                    SET hashed_password = password_hash
+                    WHERE (hashed_password IS NULL OR hashed_password = '')
+                      AND password_hash IS NOT NULL AND password_hash <> '';
+                """)
+                cur.execute("ALTER TABLE users MODIFY COLUMN hashed_password VARCHAR(255) NOT NULL;")
+                conn.commit()
+                logger.info("Added 'hashed_password' and migrated from 'password_hash'.")
+            else:
+                cur.execute("ALTER TABLE users ADD COLUMN hashed_password VARCHAR(255) NOT NULL;")
+                conn.commit()
+                logger.info("Added 'hashed_password' column.")
 
 def users_has_column(column: str) -> bool:
     with get_db_conn() as conn, conn.cursor() as cur:
@@ -202,6 +232,7 @@ def update_user_password(username: str, new_hash: str) -> None:
         cur.execute(sql, tuple(params))
         conn.commit()
 
+# ---------- GAMES ----------
 def count_games_in_db() -> int:
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) AS n FROM games WHERE COALESCE(title,'') <> ''")
@@ -234,6 +265,7 @@ def _safe_int(x, default: int = 0) -> int:
         return default
 
 def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Renvoie une liste de jeux nettoyés pour le modèle."""
     sql = """
         SELECT
             game_id_rawg AS id,
@@ -267,6 +299,7 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     return games
 
 def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
+    """Recherche case-insensitive par titre."""
     like = f"%{q.strip().lower()}%"
     sql = """
         SELECT
@@ -274,8 +307,13 @@ def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
             g.title,
             g.rating,
             g.metacritic,
-            g.platforms
+            g.platforms,
+            bp.best_price_PC AS best_price,
+            bp.best_shop_PC  AS best_shop,
+            bp.site_url_PC   AS site_url
         FROM games g
+        LEFT JOIN best_price_pc bp
+          ON bp.game_id_rawg = g.game_id_rawg OR bp.title = g.title
         WHERE LOWER(g.title) LIKE %s
         ORDER BY CHAR_LENGTH(g.title) ASC
         LIMIT %s
@@ -284,7 +322,9 @@ def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
         cur.execute(sql, (like, max(1, limit)))
         return cur.fetchall() or []
 
-# ----------------- Auth helpers -----------------
+# ---------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
@@ -301,7 +341,9 @@ def verify_token(token: str = Depends(oauth2_scheme)) -> str:
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# ----------------- Decorator (latency) -----------------
+# ---------------------------------------------------------------------
+# Decorator (latency)
+# ---------------------------------------------------------------------
 def measure_latency(endpoint: str):
     def decorator(func):
         if inspect.iscoroutinefunction(func):
@@ -334,17 +376,24 @@ def measure_latency(endpoint: str):
             return sync_wrapper
     return decorator
 
+# ---------------------------------------------------------------------
+# Helper functions pour compliance
+# ---------------------------------------------------------------------
 def get_security_validator():
+    """Récupère le security validator de manière sûre"""
     if COMPLIANCE_ENABLED and hasattr(app.state, 'security_validator'):
         return app.state.security_validator
     return None
 
 def get_accessibility_validator():
+    """Récupère l'accessibility validator de manière sûre"""
     if COMPLIANCE_ENABLED and hasattr(app.state, 'accessibility_validator'):
         return app.state.accessibility_validator
     return None
 
-# ----------------- System & monitoring -----------------
+# ---------------------------------------------------------------------
+# System & monitoring
+# ---------------------------------------------------------------------
 @app.get("/healthz", tags=["system"])
 def healthz():
     model = get_model()
@@ -360,6 +409,7 @@ def healthz():
     except Exception as e:
         logger.warning("Error while loading model: %s. Will train on first request.", e)
 
+    # Log compliance status
     if COMPLIANCE_ENABLED:
         logger.info("E4 Compliance standards active")
         logger.info(f"Security validator: {get_security_validator() is not None}")
@@ -386,7 +436,9 @@ def root():
 
 Instrumentator().instrument(app).expose(app, include_in_schema=True)
 
-# ----------------- Training & metrics -----------------
+# ---------------------------------------------------------------------
+# Model training helpers
+# ---------------------------------------------------------------------
 def _ensure_model_trained_with_db(force: bool = False):
     model = get_model()
     if (not model.is_trained) or force:
@@ -404,6 +456,9 @@ def _ensure_model_trained_with_db(force: bool = False):
         except Exception as e:
             logger.warning("Could not save model: %s", e)
 
+# ---------------------------------------------------------------------
+# Model management
+# ---------------------------------------------------------------------
 @app.post("/model/train", tags=["model"], response_model=TrainResponse)
 def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: str = Depends(verify_token)):
     start_time = time.time()
@@ -448,21 +503,26 @@ def evaluate_model(test_queries: List[str] = Query(default=["RPG", "Action", "In
     monitor = get_monitor()
     return monitor.evaluate_model(model, test_queries)
 
-# ----------------- Recos (ML) -----------------
+# ---------------------------------------------------------------------
+# Recommendations (ML) avec compliance
+# ---------------------------------------------------------------------
 @app.post("/recommend/ml", tags=["recommend"])
 @measure_latency("recommend_ml")
 def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     _ensure_model_trained_with_db()
     model = get_model()
+    
+    # Nettoyage de base
     clean_query = request.query.strip()
-
-    sec = get_security_validator()
-    if sec:
+    
+    # Nettoyage avec compliance si disponible
+    security_validator = get_security_validator()
+    if security_validator:
         try:
-            clean_query = sec.sanitize_input(clean_query)
+            clean_query = security_validator.sanitize_input(clean_query)
         except Exception as e:
             logger.warning(f"Compliance sanitization failed: {e}")
-
+    
     if not clean_query:
         raise HTTPException(status_code=400, detail="Query is empty")
 
@@ -482,94 +542,47 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
 
     latency = time.time() - start_time
     get_monitor().record_prediction("recommend_ml", clean_query, recommendations, latency)
-
+    
     response = {
         "query": clean_query,
         "recommendations": recommendations,
         "latency_ms": latency * 1000,
         "model_version": model.model_version,
     }
-
-    acc = get_accessibility_validator()
-    if acc:
+    
+    # Enhancement accessibilité si disponible
+    accessibility_validator = get_accessibility_validator()
+    if accessibility_validator:
         try:
-            response = acc.enhance_response_accessibility(response)
+            response = accessibility_validator.enhance_response_accessibility(response)
         except Exception as e:
             logger.warning(f"Accessibility enhancement failed: {e}")
-
+    
     return response
-
-# ----- Nouveaux endpoints -----
-
-@app.post("/recommend/similar-game", tags=["recommend"])
-def recommend_similar_game(payload: SimilarGameRequest, user: str = Depends(verify_token)):
-    """
-    KNN sur un jeu spécifique:
-      - fournir game_id OU title
-    """
-    _ensure_model_trained_with_db()
-    model = get_model()
-
-    game_id = payload.game_id
-    if not game_id and payload.title:
-        matches = find_games_by_title(payload.title, limit=1)
-        if not matches:
-            raise HTTPException(status_code=404, detail="Game not found with given title")
-        game_id = int(matches[0]["id"])
-
-    if not game_id:
-        raise HTTPException(status_code=400, detail="Provide either 'game_id' or 'title'")
-
-    try:
-        recs = model.predict_by_game_id(int(game_id), k=max(1, payload.k))
-        return {"source_id": int(game_id), "recommendations": recs, "model_version": model.model_version}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-@app.get("/recommend/cluster/{cluster_id}", tags=["recommend"])
-def recommend_cluster(cluster_id: int, sample: int = Query(50, ge=1, le=500), user: str = Depends(verify_token)):
-    _ensure_model_trained_with_db()
-    model = get_model()
-    try:
-        games = model.get_cluster_games(cluster_id, sample=sample)
-        return {"cluster": cluster_id, "count": len(games), "games": games}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/recommend/cluster-explore", tags=["recommend"])
-def recommend_cluster_explore(top_terms: int = Query(10, ge=3, le=30), user: str = Depends(verify_token)):
-    _ensure_model_trained_with_db()
-    model = get_model()
-    return model.cluster_explore(top_n_terms=top_terms)
-
-@app.get("/recommend/random-cluster", tags=["recommend"])
-def recommend_random_cluster(sample: int = Query(12, ge=1, le=200), user: str = Depends(verify_token)):
-    _ensure_model_trained_with_db()
-    model = get_model()
-    return model.random_cluster(sample=sample)
 
 @app.get("/recommend/by-title/{title}", tags=["recommend"])
 def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
-    """
-    Similarité stricte sur les titres (TF-IDF caractères).
-    Différent de /recommend/similar-game (qui utilise KNN à partir d’un jeu existant).
-    """
+    matches = find_games_by_title(title, limit=1)
+    if not matches:
+        raise HTTPException(status_code=404, detail="Game not found")
     _ensure_model_trained_with_db()
     model = get_model()
     try:
-        recos = model.recommend_by_title_similarity(title, k=k)
+        recos = model.predict_by_game_id(int(matches[0]["id"]), k)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"title": title, "recommendations": recos}
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"title": title, "source_id": int(matches[0]["id"]), "recommendations": recos}
 
 @app.get("/recommend/by-genre/{genre}", tags=["recommend"])
 def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
     _ensure_model_trained_with_db()
     model = get_model()
-    recos = model.recommend_by_genre(genre, k=k)
+    recos = model.predict(query=genre, k=k, min_confidence=0.0)
     return {"genre": genre, "recommendations": recos}
 
-# ----------------- Auth endpoints (inchangés) -----------------
+# ---------------------------------------------------------------------
+# Auth endpoints avec compliance
+# ---------------------------------------------------------------------
 def _issue_token_core(username: str, password: str):
     if not DB_READY:
         if settings.DEMO_LOGIN_ENABLED and username == settings.DEMO_USERNAME and password == settings.DEMO_PASSWORD:
@@ -617,12 +630,17 @@ def token_alias(username: str = Form(...), password: str = Form(...)):
 def register(username: str = Form(...), password: str = Form(...)):
     if not DB_READY:
         raise HTTPException(status_code=503, detail="Database unavailable: cannot register now")
+    
+    # Nettoyage de base
     username = username.strip()
-    sec = get_security_validator()
-    if sec:
+    
+    # Validation avec compliance si disponible
+    security_validator = get_security_validator()
+    if security_validator:
         try:
-            username = sec.sanitize_input(username)
-            password_validation = sec.validate_password(password)
+            username = security_validator.sanitize_input(username)
+            
+            password_validation = security_validator.validate_password(password)
             if not password_validation["valid"]:
                 raise HTTPException(
                     status_code=400,
@@ -634,7 +652,7 @@ def register(username: str = Form(...), password: str = Form(...)):
                 )
         except Exception as e:
             logger.warning(f"Compliance validation failed: {e}")
-
+    
     if get_user(username):
         raise HTTPException(status_code=400, detail="User already exists")
     try:
@@ -644,17 +662,20 @@ def register(username: str = Form(...), password: str = Form(...)):
         raise HTTPException(status_code=503, detail="Database error during register")
     return {"ok": True}
 
-# ----------------- Games search & monitoring -----------------
+# ---------------------------------------------------------------------
+# Games search
+# ---------------------------------------------------------------------
 @app.get("/games/by-title/{title}", tags=["games"])
 def games_by_title(title: str, user: str = Depends(verify_token)):
+    # Nettoyage du titre avec compliance si disponible
     clean_title = title.strip()
-    sec = get_security_validator()
-    if sec:
+    security_validator = get_security_validator()
+    if security_validator:
         try:
-            clean_title = sec.sanitize_input(clean_title)
+            clean_title = security_validator.sanitize_input(clean_title)
         except Exception as e:
             logger.warning(f"Title sanitization failed: {e}")
-
+    
     rows = find_games_by_title(clean_title, limit=25)
     results = []
     for r in rows:
@@ -665,17 +686,23 @@ def games_by_title(title: str, user: str = Depends(verify_token)):
             "title": r["title"],
             "rating": r.get("rating"),
             "metacritic": r.get("metacritic"),
+            "best_price": r.get("best_price"),
+            "best_shop": r.get("best_shop"),
+            "site_url": r.get("site_url"),
             "platforms": platforms,
         })
     return {"results": results}
 
+# ---------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------
 @app.get("/monitoring/summary", tags=["monitoring"])
 def monitoring_summary(user: str = Depends(verify_token)):
     monitor = get_monitor()
     model = get_model()
     return {
-        "model": model.get_metrics(),
-        "monitoring": monitor.get_metrics_summary(),
+        "model": model.get_metrics(), 
+        "monitoring": monitor.get_metrics_summary(), 
         "last_evaluation": monitor.last_evaluation,
         "compliance_status": {
             "enabled": COMPLIANCE_ENABLED,
@@ -696,44 +723,66 @@ def check_drift(user: str = Depends(verify_token)):
     elif drift_score > 0.15:
         status = "moderate_drift"
     return {
-        "drift_score": drift_score,
+        "drift_score": drift_score, 
         "status": status,
         "recommendation": "Retrain model" if status == "high_drift"
         else "Monitor closely" if status == "moderate_drift" else "No action needed"
     }
 
-# ----------------- Compliance status -----------------
+# ---------------------------------------------------------------------
+# Compliance endpoints (nouveaux pour E4)
+# ---------------------------------------------------------------------
 @app.get("/compliance/status", tags=["compliance"])
 def compliance_status(user: str = Depends(verify_token)):
+    """Status de la conformité E4"""
     if not COMPLIANCE_ENABLED:
-        return {"compliance_enabled": False, "message": "Compliance module not available", "standards": []}
+        return {
+            "compliance_enabled": False,
+            "message": "Compliance module not available",
+            "standards": []
+        }
+    
     return {
         "compliance_enabled": True,
         "message": "E4 compliance standards active",
         "standards": [
-            {"name": "Security Standards", "status": "active" if get_security_validator() else "inactive",
-             "features": ["Input sanitization", "Password validation", "Injection protection"]},
-            {"name": "Accessibility Standards", "status": "active" if get_accessibility_validator() else "inactive",
-             "features": ["ARIA labels", "Screen reader support", "WCAG 2.1 AA compliance"]}
+            {
+                "name": "Security Standards",
+                "status": "active" if get_security_validator() else "inactive",
+                "features": ["Input sanitization", "Password validation", "Injection protection"]
+            },
+            {
+                "name": "Accessibility Standards", 
+                "status": "active" if get_accessibility_validator() else "inactive",
+                "features": ["ARIA labels", "Screen reader support", "WCAG 2.1 AA compliance"]
+            }
         ]
     }
 
 @app.post("/compliance/validate-password", tags=["compliance"])
 def validate_password_endpoint(password: str = Form(...), user: str = Depends(verify_token)):
-    sec = get_security_validator()
-    if not sec:
+    """Validation de mot de passe selon standards E4"""
+    security_validator = get_security_validator()
+    if not security_validator:
         return {"error": "Compliance module not available"}
+    
     try:
-        result = sec.validate_password(password)
-        return {"validation_result": result, "standards": "E4 Security Requirements"}
+        result = security_validator.validate_password(password)
+        return {
+            "validation_result": result,
+            "standards": "E4 Security Requirements"
+        }
     except Exception as e:
         logger.error(f"Password validation failed: {e}")
         return {"error": "Validation failed"}
 
-# ----------------- Startup -----------------
+# ---------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
     global DB_READY, DB_LAST_ERROR
+
     logger.info("Starting Games API with ML and E4 compliance...")
 
     try:
@@ -759,5 +808,4 @@ async def startup_event():
         if settings.DB_REQUIRED:
             raise
 
-    model = get_model()
-    # (chargement lazy via /healthz ou aux premières requêtes de reco)
+    model = get_model
