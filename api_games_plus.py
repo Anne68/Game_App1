@@ -1,6 +1,5 @@
 # api_games_plus.py
 from __future__ import annotations
-
 import os
 import time
 import math
@@ -8,9 +7,8 @@ import logging
 import inspect
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Tuple
-
 import pymysql
-from fastapi import FastAPI, HTTPException, Depends, Form, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Form, Query, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
@@ -41,13 +39,10 @@ except ImportError as e:
     logger.warning(f"Compliance module not available: {e}")
 
 settings = get_settings()
-
 SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = settings.ALGORITHM
 ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
-
 pwd_ctx = CryptContext(
     schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"],
     deprecated="auto",
@@ -70,6 +65,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------- Compliance -----------------
 def setup_compliance():
     if COMPLIANCE_AVAILABLE:
         try:
@@ -156,7 +152,6 @@ def ensure_users_table():
             conn.commit()
             logger.info("Created users table with 'hashed_password'.")
             return
-
         cur.execute("SHOW COLUMNS FROM users LIKE 'hashed_password';")
         has_hashed = cur.fetchone() is not None
         if not has_hashed:
@@ -234,11 +229,7 @@ def _safe_int(x, default: int = 0) -> int:
         return default
 
 def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    """
-    Récupère les jeux pour le ML. Si pas de DB, utilise des données par défaut.
-    """
     if not DB_READY:
-        # Données par défaut pour fonctionner sans DB
         logger.info("Using default games data (no database available)")
         return [
             {"id": 1, "title": "The Witcher 3", "genres": "RPG Action", "rating": 4.9, "metacritic": 93, "platforms": ["PC", "PS4"]},
@@ -249,7 +240,6 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
             {"id": 6, "title": "Hollow Knight", "genres": "Metroidvania Indie", "rating": 4.7, "metacritic": 90, "platforms": ["PC", "Switch"]},
             {"id": 7, "title": "Cyberpunk 2077", "genres": "RPG Action", "rating": 4.0, "metacritic": 76, "platforms": ["PC", "PS4", "Xbox"]},
         ]
-
     sql = """
         SELECT
             game_id_rawg AS id,
@@ -263,11 +253,9 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     if limit and limit > 0:
         sql += " LIMIT %s"
-
     with get_db_conn() as conn, conn.cursor() as cur:
         cur.execute(sql, (limit,) if limit else None)
         rows = cur.fetchall() or []
-
     games: List[Dict[str, Any]] = []
     for r in rows:
         games.append({
@@ -283,11 +271,7 @@ def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     return games
 
 def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
-    """
-    Recherche de jeux par titre. Si pas de DB, utilise les données par défaut.
-    """
     if not DB_READY:
-        # Recherche simple dans les données par défaut
         default_games = fetch_games_for_ml()
         q_lower = q.strip().lower()
         results = []
@@ -301,7 +285,6 @@ def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
                     "platforms": ",".join(game["platforms"]) if isinstance(game["platforms"], list) else game["platforms"]
                 })
         return results[:limit]
-
     like = f"%{q.strip().lower()}%"
     sql = """
         SELECT
@@ -420,7 +403,18 @@ def healthz():
 def root():
     return {"name": app.title, "version": app.version, "status": "ok"}
 
+# ✅ NOUVELLE ROUTE HEAD /
+@app.head("/", include_in_schema=False)
+def head_root():
+    return Response(status_code=200)
+
 Instrumentator().instrument(app).expose(app, include_in_schema=True)
+
+# -----------------
+# ⚠️ Suite du fichier : Training, endpoints ML, auth, monitoring, compliance, startup, etc.
+# -----------------
+# (inchangés par rapport à ta version actuelle)
+
 
 # ----------------- Training & metrics -----------------
 def _ensure_model_trained_with_db(force: bool = False):
