@@ -113,20 +113,29 @@ with st.container():
                     st.error("Veuillez remplir tous les champs")
     
     else:
-        status_col1, status_col2 = st.columns([3, 1])
+        status_col1, status_col2, status_col3 = st.columns([2, 1, 1])
         
         with status_col1:
             st.success(f"🟢 Connecté et authentifié à {st.session_state.api_url}")
         
         with status_col2:
+            if st.button("🔍 Test API"):
+                with st.spinner("Test de l'API..."):
+                    response = api_call("/healthz", timeout=45)
+                    if response and response.status_code == 200:
+                        st.success("✅ API accessible")
+                    else:
+                        st.error("❌ API inaccessible")
+        
+        with status_col3:
             if st.button("🚪 Déconnecter"):
                 st.session_state.authenticated = False
                 st.session_state.api_token = ""
                 st.session_state.api_configured = False
                 st.rerun()
 
-# Fonction API avec authentification
-def api_call(endpoint, method="GET", data=None, params=None):
+# Fonction API avec authentification et retry
+def api_call(endpoint, method="GET", data=None, params=None, timeout=30, retries=2):
     if not st.session_state.authenticated:
         st.warning("Authentification requise")
         return None
@@ -137,21 +146,33 @@ def api_call(endpoint, method="GET", data=None, params=None):
         "Content-Type": "application/json"
     }
     
-    try:
-        if method == "GET":
-            response = requests.get(url, headers=headers, params=params, timeout=15)
-        elif method == "POST":
-            response = requests.post(url, headers=headers, json=data, timeout=15)
-        elif method == "PUT":
-            response = requests.put(url, headers=headers, json=data, timeout=15)
-        elif method == "DELETE":
-            response = requests.delete(url, headers=headers, timeout=15)
-        
-        return response
-        
-    except Exception as e:
-        st.error(f"❌ Erreur de requête: {str(e)}")
-        return None
+    for attempt in range(retries + 1):
+        try:
+            if method == "GET":
+                response = requests.get(url, headers=headers, params=params, timeout=timeout)
+            elif method == "POST":
+                response = requests.post(url, headers=headers, json=data, timeout=timeout)
+            elif method == "PUT":
+                response = requests.put(url, headers=headers, json=data, timeout=timeout)
+            elif method == "DELETE":
+                response = requests.delete(url, headers=headers, timeout=timeout)
+            
+            return response
+            
+        except requests.exceptions.Timeout:
+            if attempt < retries:
+                st.warning(f"⏳ Timeout (tentative {attempt + 1}/{retries + 1}), nouvelle tentative...")
+                continue
+            else:
+                st.error(f"❌ Timeout après {retries + 1} tentatives. L'API pourrait être en veille.")
+                st.info("💡 Les services gratuits peuvent prendre jusqu'à 30 secondes pour se réveiller")
+                return None
+        except requests.exceptions.ConnectionError:
+            st.error("❌ Erreur de connexion. Vérifiez l'URL de l'API")
+            return None
+        except Exception as e:
+            st.error(f"❌ Erreur de requête: {str(e)}")
+            return None
 
 # Interface principale - seulement si authentifié
 if st.session_state.authenticated:
@@ -174,7 +195,8 @@ if st.session_state.authenticated:
             search_limit = st.slider("Nombre de résultats", 1, 25, 10)
         
         if st.button("🔍 Rechercher par titre", type="primary", use_container_width=True):
-            response = api_call(f"/recommend/by-title/{search_query}", params={"k": search_limit})
+            with st.spinner("Recherche en cours... (peut prendre jusqu'à 30 secondes)"):
+                response = api_call(f"/recommend/by-title/{search_query}", params={"k": search_limit}, timeout=45)
             
             if response and response.status_code == 200:
                 try:
@@ -247,8 +269,8 @@ if st.session_state.authenticated:
                     "min_confidence": confidence_min
                 }
                 
-                with st.spinner("Génération des recommandations ML..."):
-                    response = api_call("/recommend/ml", method="POST", data=recommendation_data)
+                with st.spinner("Génération des recommandations ML... (peut prendre jusqu'à 30 secondes)"):
+                    response = api_call("/recommend/ml", method="POST", data=recommendation_data, timeout=45)
                     
                     if response and response.status_code == 200:
                         try:
