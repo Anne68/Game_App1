@@ -65,11 +65,15 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# État de session pour la configuration API
+# État de session pour la configuration API avec secrets
 if 'api_configured' not in st.session_state:
     st.session_state.api_configured = False
 if 'api_url' not in st.session_state:
-    st.session_state.api_url = "https://game-app-y8be.onrender.com"
+    # Utiliser l'URL depuis les secrets si disponible
+    try:
+        st.session_state.api_url = st.secrets["api"]["url"]
+    except:
+        st.session_state.api_url = "https://game-app-y8be.onrender.com"
 if 'api_token' not in st.session_state:
     st.session_state.api_token = ""
 if 'debug_mode' not in st.session_state:
@@ -102,21 +106,31 @@ def authenticate_user(username: str, password: str):
         st.error(f"Erreur de connexion: {str(e)}")
         return False
 
-# Configuration API et authentification
+# Configuration API et authentification avec secrets
 with st.container():
     if not st.session_state.api_configured:
-        st.info("🔧 Configuration de l'API de jeux")
+        st.info("🔧 Configuration automatique de l'API depuis les secrets")
         
-        config_col1, config_col2 = st.columns([1, 1])
-        
-        with config_col1:
-            api_url = st.text_input("🌐 URL API", value="https://game-app-y8be.onrender.com")
-        
-        with config_col2:
-            if st.button("✅ Connecter à l'API", type="primary"):
-                st.session_state.api_url = api_url.rstrip('/')
-                st.session_state.api_configured = True
-                st.rerun()
+        # Essayer de charger depuis les secrets
+        try:
+            api_url = st.secrets["api"]["url"]
+            st.session_state.api_url = api_url.rstrip('/')
+            st.session_state.api_configured = True
+            st.success(f"✅ API configurée automatiquement: {st.session_state.api_url}")
+            st.rerun()
+        except KeyError:
+            st.warning("⚠️ Configuration manuelle requise - secrets non trouvés")
+            
+            config_col1, config_col2 = st.columns([1, 1])
+            
+            with config_col1:
+                api_url = st.text_input("🌐 URL API", value="https://game-app-y8be.onrender.com")
+            
+            with config_col2:
+                if st.button("✅ Connecter à l'API", type="primary"):
+                    st.session_state.api_url = api_url.rstrip('/')
+                    st.session_state.api_configured = True
+                    st.rerun()
     
     elif not st.session_state.authenticated:
         st.warning("🔐 Authentification requise")
@@ -124,10 +138,21 @@ with st.container():
         auth_col1, auth_col2, auth_col3 = st.columns([1, 1, 1])
         
         with auth_col1:
-            username = st.text_input("👤 Nom d'utilisateur", placeholder="Votre nom d'utilisateur")
+            # Utiliser des valeurs par défaut si disponibles dans les secrets
+            try:
+                default_username = st.secrets.get("database", {}).get("username", "anne")
+            except:
+                default_username = ""
+            
+            username = st.text_input("👤 Nom d'utilisateur", 
+                                   value=default_username, 
+                                   placeholder="Votre nom d'utilisateur")
         
         with auth_col2:
-            password = st.text_input("🔑 Mot de passe", type="password", placeholder="Votre mot de passe")
+            # Masquer le mot de passe par défaut
+            password = st.text_input("🔑 Mot de passe", 
+                                   type="password", 
+                                   placeholder="Votre mot de passe")
         
         with auth_col3:
             st.write("")  # Espace
@@ -138,6 +163,24 @@ with st.container():
                         st.rerun()
                 else:
                     st.error("Veuillez remplir tous les champs")
+                    
+        # Bouton d'aide pour la configuration
+        with st.expander("💡 Aide à la connexion"):
+            st.markdown("""
+            **Informations de connexion:**
+            - Nom d'utilisateur: Votre nom d'utilisateur de l'API
+            - Mot de passe: Votre mot de passe
+            
+            **Si vous n'avez pas de compte:**
+            1. Utilisez n'importe quel nom d'utilisateur
+            2. Utilisez n'importe quel mot de passe
+            3. Le système créera automatiquement un compte
+            
+            **Configuration de la base de données:**
+            - Host: mysql-anne.alwaysdata.net
+            - Port: 3306  
+            - Database: anne_games_db
+            """)
     
     else:
         status_col1, status_col2, status_col3, status_col4 = st.columns([2, 1, 1, 1])
@@ -155,6 +198,12 @@ with st.container():
                             st.success("✅ API OK")
                         else:
                             st.warning("⚠️ API dégradée")
+                        
+                        # Afficher l'état de la DB
+                        if health_data.get("db_ready"):
+                            st.success("✅ DB connectée")
+                        else:
+                            st.error("❌ DB déconnectée")
                     else:
                         st.error(f"❌ {response.status_code}")
                 except Exception as e:
@@ -172,7 +221,7 @@ with st.container():
                 st.session_state.api_configured = False
                 st.rerun()
 
-# Mode debug
+# Mode debug avec informations secrets
 if st.session_state.debug_mode and st.session_state.authenticated:
     with st.expander("🐛 Informations de debug", expanded=True):
         st.markdown("**Configuration actuelle:**")
@@ -181,6 +230,24 @@ URL API: {st.session_state.api_url}
 Token: {st.session_state.api_token[:20]}...{st.session_state.api_token[-10:] if st.session_state.api_token else 'Non défini'}
 Authenticated: {st.session_state.authenticated}
         """)
+        
+        # Afficher les informations des secrets (sans les mots de passe)
+        st.markdown("**Configuration des secrets:**")
+        try:
+            api_config = st.secrets.get("api", {})
+            db_config = st.secrets.get("database", {})
+            
+            st.code(f"""
+API URL: {api_config.get('url', 'Non défini')}
+DB Host: {db_config.get('host', 'Non défini')}
+DB Port: {db_config.get('port', 'Non défini')}
+DB Username: {db_config.get('username', 'Non défini')}
+DB Database: {db_config.get('database', 'Non défini')}
+DB Password: {'***' if db_config.get('password') else 'Non défini'}
+            """)
+        except Exception as e:
+            st.warning(f"Erreur lors de la lecture des secrets: {str(e)}")
+            st.info("Assurez-vous que le fichier secrets.toml est correctement configuré")
 
 st.markdown("---")
 
