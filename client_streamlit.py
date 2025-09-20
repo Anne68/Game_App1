@@ -8,8 +8,8 @@ import plotly.graph_objects as go
 
 # Configuration de la page
 st.set_page_config(
-    page_title="API Hub",
-    page_icon="⚡",
+    page_title="Game Recommendation API",
+    page_icon="🎮",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -55,6 +55,13 @@ st.markdown("""
         font-family: monospace;
         font-size: 0.85rem;
     }
+    .game-card {
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+        background: #f9f9f9;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -62,65 +69,94 @@ st.markdown("""
 if 'api_configured' not in st.session_state:
     st.session_state.api_configured = False
 if 'api_url' not in st.session_state:
-    st.session_state.api_url = ""
-if 'api_key' not in st.session_state:
-    st.session_state.api_key = ""
+    st.session_state.api_url = "https://game-app-y8be.onrender.com"
+if 'api_token' not in st.session_state:
+    st.session_state.api_token = ""
 if 'debug_mode' not in st.session_state:
     st.session_state.debug_mode = False
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
 
 # Configuration API compacte en haut de page
-st.markdown('<div class="main-header"><h1>⚡ API Hub</h1><p>Interface unifiée pour vos APIs</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header"><h1>🎮 Game Recommendation API</h1><p>Plateforme avancée de recommandation avec modèles IA multiples</p></div>', unsafe_allow_html=True)
 
-# Configuration API dans un conteneur compact
+# Fonction d'authentification
+def authenticate_user(username: str, password: str):
+    try:
+        response = requests.post(
+            f"{st.session_state.api_url}/token",
+            data={"username": username, "password": password},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            token_data = response.json()
+            st.session_state.api_token = token_data["access_token"]
+            st.session_state.authenticated = True
+            return True
+        else:
+            st.error(f"Erreur d'authentification: {response.status_code}")
+            return False
+    except Exception as e:
+        st.error(f"Erreur de connexion: {str(e)}")
+        return False
+
+# Configuration API et authentification
 with st.container():
     if not st.session_state.api_configured:
-        st.info("🔧 Configuration rapide requise")
+        st.info("🔧 Configuration de l'API de jeux")
         
-        config_col1, config_col2, config_col3 = st.columns([2, 2, 1])
+        config_col1, config_col2 = st.columns([1, 1])
         
         with config_col1:
-            api_url = st.text_input("🌐 URL API", placeholder="https://api.exemple.com", label_visibility="collapsed")
+            api_url = st.text_input("🌐 URL API", value="https://game-app-y8be.onrender.com")
         
         with config_col2:
-            api_key = st.text_input("🔑 Clé API", type="password", placeholder="Votre clé API", label_visibility="collapsed")
+            if st.button("✅ Connecter à l'API", type="primary"):
+                st.session_state.api_url = api_url.rstrip('/')
+                st.session_state.api_configured = True
+                st.rerun()
+    
+    elif not st.session_state.authenticated:
+        st.warning("🔐 Authentification requise")
         
-        with config_col3:
-            if st.button("✅ Connecter", type="primary"):
-                if api_url and api_key:
-                    st.session_state.api_url = api_url.rstrip('/')
-                    st.session_state.api_key = api_key
-                    st.session_state.api_configured = True
-                    st.rerun()
+        auth_col1, auth_col2, auth_col3 = st.columns([1, 1, 1])
+        
+        with auth_col1:
+            username = st.text_input("👤 Nom d'utilisateur", placeholder="Votre nom d'utilisateur")
+        
+        with auth_col2:
+            password = st.text_input("🔑 Mot de passe", type="password", placeholder="Votre mot de passe")
+        
+        with auth_col3:
+            st.write("")  # Espace
+            if st.button("🚀 Se connecter", type="primary"):
+                if username and password:
+                    if authenticate_user(username, password):
+                        st.success("✅ Authentification réussie!")
+                        st.rerun()
                 else:
-                    st.error("URL et clé requises")
+                    st.error("Veuillez remplir tous les champs")
+    
     else:
         status_col1, status_col2, status_col3, status_col4 = st.columns([2, 1, 1, 1])
         
         with status_col1:
-            st.success(f"🟢 Connecté à {st.session_state.api_url}")
+            st.success(f"🟢 Connecté et authentifié à {st.session_state.api_url}")
         
         with status_col2:
-            if st.button("🔄 Test"):
+            if st.button("🔄 Test Health"):
                 try:
-                    headers = {"Authorization": f"Bearer {st.session_state.api_key}"}
-                    test_url = f"{st.session_state.api_url}/health"
-                    
-                    if st.session_state.debug_mode:
-                        st.markdown(f'<div class="debug-info">Test URL: {test_url}</div>', unsafe_allow_html=True)
-                    
-                    response = requests.get(test_url, headers=headers, timeout=5)
-                    
+                    response = requests.get(f"{st.session_state.api_url}/healthz", timeout=10)
                     if response.status_code == 200:
-                        st.success("✅ OK")
+                        health_data = response.json()
+                        if health_data.get("status") == "healthy":
+                            st.success("✅ API OK")
+                        else:
+                            st.warning("⚠️ API dégradée")
                     else:
                         st.error(f"❌ {response.status_code}")
-                        if st.session_state.debug_mode:
-                            st.text(f"Réponse: {response.text[:200]}")
-                            
-                except requests.exceptions.Timeout:
-                    st.error("❌ Timeout")
-                except requests.exceptions.ConnectionError:
-                    st.error("❌ Connexion impossible")
                 except Exception as e:
                     st.error(f"❌ Erreur: {str(e)}")
         
@@ -130,32 +166,35 @@ with st.container():
                 st.rerun()
         
         with status_col4:
-            if st.button("⚙️ Changer"):
+            if st.button("🚪 Déconnecter"):
+                st.session_state.authenticated = False
+                st.session_state.api_token = ""
                 st.session_state.api_configured = False
-                st.session_state.debug_mode = False
                 st.rerun()
 
 # Mode debug
-if st.session_state.debug_mode and st.session_state.api_configured:
+if st.session_state.debug_mode and st.session_state.authenticated:
     with st.expander("🐛 Informations de debug", expanded=True):
         st.markdown("**Configuration actuelle:**")
         st.code(f"""
 URL API: {st.session_state.api_url}
-Clé API: {'*' * (len(st.session_state.api_key) - 4) + st.session_state.api_key[-4:] if st.session_state.api_key else 'Non définie'}
-Headers: Authorization: Bearer [MASQUÉ]
+Token: {st.session_state.api_token[:20]}...{st.session_state.api_token[-10:] if st.session_state.api_token else 'Non défini'}
+Authenticated: {st.session_state.authenticated}
         """)
 
 st.markdown("---")
 
-# Fonction API simplifiée avec debug amélioré
+# Fonction API avec authentification
 def api_call(endpoint, method="GET", data=None, params=None):
-    if not st.session_state.api_configured:
-        st.warning("Configuration API requise")
+    if not st.session_state.authenticated:
+        st.warning("Authentification requise")
         return None
     
-    # Construction de l'URL
-    url = f"{st.session_state.api_url}/{endpoint.lstrip('/')}"
-    headers = {"Authorization": f"Bearer {st.session_state.api_key}"}
+    url = f"{st.session_state.api_url}{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {st.session_state.api_token}",
+        "Content-Type": "application/json"
+    }
     
     # Debug info
     if st.session_state.debug_mode:
@@ -167,305 +206,343 @@ def api_call(endpoint, method="GET", data=None, params=None):
     
     try:
         if method == "GET":
-            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response = requests.get(url, headers=headers, params=params, timeout=15)
         elif method == "POST":
-            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response = requests.post(url, headers=headers, json=data, timeout=15)
         elif method == "PUT":
-            response = requests.put(url, headers=headers, json=data, timeout=10)
+            response = requests.put(url, headers=headers, json=data, timeout=15)
         elif method == "DELETE":
-            response = requests.delete(url, headers=headers, timeout=10)
+            response = requests.delete(url, headers=headers, timeout=15)
         
         # Debug de la réponse
         if st.session_state.debug_mode:
             st.markdown(f'<div class="debug-info">📡 Status: {response.status_code}</div>', unsafe_allow_html=True)
-            if response.status_code != 200:
-                st.markdown(f'<div class="debug-info">❌ Erreur: {response.text[:300]}</div>', unsafe_allow_html=True)
+            if response.status_code == 401:
+                st.error("Token expiré - reconnectez-vous")
+                st.session_state.authenticated = False
+                st.rerun()
+            if response.status_code not in [200, 201]:
+                st.markdown(f'<div class="debug-info">❌ Erreur: {response.text[:500]}</div>', unsafe_allow_html=True)
         
         return response
         
-    except requests.exceptions.Timeout:
-        st.error("❌ Timeout de la requête")
-        return None
-    except requests.exceptions.ConnectionError:
-        st.error("❌ Erreur de connexion - Vérifiez l'URL")
-        return None
-    except requests.exceptions.HTTPError as e:
-        st.error(f"❌ Erreur HTTP: {str(e)}")
-        return None
     except Exception as e:
-        st.error(f"❌ Erreur inattendue: {str(e)}")
+        st.error(f"❌ Erreur de requête: {str(e)}")
         return None
 
-# Interface principale avec onglets simplifiés
-tab_search, tab_recommendations, tab_analytics, tab_admin = st.tabs([
-    "🔍 Recherche", 
-    "⭐ Recommandations", 
-    "📊 Analytics", 
-    "🔧 Admin"
-])
+# Interface principale - seulement si authentifié
+if st.session_state.authenticated:
+    tab_search, tab_recommendations, tab_model, tab_analytics = st.tabs([
+        "🔍 Recherche par Titre", 
+        "⭐ Recommandations ML", 
+        "🤖 Gestion Modèle",
+        "📊 Analytics"
+    ])
 
-# ONGLET RECHERCHE - Adapté aux captures d'écran
-with tab_search:
-    st.header("🔍 Recherche avancée de jeux")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        search_query = st.text_input("Rechercher un jeu", placeholder="cyberpunk, zelda, mario...")
-    
-    with col2:
-        search_type = st.selectbox("Type de recherche", ["Par titre", "Par genre", "Par plateforme"])
-    
-    if st.button("🔍 Rechercher", type="primary", use_container_width=True):
-        # Adaptation selon vos captures d'écran
-        search_params = {
-            "query": search_query,
-            "type": search_type.lower().replace(" ", "_")
-        }
+    # ONGLET RECHERCHE PAR TITRE
+    with tab_search:
+        st.header("🔍 Recherche de jeux par titre")
         
-        response = api_call("search", params=search_params)
+        col1, col2 = st.columns([2, 1])
         
-        if response and response.status_code == 200:
-            try:
-                results = response.json()
-                
-                if results and len(results) > 0:
-                    st.success(f"✅ {len(results)} résultat(s) trouvé(s)")
-                    
-                    for game in results[:5]:  # Limiter à 5 résultats
-                        with st.container():
-                            game_col1, game_col2, game_col3 = st.columns([3, 1, 1])
-                            
-                            with game_col1:
-                                st.write(f"**{game.get('title', 'Titre inconnu')}**")
-                                st.caption(f"Genre: {game.get('genre', 'N/A')} | Plateforme: {game.get('platform', 'N/A')}")
-                            
-                            with game_col2:
-                                rating = game.get('rating', 0)
-                                st.metric("Note", f"{rating}/10")
-                            
-                            with game_col3:
-                                if st.button("📋 Détails", key=f"detail_{game.get('id', 0)}"):
-                                    st.info(f"Détails pour: {game.get('title', 'Jeu')}")
-                            
-                            st.divider()
-                else:
-                    st.warning("❌ Aucun résultat trouvé")
-            except json.JSONDecodeError:
-                st.error("❌ Erreur de format de réponse")
-        elif response and response.status_code == 404:
-            st.error("❌ Erreur de recherche: Not Found - Vérifiez l'endpoint")
-        else:
-            st.error("❌ Erreur lors de la recherche")
-
-# ONGLET RECOMMANDATIONS - Basé sur vos captures d'écran
-with tab_recommendations:
-    st.header("⭐ Recommandations ML Avancées")
-    
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.subheader("Configuration")
+        with col1:
+            search_query = st.text_input("Rechercher un jeu", placeholder="cyberpunk, zelda, mario...", value="cyberpunk")
         
-        # Profil utilisateur (optionnel)
-        with st.expander("🎯 Profil utilisateur (optionnel)", expanded=False):
-            user_genres = st.multiselect(
-                "Genres préférés", 
-                ["RPG", "Action", "Aventure", "Sport", "Stratégie", "Simulation"],
-                default=["RPG"]
-            )
-            user_platforms = st.multiselect(
-                "Plateformes préférées",
-                ["PC", "Xbox", "PlayStation", "Nintendo Switch"],
-                default=["PC"]
-            )
+        with col2:
+            search_limit = st.slider("Nombre de résultats", 1, 25, 10)
         
-        # Paramètres de recommandation
-        num_recommendations = st.slider("Nombre de suggestions", 1, 10, 2)
-        algorithm = st.selectbox("Algorithme", ["hybrid", "collaborative", "content-based"])
-        confidence_min = st.slider("Confiance minimum", 0.0, 1.0, 0.1, 0.05)
-    
-    with col2:
-        st.subheader("Obtenir des recommandations")
-        
-        if st.button("🎯 Obtenir des recommandations", type="primary", use_container_width=True):
-            # Préparation des données pour l'API
-            recommendation_data = {
-                "user_profile": {
-                    "preferred_genres": user_genres,
-                    "preferred_platforms": user_platforms
-                },
-                "algorithm": algorithm,
-                "num_recommendations": num_recommendations,
-                "min_confidence": confidence_min
-            }
+        if st.button("🔍 Rechercher par titre", type="primary", use_container_width=True):
+            # Utiliser l'endpoint exact de votre API
+            response = api_call(f"/recommend/by-title/{search_query}", params={"k": search_limit})
             
-            with st.spinner("Génération des recommandations..."):
-                response = api_call("recommendations", method="POST", data=recommendation_data)
-                
-                if response and response.status_code == 200:
-                    try:
-                        recommendations = response.json()
+            if response and response.status_code == 200:
+                try:
+                    results = response.json()
+                    
+                    st.success(f"✅ Recommandations basées sur le titre '{results.get('title', search_query)}'")
+                    
+                    recommendations = results.get("recommendations", [])
+                    
+                    if recommendations:
+                        for game in recommendations:
+                            with st.container():
+                                st.markdown('<div class="game-card">', unsafe_allow_html=True)
+                                
+                                game_col1, game_col2, game_col3 = st.columns([3, 1, 1])
+                                
+                                with game_col1:
+                                    title = game.get('title', 'Titre inconnu')
+                                    st.write(f"**{title}**")
+                                    
+                                    genres = game.get('genres', 'N/A')
+                                    platforms = game.get('platforms', 'N/A')
+                                    st.caption(f"Genres: {genres}")
+                                    if platforms != 'N/A':
+                                        st.caption(f"Plateformes: {platforms}")
+                                
+                                with game_col2:
+                                    rating = game.get('rating', 0)
+                                    st.metric("Note", f"{rating:.1f}/5")
+                                
+                                with game_col3:
+                                    similarity = game.get('similarity_score', game.get('confidence', 0))
+                                    st.metric("Similarité", f"{similarity:.2f}")
+                                
+                                st.markdown('</div>', unsafe_allow_html=True)
+                                st.divider()
+                    else:
+                        st.warning("Aucune recommandation trouvée")
                         
-                        if recommendations and len(recommendations) > 0:
-                            st.success(f"✅ {len(recommendations)} recommandation(s) générée(s)")
+                except json.JSONDecodeError:
+                    st.error("❌ Erreur de format de réponse")
+            else:
+                st.error("❌ Erreur lors de la recherche")
+
+    # ONGLET RECOMMANDATIONS ML
+    with tab_recommendations:
+        st.header("⭐ Recommandations ML Avancées")
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.subheader("Configuration")
+            
+            # Paramètres de recommandation selon votre API
+            user_query = st.text_input("Décrivez ce que vous cherchez", value="RPG fantasy", placeholder="RPG, action, aventure...")
+            num_recommendations = st.slider("Nombre de suggestions", 1, 20, 10)
+            confidence_min = st.slider("Confiance minimum", 0.0, 1.0, 0.1, 0.05)
+        
+        with col2:
+            st.subheader("Obtenir des recommandations")
+            
+            if st.button("🎯 Obtenir des recommandations ML", type="primary", use_container_width=True):
+                # Utiliser l'endpoint exact de votre API
+                recommendation_data = {
+                    "query": user_query,
+                    "k": num_recommendations,
+                    "min_confidence": confidence_min
+                }
+                
+                with st.spinner("Génération des recommandations ML..."):
+                    response = api_call("/recommend/ml", method="POST", data=recommendation_data)
+                    
+                    if response and response.status_code == 200:
+                        try:
+                            results = response.json()
                             
-                            for i, rec in enumerate(recommendations):
+                            st.success(f"✅ {len(results.get('recommendations', []))} recommandation(s) générée(s)")
+                            st.info(f"Modèle: {results.get('model_version', 'unknown')} | Latence: {results.get('latency_ms', 0):.1f}ms")
+                            
+                            recommendations = results.get("recommendations", [])
+                            
+                            for rec in recommendations:
                                 with st.container():
+                                    st.markdown('<div class="game-card">', unsafe_allow_html=True)
+                                    
                                     rec_col1, rec_col2, rec_col3 = st.columns([2, 1, 1])
                                     
                                     with rec_col1:
-                                        st.write(f"**{rec.get('title', 'Jeu recommandé')}**")
-                                        st.caption(f"Confiance: {rec.get('confidence', 0):.2f}")
+                                        title = rec.get('title', 'Jeu recommandé')
+                                        st.write(f"**{title}**")
+                                        
+                                        genres = rec.get('genres', 'N/A')
+                                        st.caption(f"Genres: {genres}")
                                     
                                     with rec_col2:
-                                        score = rec.get('score', 0)
-                                        st.metric("Score", f"{score:.1f}")
+                                        confidence = rec.get('confidence', rec.get('score', 0))
+                                        st.metric("Confiance", f"{confidence:.3f}")
                                     
                                     with rec_col3:
-                                        st.write(f"**{rec.get('reason', 'Recommandé pour vous')}**")
+                                        rating = rec.get('rating', 0)
+                                        st.metric("Note", f"{rating:.1f}")
                                     
+                                    st.markdown('</div>', unsafe_allow_html=True)
                                     st.divider()
-                        else:
-                            st.warning("❌ Aucune recommandation générée")
-                    except json.JSONDecodeError:
-                        st.error("❌ Erreur de format de réponse")
-                elif response and response.status_code == 404:
-                    st.error("❌ Endpoint de recommandations non trouvé")
-                else:
-                    st.error("❌ Erreur lors de la génération des recommandations")
-
-# ONGLET ANALYTICS - Interface simplifiée
-with tab_analytics:
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.subheader("📈 Métriques")
+                                    
+                        except json.JSONDecodeError:
+                            st.error("❌ Erreur de format de réponse")
+                    else:
+                        st.error("❌ Erreur lors de la génération des recommandations")
         
-        if st.button("Actualiser", type="primary", use_container_width=True):
-            response = api_call("analytics/metrics")
-            
-            if response and response.status_code == 200:
-                try:
-                    data = response.json()
-                    
-                    st.metric("👥 Utilisateurs", data.get("total_users", "N/A"))
-                    st.metric("🎮 Jeux", data.get("total_games", "N/A"))
-                    st.metric("⭐ Recommandations", data.get("recommendations_served", "N/A"))
-                    st.metric("🎯 Taux de succès", f"{data.get('success_rate', 0)}%")
-                except json.JSONDecodeError:
-                    st.error("❌ Erreur de format des métriques")
-            else:
-                # Données de démonstration
-                st.metric("👥 Utilisateurs", "1,234")
-                st.metric("🎮 Jeux", "15,678")
-                st.metric("⭐ Recommandations", "45,123")
-                st.metric("🎯 Taux de succès", "87%")
-    
-    with col2:
-        st.subheader("📊 Tendances")
+        # Section recommandations par genre
+        st.markdown("---")
+        st.subheader("🎮 Recommandations par genre")
         
-        # Graphique simplifié
-        dates = pd.date_range('2024-01-01', periods=30)
-        values = [100 + i*3 + (i%7)*5 for i in range(30)]
+        genre_col1, genre_col2 = st.columns([1, 1])
         
-        fig = px.area(
-            x=dates, 
-            y=values,
-            title="Évolution des recommandations",
-            color_discrete_sequence=['#667eea']
-        )
-        fig.update_layout(
-            showlegend=False,
-            height=300,
-            margin=dict(l=0, r=0, t=40, b=0)
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# ONGLET ADMIN - Interface de monitoring
-with tab_admin:
-    # Statut des services
-    st.subheader("🚦 Statut des services")
-    
-    services = ["API", "ML Models", "Database", "Cache"]
-    service_cols = st.columns(len(services))
-    
-    for i, service in enumerate(services):
-        with service_cols[i]:
-            if st.button(f"Test {service}", key=f"test_{service}"):
-                response = api_call(f"health/{service.lower()}")
+        with genre_col1:
+            genre = st.selectbox("Choisir un genre", ["RPG", "Action", "Adventure", "Strategy", "Simulation", "Sports", "Racing", "Indie"])
+            genre_limit = st.slider("Nombre de jeux", 1, 20, 5, key="genre_limit")
+        
+        with genre_col2:
+            st.write("")  # Espace
+            if st.button("🎯 Recommandations par genre", use_container_width=True):
+                response = api_call(f"/recommend/by-genre/{genre}", params={"k": genre_limit})
                 
                 if response and response.status_code == 200:
-                    st.markdown(f'<div class="status-ok">✅ {service}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="status-error">❌ {service}</div>', unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Logs et debug
-    st.subheader("📝 Logs et debug")
-    
-    log_col1, log_col2 = st.columns(2)
-    
-    with log_col1:
-        if st.button("📋 Récupérer les logs"):
-            response = api_call("admin/logs", params={"limit": 10})
-            
-            if response and response.status_code == 200:
-                try:
-                    logs = response.json()
-                    
-                    for log in logs[:5]:
-                        timestamp = log.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-                        level = log.get('level', 'INFO')
-                        message = log.get('message', 'Message de log')
+                    try:
+                        results = response.json()
+                        st.success(f"✅ Jeux du genre '{results.get('genre', genre)}'")
                         
-                        if level == "ERROR":
-                            st.error(f"🔴 {timestamp} | {message}")
-                        elif level == "WARNING":
-                            st.warning(f"🟡 {timestamp} | {message}")
-                        else:
-                            st.info(f"🔵 {timestamp} | {message}")
-                except json.JSONDecodeError:
-                    st.error("❌ Erreur de format des logs")
-            else:
-                # Logs de démonstration
-                st.info("🔵 2024-09-20 11:20:15 | API démarrée avec succès")
-                st.info("🔵 2024-09-20 11:18:32 | Modèle ML chargé")
-                st.warning("🟡 2024-09-20 11:15:20 | Latence élevée détectée")
-    
-    with log_col2:
-        if st.button("🔄 Test complet de l'API"):
-            st.write("**Test des endpoints principaux:**")
-            
-            endpoints = [
-                ("search", "GET"),
-                ("recommendations", "POST"),
-                ("analytics/metrics", "GET"),
-                ("health", "GET")
-            ]
-            
-            for endpoint, method in endpoints:
-                test_data = {"test": True} if method == "POST" else None
-                response = api_call(endpoint, method=method, data=test_data)
-                
-                if response:
-                    if response.status_code == 200:
-                        st.success(f"✅ {endpoint} ({method})")
-                    else:
-                        st.error(f"❌ {endpoint} ({method}) - {response.status_code}")
-                else:
-                    st.error(f"❌ {endpoint} ({method}) - Pas de réponse")
+                        for game in results.get("recommendations", []):
+                            with st.container():
+                                game_col1, game_col2 = st.columns([3, 1])
+                                
+                                with game_col1:
+                                    st.write(f"**{game.get('title', 'Titre inconnu')}**")
+                                    st.caption(f"Genres: {game.get('genres', 'N/A')}")
+                                
+                                with game_col2:
+                                    st.metric("Note", f"{game.get('rating', 0):.1f}")
+                                
+                                st.divider()
+                                
+                    except json.JSONDecodeError:
+                        st.error("❌ Erreur de format")
 
-# Footer avec informations utiles
+    # ONGLET GESTION MODÈLE
+    with tab_model:
+        st.header("🤖 Gestion du modèle ML")
+        
+        # Métriques du modèle
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.subheader("📊 Métriques du modèle")
+            
+            if st.button("📈 Récupérer les métriques", type="primary"):
+                response = api_call("/model/metrics")
+                
+                if response and response.status_code == 200:
+                    try:
+                        metrics = response.json()
+                        
+                        st.metric("Version du modèle", metrics.get("model_version", "unknown"))
+                        st.metric("Modèle entraîné", "✅ Oui" if metrics.get("is_trained", False) else "❌ Non")
+                        st.metric("Total prédictions", metrics.get("total_predictions", 0))
+                        st.metric("Confiance moyenne", f"{metrics.get('avg_confidence', 0):.3f}")
+                        st.metric("Nombre de jeux", metrics.get("games_count", 0))
+                        st.metric("Dimension des features", metrics.get("feature_dimension", 0))
+                        
+                        if metrics.get("last_training"):
+                            st.info(f"Dernier entraînement: {metrics['last_training']}")
+                        
+                    except json.JSONDecodeError:
+                        st.error("❌ Erreur de format des métriques")
+        
+        with col2:
+            st.subheader("🔄 Actions sur le modèle")
+            
+            # Entraînement du modèle
+            with st.form("train_model"):
+                st.write("**Entraîner le modèle**")
+                
+                version = st.text_input("Version (optionnel)", placeholder="v1.0.0")
+                force_retrain = st.checkbox("Forcer le ré-entraînement")
+                
+                if st.form_submit_button("🚀 Entraîner le modèle", type="primary"):
+                    train_data = {
+                        "version": version if version else None,
+                        "force_retrain": force_retrain
+                    }
+                    
+                    with st.spinner("Entraînement en cours..."):
+                        response = api_call("/model/train", method="POST", data=train_data)
+                        
+                        if response and response.status_code == 200:
+                            try:
+                                result = response.json()
+                                st.success(f"✅ Entraînement terminé!")
+                                st.info(f"Version: {result.get('version', 'unknown')}")
+                                st.info(f"Durée: {result.get('duration', 0):.2f} secondes")
+                                
+                                if result.get('result'):
+                                    st.json(result['result'])
+                                    
+                            except json.JSONDecodeError:
+                                st.error("❌ Erreur de format de réponse")
+                        else:
+                            st.error("❌ Erreur lors de l'entraînement")
+            
+            # Évaluation du modèle
+            st.markdown("---")
+            
+            if st.button("🧪 Évaluer le modèle"):
+                test_queries = ["RPG", "Action", "Indie", "Simulation"]
+                
+                with st.spinner("Évaluation en cours..."):
+                    params = {"test_queries": test_queries}
+                    response = api_call("/model/evaluate", method="POST", params=params)
+                    
+                    if response and response.status_code == 200:
+                        try:
+                            evaluation = response.json()
+                            st.success("✅ Évaluation terminée")
+                            st.json(evaluation)
+                        except json.JSONDecodeError:
+                            st.error("❌ Erreur de format d'évaluation")
+
+    # ONGLET ANALYTICS
+    with tab_analytics:
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            st.subheader("📈 Statut système")
+            
+            if st.button("🔄 Actualiser le statut", type="primary"):
+                response = api_call("/healthz")
+                
+                if response and response.status_code == 200:
+                    try:
+                        health = response.json()
+                        
+                        status = health.get("status", "unknown")
+                        if status == "healthy":
+                            st.success("🟢 Système en bonne santé")
+                        else:
+                            st.warning(f"⚠️ Système: {status}")
+                        
+                        st.metric("Base de données", "✅ Connectée" if health.get("db_ready", False) else "❌ Déconnectée")
+                        st.metric("Modèle ML", "✅ Chargé" if health.get("model_loaded", False) else "❌ Non chargé")
+                        st.metric("Version modèle", health.get("model_version", "unknown"))
+                        st.metric("Compliance", "✅ Activée" if health.get("compliance_enabled", False) else "❌ Désactivée")
+                        
+                        if health.get("db_error"):
+                            st.error(f"Erreur DB: {health['db_error']}")
+                        
+                        # Métriques de monitoring
+                        monitoring = health.get("monitoring", {})
+                        if monitoring:
+                            st.markdown("**Métriques de monitoring:**")
+                            for key, value in monitoring.items():
+                                st.text(f"{key}: {value}")
+                        
+                    except json.JSONDecodeError:
+                        st.error("❌ Erreur de format du statut")
+        
+        with col2:
+            st.subheader("📊 Métriques Prometheus")
+            
+            if st.button("📈 Voir les métriques Prometheus"):
+                response = api_call("/metrics")
+                
+                if response and response.status_code == 200:
+                    st.text_area("Métriques Prometheus", response.text, height=400)
+                else:
+                    st.error("❌ Impossible de récupérer les métriques")
+
+else:
+    st.info("👆 Veuillez vous connecter pour accéder aux fonctionnalités")
+
+# Footer
 st.markdown("---")
 if st.session_state.debug_mode:
     st.markdown(
-        '<div style="text-align: center; color: #666; font-size: 0.8rem;">🐛 Mode debug activé | ⚡ API Hub - Interface de test</div>',
+        '<div style="text-align: center; color: #666; font-size: 0.8rem;">🐛 Mode debug activé | 🎮 Game Recommendation API - Interface de test</div>',
         unsafe_allow_html=True
     )
 else:
     st.markdown(
-        '<div style="text-align: center; color: #666; font-size: 0.8rem;">⚡ API Hub - Interface simplifiée</div>',
+        '<div style="text-align: center; color: #666; font-size: 0.8rem;">🎮 Game Recommendation API - Interface simplifiée</div>',
         unsafe_allow_html=True
     )
