@@ -3,8 +3,6 @@ import requests
 import json
 import pandas as pd
 from datetime import datetime
-# import plotly.express as px  # Commenté
-# import plotly.graph_objects as go  # Commenté
 
 # Configuration de la page
 st.set_page_config(
@@ -31,6 +29,13 @@ st.markdown("""
         padding: 1rem;
         margin: 0.5rem 0;
         background: #f9f9f9;
+    }
+    .status-card {
+        background: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 0.5rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -108,7 +113,17 @@ with st.container():
                     st.error("Veuillez remplir tous les champs")
     
     else:
-        st.success(f"🟢 Connecté et authentifié à {st.session_state.api_url}")
+        status_col1, status_col2 = st.columns([3, 1])
+        
+        with status_col1:
+            st.success(f"🟢 Connecté et authentifié à {st.session_state.api_url}")
+        
+        with status_col2:
+            if st.button("🚪 Déconnecter"):
+                st.session_state.authenticated = False
+                st.session_state.api_token = ""
+                st.session_state.api_configured = False
+                st.rerun()
 
 # Fonction API avec authentification
 def api_call(endpoint, method="GET", data=None, params=None):
@@ -127,6 +142,10 @@ def api_call(endpoint, method="GET", data=None, params=None):
             response = requests.get(url, headers=headers, params=params, timeout=15)
         elif method == "POST":
             response = requests.post(url, headers=headers, json=data, timeout=15)
+        elif method == "PUT":
+            response = requests.put(url, headers=headers, json=data, timeout=15)
+        elif method == "DELETE":
+            response = requests.delete(url, headers=headers, timeout=15)
         
         return response
         
@@ -136,9 +155,10 @@ def api_call(endpoint, method="GET", data=None, params=None):
 
 # Interface principale - seulement si authentifié
 if st.session_state.authenticated:
-    tab_search, tab_recommendations = st.tabs([
+    tab_search, tab_recommendations, tab_health = st.tabs([
         "🔍 Recherche par Titre", 
-        "⭐ Recommandations ML"
+        "⭐ Recommandations ML",
+        "🏥 Santé API"
     ])
 
     # ONGLET RECHERCHE PAR TITRE
@@ -197,7 +217,12 @@ if st.session_state.authenticated:
                 except json.JSONDecodeError:
                     st.error("❌ Erreur de format de réponse")
             else:
-                st.error("❌ Erreur lors de la recherche")
+                if response:
+                    st.error(f"❌ Erreur lors de la recherche: {response.status_code}")
+                    if response.text:
+                        st.code(response.text)
+                else:
+                    st.error("❌ Aucune réponse de l'API")
 
     # ONGLET RECOMMANDATIONS ML
     with tab_recommendations:
@@ -210,6 +235,7 @@ if st.session_state.authenticated:
             
             user_query = st.text_input("Décrivez ce que vous cherchez", value="RPG fantasy", placeholder="RPG, action, aventure...")
             num_recommendations = st.slider("Nombre de suggestions", 1, 20, 10)
+            confidence_min = st.slider("Confiance minimum", 0.0, 1.0, 0.1, 0.05)
         
         with col2:
             st.subheader("Obtenir des recommandations")
@@ -217,7 +243,8 @@ if st.session_state.authenticated:
             if st.button("🎯 Obtenir des recommandations ML", type="primary", use_container_width=True):
                 recommendation_data = {
                     "query": user_query,
-                    "k": num_recommendations
+                    "k": num_recommendations,
+                    "min_confidence": confidence_min
                 }
                 
                 with st.spinner("Génération des recommandations ML..."):
@@ -228,6 +255,12 @@ if st.session_state.authenticated:
                             results = response.json()
                             
                             st.success(f"✅ {len(results.get('recommendations', []))} recommandation(s) générée(s)")
+                            
+                            # Afficher les métriques de performance si disponibles
+                            if results.get('latency_ms'):
+                                st.info(f"⚡ Temps de traitement: {results['latency_ms']:.1f}ms")
+                            if results.get('model_version'):
+                                st.info(f"🤖 Modèle: {results['model_version']}")
                             
                             recommendations = results.get("recommendations", [])
                             
@@ -258,7 +291,79 @@ if st.session_state.authenticated:
                         except json.JSONDecodeError:
                             st.error("❌ Erreur de format de réponse")
                     else:
-                        st.error("❌ Erreur lors de la génération des recommandations")
+                        if response:
+                            st.error(f"❌ Erreur lors de la génération: {response.status_code}")
+                            if response.text:
+                                st.code(response.text)
+                        else:
+                            st.error("❌ Aucune réponse de l'API")
+
+    # ONGLET SANTÉ API
+    with tab_health:
+        st.header("🏥 Santé de l'API")
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.subheader("Status général")
+            
+            if st.button("🔄 Vérifier le statut", type="primary"):
+                response = api_call("/healthz")
+                
+                if response and response.status_code == 200:
+                    try:
+                        health_data = response.json()
+                        
+                        status = health_data.get("status", "unknown")
+                        if status == "healthy":
+                            st.success("🟢 API en bonne santé")
+                        else:
+                            st.warning(f"⚠️ Statut: {status}")
+                        
+                        # Afficher les détails
+                        st.markdown('<div class="status-card">', unsafe_allow_html=True)
+                        st.write(f"**Base de données:** {'✅ Connectée' if health_data.get('db_ready', False) else '❌ Déconnectée'}")
+                        st.write(f"**Modèle ML:** {'✅ Chargé' if health_data.get('model_loaded', False) else '❌ Non chargé'}")
+                        st.write(f"**Version modèle:** {health_data.get('model_version', 'unknown')}")
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        
+                        if health_data.get("db_error"):
+                            st.error(f"Erreur DB: {health_data['db_error']}")
+                        
+                    except json.JSONDecodeError:
+                        st.error("❌ Erreur de format de réponse")
+                else:
+                    if response:
+                        st.error(f"❌ API non disponible: {response.status_code}")
+                    else:
+                        st.error("❌ Impossible de contacter l'API")
+        
+        with col2:
+            st.subheader("Métriques")
+            
+            if st.button("📊 Récupérer les métriques"):
+                response = api_call("/model/metrics")
+                
+                if response and response.status_code == 200:
+                    try:
+                        metrics = response.json()
+                        
+                        st.markdown('<div class="status-card">', unsafe_allow_html=True)
+                        st.metric("Total prédictions", metrics.get("total_predictions", 0))
+                        st.metric("Confiance moyenne", f"{metrics.get('avg_confidence', 0):.3f}")
+                        st.metric("Nombre de jeux", metrics.get("games_count", 0))
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        
+                        if metrics.get("last_training"):
+                            st.info(f"Dernier entraînement: {metrics['last_training']}")
+                        
+                    except json.JSONDecodeError:
+                        st.error("❌ Erreur de format des métriques")
+                else:
+                    if response:
+                        st.error(f"❌ Métriques non disponibles: {response.status_code}")
+                    else:
+                        st.error("❌ Impossible de récupérer les métriques")
 
 else:
     st.info("👆 Veuillez vous connecter pour accéder aux fonctionnalités")
@@ -266,6 +371,6 @@ else:
 # Footer
 st.markdown("---")
 st.markdown(
-    '<div style="text-align: center; color: #666; font-size: 0.8rem;">🎮 Game Recommendation API - Interface simplifiée</div>',
+    '<div style="text-align: center; color: #666; font-size: 0.8rem;">🎮 Game Recommendation API - Interface simplifiée (sans graphiques)</div>',
     unsafe_allow_html=True
 )
