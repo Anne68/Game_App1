@@ -129,7 +129,7 @@ class RecommendationModel:
         self.title_tfidf = self.title_vectorizer.fit_transform(self.games_df["title"].fillna(""))
 
         # Index rapides
-        self._id_to_index = {int(row.id): idx for idx, row in self.games_df[["id"]].itertuples(index=True)}
+        self._id_to_index = {int(self.games_df.iloc[idx]["id"]): idx for idx in range(len(self.games_df))}
         self._neighbors_cache.clear()
 
         self.is_trained = True
