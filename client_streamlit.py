@@ -534,9 +534,21 @@ if st.session_state.authenticated:
 else:
     st.info("👆 Veuillez vous connecter pour accéder aux fonctionnalités")
 
-# Footer
+# Footer with proper string concatenation
 st.markdown("---")
 if st.session_state.debug_mode:
+    # Fixed string concatenation issue by ensuring all variables are properly defined
+    api_base_url = st.session_state.api_url if st.session_state.api_url else "Non défini"
+    
+    with st.container():
+        st.markdown("🔗 **Liens utiles:**")
+        if api_base_url != "Non défini":
+            st.markdown(f"- [📖 API Documentation]({api_base_url}/docs)")
+            st.markdown(f"- [📊 Métriques Prometheus]({api_base_url}/metrics)")
+        else:
+            st.markdown("- 📖 API Documentation (URL non configurée)")
+            st.markdown("- 📊 Métriques Prometheus (URL non configurée)")
+    
     st.markdown(
         '<div style="text-align: center; color: #666; font-size: 0.8rem;">🐛 Mode debug activé | 🎮 Game Recommendation API - Interface de test</div>',
         unsafe_allow_html=True
