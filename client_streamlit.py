@@ -3,10 +3,10 @@ import requests
 import json
 import pandas as pd
 from datetime import datetime
-import plotly.express as px
-import plotly.graph_objects as go
+# import plotly.express as px  # Commenté
+# import plotly.graph_objects as go  # Commenté
 
-# Configuration de la page (une seule fois)
+# Configuration de la page
 st.set_page_config(
     page_title="Game Recommendation API",
     page_icon="🎮",
@@ -14,7 +14,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# CSS personnalisé pour une interface plus épurée
+# CSS personnalisé
 st.markdown("""
 <style>
     .main-header {
@@ -24,36 +24,6 @@ st.markdown("""
         margin-bottom: 2rem;
         color: white;
         text-align: center;
-    }
-    .metric-card {
-        background: white;
-        padding: 1rem;
-        border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        border-left: 4px solid #667eea;
-    }
-    .status-ok {
-        background-color: #d4edda;
-        color: #155724;
-        padding: 0.5rem;
-        border-radius: 4px;
-        text-align: center;
-    }
-    .status-error {
-        background-color: #f8d7da;
-        color: #721c24;
-        padding: 0.5rem;
-        border-radius: 4px;
-        text-align: center;
-    }
-    .debug-info {
-        background-color: #fff3cd;
-        border: 1px solid #ffeaa7;
-        padding: 0.75rem;
-        border-radius: 4px;
-        margin: 0.5rem 0;
-        font-family: monospace;
-        font-size: 0.85rem;
     }
     .game-card {
         border: 1px solid #e0e0e0;
@@ -72,13 +42,11 @@ if 'api_url' not in st.session_state:
     st.session_state.api_url = "https://game-app-y8be.onrender.com"
 if 'api_token' not in st.session_state:
     st.session_state.api_token = ""
-if 'debug_mode' not in st.session_state:
-    st.session_state.debug_mode = False
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 
 # Configuration API compacte en haut de page
-st.markdown('<div class="main-header"><h1>🎮 Game Recommendation API</h1><p>Plateforme avancée de recommandation avec modèles IA multiples</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header"><h1>🎮 Game Recommendation API</h1><p>Plateforme de recommandation de jeux</p></div>', unsafe_allow_html=True)
 
 # Fonction d'authentification
 def authenticate_user(username: str, password: str):
@@ -130,7 +98,7 @@ with st.container():
             password = st.text_input("🔑 Mot de passe", type="password", placeholder="Votre mot de passe")
         
         with auth_col3:
-            st.write("")  # Espace
+            st.write("")
             if st.button("🚀 Se connecter", type="primary"):
                 if username and password:
                     if authenticate_user(username, password):
@@ -140,49 +108,7 @@ with st.container():
                     st.error("Veuillez remplir tous les champs")
     
     else:
-        status_col1, status_col2, status_col3, status_col4 = st.columns([2, 1, 1, 1])
-        
-        with status_col1:
-            st.success(f"🟢 Connecté et authentifié à {st.session_state.api_url}")
-        
-        with status_col2:
-            if st.button("🔄 Test Health"):
-                try:
-                    response = requests.get(f"{st.session_state.api_url}/healthz", timeout=10)
-                    if response.status_code == 200:
-                        health_data = response.json()
-                        if health_data.get("status") == "healthy":
-                            st.success("✅ API OK")
-                        else:
-                            st.warning("⚠️ API dégradée")
-                    else:
-                        st.error(f"❌ {response.status_code}")
-                except Exception as e:
-                    st.error(f"❌ Erreur: {str(e)}")
-        
-        with status_col3:
-            if st.button("🐛 Debug"):
-                st.session_state.debug_mode = not st.session_state.debug_mode
-                st.rerun()
-        
-        with status_col4:
-            if st.button("🚪 Déconnecter"):
-                st.session_state.authenticated = False
-                st.session_state.api_token = ""
-                st.session_state.api_configured = False
-                st.rerun()
-
-# Mode debug
-if st.session_state.debug_mode and st.session_state.authenticated:
-    with st.expander("🐛 Informations de debug", expanded=True):
-        st.markdown("**Configuration actuelle:**")
-        st.code(f"""
-URL API: {st.session_state.api_url}
-Token: {st.session_state.api_token[:20]}...{st.session_state.api_token[-10:] if st.session_state.api_token else 'Non défini'}
-Authenticated: {st.session_state.authenticated}
-        """)
-
-st.markdown("---")
+        st.success(f"🟢 Connecté et authentifié à {st.session_state.api_url}")
 
 # Fonction API avec authentification
 def api_call(endpoint, method="GET", data=None, params=None):
@@ -196,33 +122,11 @@ def api_call(endpoint, method="GET", data=None, params=None):
         "Content-Type": "application/json"
     }
     
-    # Debug info
-    if st.session_state.debug_mode:
-        st.markdown(f'<div class="debug-info">🔍 {method} {url}</div>', unsafe_allow_html=True)
-        if params:
-            st.markdown(f'<div class="debug-info">📋 Params: {params}</div>', unsafe_allow_html=True)
-        if data:
-            st.markdown(f'<div class="debug-info">📦 Data: {json.dumps(data, indent=2)}</div>', unsafe_allow_html=True)
-    
     try:
         if method == "GET":
             response = requests.get(url, headers=headers, params=params, timeout=15)
         elif method == "POST":
             response = requests.post(url, headers=headers, json=data, timeout=15)
-        elif method == "PUT":
-            response = requests.put(url, headers=headers, json=data, timeout=15)
-        elif method == "DELETE":
-            response = requests.delete(url, headers=headers, timeout=15)
-        
-        # Debug de la réponse
-        if st.session_state.debug_mode:
-            st.markdown(f'<div class="debug-info">📡 Status: {response.status_code}</div>', unsafe_allow_html=True)
-            if response.status_code == 401:
-                st.error("Token expiré - reconnectez-vous")
-                st.session_state.authenticated = False
-                st.rerun()
-            if response.status_code not in [200, 201]:
-                st.markdown(f'<div class="debug-info">❌ Erreur: {response.text[:500]}</div>', unsafe_allow_html=True)
         
         return response
         
@@ -232,11 +136,9 @@ def api_call(endpoint, method="GET", data=None, params=None):
 
 # Interface principale - seulement si authentifié
 if st.session_state.authenticated:
-    tab_search, tab_recommendations, tab_model, tab_analytics = st.tabs([
+    tab_search, tab_recommendations = st.tabs([
         "🔍 Recherche par Titre", 
-        "⭐ Recommandations ML", 
-        "🤖 Gestion Modèle",
-        "📊 Analytics"
+        "⭐ Recommandations ML"
     ])
 
     # ONGLET RECHERCHE PAR TITRE
@@ -297,31 +199,73 @@ if st.session_state.authenticated:
             else:
                 st.error("❌ Erreur lors de la recherche")
 
-    # Autres onglets (Recommandations ML, Gestion Modèle, Analytics) restent inchangés...
+    # ONGLET RECOMMANDATIONS ML
+    with tab_recommendations:
+        st.header("⭐ Recommandations ML")
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.subheader("Configuration")
+            
+            user_query = st.text_input("Décrivez ce que vous cherchez", value="RPG fantasy", placeholder="RPG, action, aventure...")
+            num_recommendations = st.slider("Nombre de suggestions", 1, 20, 10)
+        
+        with col2:
+            st.subheader("Obtenir des recommandations")
+            
+            if st.button("🎯 Obtenir des recommandations ML", type="primary", use_container_width=True):
+                recommendation_data = {
+                    "query": user_query,
+                    "k": num_recommendations
+                }
+                
+                with st.spinner("Génération des recommandations ML..."):
+                    response = api_call("/recommend/ml", method="POST", data=recommendation_data)
+                    
+                    if response and response.status_code == 200:
+                        try:
+                            results = response.json()
+                            
+                            st.success(f"✅ {len(results.get('recommendations', []))} recommandation(s) générée(s)")
+                            
+                            recommendations = results.get("recommendations", [])
+                            
+                            for rec in recommendations:
+                                with st.container():
+                                    st.markdown('<div class="game-card">', unsafe_allow_html=True)
+                                    
+                                    rec_col1, rec_col2, rec_col3 = st.columns([2, 1, 1])
+                                    
+                                    with rec_col1:
+                                        title = rec.get('title', 'Jeu recommandé')
+                                        st.write(f"**{title}**")
+                                        
+                                        genres = rec.get('genres', 'N/A')
+                                        st.caption(f"Genres: {genres}")
+                                    
+                                    with rec_col2:
+                                        confidence = rec.get('confidence', rec.get('score', 0))
+                                        st.metric("Confiance", f"{confidence:.3f}")
+                                    
+                                    with rec_col3:
+                                        rating = rec.get('rating', 0)
+                                        st.metric("Note", f"{rating:.1f}")
+                                    
+                                    st.markdown('</div>', unsafe_allow_html=True)
+                                    st.divider()
+                                    
+                        except json.JSONDecodeError:
+                            st.error("❌ Erreur de format de réponse")
+                    else:
+                        st.error("❌ Erreur lors de la génération des recommandations")
 
 else:
     st.info("👆 Veuillez vous connecter pour accéder aux fonctionnalités")
 
 # Footer
 st.markdown("---")
-if st.session_state.debug_mode:
-    api_base_url = st.session_state.api_url if st.session_state.api_url else "Non défini"
-    
-    with st.container():
-        st.markdown("🔗 **Liens utiles:**")
-        if api_base_url != "Non défini":
-            st.markdown(f"- [📖 API Documentation]({api_base_url}/docs)")
-            st.markdown(f"- [📊 Métriques Prometheus]({api_base_url}/metrics)")
-        else:
-            st.markdown("- 📖 API Documentation (URL non configurée)")
-            st.markdown("- 📊 Métriques Prometheus (URL non configurée)")
-    
-    st.markdown(
-        '<div style="text-align: center; color: #666; font-size: 0.8rem;">🐛 Mode debug activé | 🎮 Game Recommendation API - Interface de test</div>',
-        unsafe_allow_html=True
-    )
-else:
-    st.markdown(
-        '<div style="text-align: center; color: #666; font-size: 0.8rem;">🎮 Game Recommendation API - Interface simplifiée</div>',
-        unsafe_allow_html=True
-    )
+st.markdown(
+    '<div style="text-align: center; color: #666; font-size: 0.8rem;">🎮 Game Recommendation API - Interface simplifiée</div>',
+    unsafe_allow_html=True
+)
