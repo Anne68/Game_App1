@@ -663,7 +663,6 @@ def get_recommendations(request: RecommendationRequest, username: str = Depends(
                     genre_conditions = []
                     for interaction in interactions
             
-        }
         
     except Exception as e:
         logger.error(f"Error fetching user interactions: {e}")
