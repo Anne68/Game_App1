@@ -1,4 +1,4 @@
-# api_games_complete_adapted.py - API adaptée à votre structure BDD
+# api_games_plus.py - Version corrigée
 from __future__ import annotations
 
 import os
@@ -20,12 +20,10 @@ from passlib.context import CryptContext
 from prometheus_client import Counter, Gauge, Histogram, Info, generate_latest, CONTENT_TYPE_LATEST
 from prometheus_fastapi_instrumentator import Instrumentator
 
-# Imports existants (adaptez selon vos modules)
+# Imports locaux avec gestion d'erreur
 try:
     from settings import get_settings
-    from monitoring_metrics import get_monitor
 except ImportError:
-    # Fallback si les modules n'existent pas
     class MockSettings:
         db_configured = True
         DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -41,7 +39,10 @@ except ImportError:
     
     def get_settings():
         return MockSettings()
-    
+
+try:
+    from monitoring_metrics import get_monitor
+except ImportError:
     class MockMonitor:
         def record_prediction(self, *args, **kwargs):
             pass
@@ -52,18 +53,11 @@ except ImportError:
 logger = logging.getLogger("games-api")
 settings = get_settings()
 
-# =========================
-# CONFIGURATION AUTH
-# =========================
-
+# Configuration auth
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# =========================
-# MODELS PYDANTIC
-# =========================
-
-# Models d'authentification
+# Models Pydantic
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
@@ -79,7 +73,6 @@ class UserResponse(BaseModel):
     created_at: Optional[str] = None
     is_active: bool = True
 
-# Models pour les jeux
 class GameResponse(BaseModel):
     game_id_rawg: int
     title: str
@@ -96,7 +89,6 @@ class GameWithPriceResponse(GameResponse):
     site_url_PC: Optional[str] = None
     similarity_score: Optional[float] = None
 
-# Models pour les prix
 class PriceInfo(BaseModel):
     title: str
     best_price_PC: Optional[str] = None
@@ -106,7 +98,6 @@ class PriceInfo(BaseModel):
     similarity_score: Optional[float] = None
     last_update: Optional[str] = None
 
-# Models pour les recommandations
 class RecommendationRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
     k: int = Field(default=10, ge=1, le=50)
@@ -120,14 +111,12 @@ class RecommendationResponse(BaseModel):
     total_results: int
     filters_applied: Dict[str, Any]
 
-# Models pour les interactions utilisateur
 class UserInteraction(BaseModel):
     user_id: int
     game_id_rawg: int
     interaction_type: str
     rating: Optional[float] = None
 
-# Models pour la wishlist
 class WishlistItem(BaseModel):
     game_id_rawg: int
     target_price: Optional[float] = None
@@ -144,7 +133,6 @@ class WishlistResponse(BaseModel):
     alert_triggered: bool = False
     created_at: Optional[str] = None
 
-# Models pour les statistiques
 class StatsResponse(BaseModel):
     total_games: int
     total_games_with_prices: int
@@ -152,10 +140,7 @@ class StatsResponse(BaseModel):
     high_quality_matches: int
     last_extraction: Optional[str] = None
 
-# =========================
-# FASTAPI APP SETUP
-# =========================
-
+# FastAPI app setup
 app = FastAPI(
     title="Anne's Games API - Complete Edition",
     version="4.0.0",
@@ -176,10 +161,7 @@ app.add_middleware(
 # Variables globales
 DB_READY: bool = False
 
-# =========================
-# ENDPOINTS RACINE ET HEALTH
-# =========================
-
+# Endpoints racine et health
 @app.get("/", include_in_schema=False)
 def root():
     """Endpoint racine"""
@@ -214,10 +196,7 @@ def get_metrics():
         media_type=CONTENT_TYPE_LATEST
     )
 
-# =========================
-# UTILITAIRES BASE DE DONNÉES
-# =========================
-
+# Utilitaires base de données
 def get_db_conn():
     """Fonction de connexion DB"""
     import pymysql
@@ -235,10 +214,7 @@ def get_db_conn():
         autocommit=True
     )
 
-# =========================
-# FONCTIONS D'AUTHENTIFICATION
-# =========================
-
+# Fonctions d'authentification
 def hash_password(password: str) -> str:
     """Hache un mot de passe"""
     return pwd_ctx.hash(password)
@@ -312,10 +288,7 @@ def get_user_id_from_username(username: str) -> int:
     # Fallback: utiliser un hash du username
     return abs(hash(username)) % 1000000
 
-# =========================
-# ENDPOINTS D'AUTHENTIFICATION
-# =========================
-
+# Endpoints d'authentification
 @app.post("/register", tags=["auth"], response_model=UserResponse, status_code=201)
 def register_user(user_data: UserCreate):
     """Inscription d'un nouvel utilisateur"""
@@ -391,10 +364,7 @@ def get_current_user(username: str = Depends(verify_token)):
         is_active=True
     )
 
-# =========================
-# ENDPOINTS JEUX
-# =========================
-
+# Endpoints jeux
 @app.get("/games", tags=["games"], response_model=List[GameResponse])
 def get_games(
     limit: int = Query(default=50, ge=1, le=500),
@@ -536,10 +506,7 @@ def search_games(
         logger.error(f"Error searching games: {e}")
         raise HTTPException(status_code=500, detail="Failed to search games")
 
-# =========================
-# ENDPOINTS PRIX
-# =========================
-
+# Endpoints prix
 @app.get("/prices", tags=["prices"], response_model=List[PriceInfo])
 def get_prices(
     limit: int = Query(default=50, ge=1, le=500),
@@ -621,10 +588,7 @@ def search_prices(
         logger.error(f"Error searching prices: {e}")
         raise HTTPException(status_code=500, detail="Failed to search prices")
 
-# =========================
-# ENDPOINTS RECOMMANDATIONS
-# =========================
-
+# Endpoints recommandations - SECTION CORRIGÉE
 @app.post("/recommend", tags=["recommendations"], response_model=RecommendationResponse)
 def get_recommendations(request: RecommendationRequest, username: str = Depends(verify_token)):
     """Système de recommandation basé sur les données utilisateur"""
@@ -661,441 +625,7 @@ def get_recommendations(request: RecommendationRequest, username: str = Depends(
                 # Filtrer par genres
                 if request.genres:
                     genre_conditions = []
-                    for interaction in interactions
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"Error fetching user interactions: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch interactions")
-
-# =========================
-# ENDPOINTS WISHLIST
-# =========================
-
-@app.post("/wishlist", tags=["wishlist"], status_code=201)
-def add_to_wishlist(item: WishlistItem, username: str = Depends(verify_token)):
-    """Ajoute un jeu à la wishlist"""
-    
-    try:
-        user_id = get_user_id_from_username(username)
-        
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                # Vérifier si le jeu existe
-                cur.execute("SELECT title FROM games WHERE game_id_rawg = %s", (item.game_id_rawg,))
-                game = cur.fetchone()
-                if not game:
-                    raise HTTPException(status_code=404, detail="Game not found")
-                
-                # Créer la table wishlist si elle n'existe pas
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS wishlist (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        user_id INT NOT NULL,
-                        game_id_rawg INT NOT NULL,
-                        target_price DECIMAL(10,2),
-                        currency VARCHAR(3) DEFAULT 'EUR',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        UNIQUE KEY unique_user_game (user_id, game_id_rawg),
-                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                        FOREIGN KEY (game_id_rawg) REFERENCES games(game_id_rawg) ON DELETE CASCADE
-                    )
-                """)
-                
-                # Ajouter à la wishlist
-                cur.execute("""
-                    INSERT INTO wishlist (user_id, game_id_rawg, target_price, currency)
-                    VALUES (%s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                    target_price = VALUES(target_price),
-                    currency = VALUES(currency),
-                    is_active = TRUE
-                """, (user_id, item.game_id_rawg, item.target_price, item.currency))
-                
-                wishlist_id = cur.lastrowid or cur.execute("SELECT id FROM wishlist WHERE user_id = %s AND game_id_rawg = %s", (user_id, item.game_id_rawg)) or cur.fetchone()["id"]
-        
-        return {
-            "id": wishlist_id,
-            "message": "Game added to wishlist successfully",
-            "game_title": game["title"],
-            "target_price": item.target_price,
-            "currency": item.currency
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error adding to wishlist: {e}")
-        raise HTTPException(status_code=500, detail="Failed to add to wishlist")
-
-@app.get("/wishlist", tags=["wishlist"], response_model=List[WishlistResponse])
-def get_user_wishlist(username: str = Depends(verify_token), active_only: bool = True):
-    """Récupère la wishlist de l'utilisateur"""
-    
-    try:
-        user_id = get_user_id_from_username(username)
-        
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                sql = """
-                    SELECT w.*, g.title, p.best_price_PC
-                    FROM wishlist w
-                    JOIN games g ON w.game_id_rawg = g.game_id_rawg
-                    LEFT JOIN best_price_pc p ON g.title = p.title
-                    WHERE w.user_id = %s
-                """
-                params = [user_id]
-                
-                if active_only:
-                    sql += " AND w.is_active = TRUE"
-                
-                sql += " ORDER BY w.created_at DESC"
-                
-                cur.execute(sql, params)
-                wishlist_items = cur.fetchall()
-        
-        def parse_price(price_str):
-            """Parse price string to float"""
-            if not price_str:
-                return None
-            # Remove currency symbols and convert to float
-            price_clean = re.sub(r'[€$£]', '', price_str).replace(',', '.')
-            try:
-                return float(price_clean)
-            except:
-                return None
-        
-        results = []
-        for item in wishlist_items:
-            current_price_str = item.get("best_price_PC")
-            current_price = parse_price(current_price_str)
-            
-            # Calculate price difference and alert
-            price_difference = None
-            alert_triggered = False
-            
-            if current_price and item.get("target_price"):
-                price_difference = current_price - float(item["target_price"])
-                alert_triggered = current_price <= float(item["target_price"])
-            
-            results.append(WishlistResponse(
-                id=item["id"],
-                game_id_rawg=item["game_id_rawg"],
-                title=item["title"],
-                target_price=float(item["target_price"]) if item.get("target_price") else None,
-                current_price=current_price_str,
-                price_difference=price_difference,
-                alert_triggered=alert_triggered,
-                created_at=item["created_at"].isoformat() if item.get("created_at") else None
-            ))
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"Error fetching wishlist: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch wishlist")
-
-@app.delete("/wishlist/{wishlist_id}", tags=["wishlist"])
-def remove_from_wishlist(wishlist_id: int, username: str = Depends(verify_token)):
-    """Supprime un item de la wishlist"""
-    
-    try:
-        user_id = get_user_id_from_username(username)
-        
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                # Vérifier que l'item appartient à l'utilisateur
-                cur.execute("""
-                    DELETE FROM wishlist 
-                    WHERE id = %s AND user_id = %s
-                """, (wishlist_id, user_id))
-                
-                if cur.rowcount == 0:
-                    raise HTTPException(status_code=404, detail="Wishlist item not found")
-        
-        return {"message": "Item removed from wishlist successfully"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error removing from wishlist: {e}")
-        raise HTTPException(status_code=500, detail="Failed to remove from wishlist")
-
-@app.get("/wishlist/alerts", tags=["wishlist"])
-def get_price_alerts(username: str = Depends(verify_token)):
-    """Récupère les alertes de prix pour l'utilisateur"""
-    
-    try:
-        user_id = get_user_id_from_username(username)
-        
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT w.*, g.title, p.best_price_PC, p.best_shop_PC, p.site_url_PC
-                    FROM wishlist w
-                    JOIN games g ON w.game_id_rawg = g.game_id_rawg
-                    JOIN best_price_pc p ON g.title = p.title
-                    WHERE w.user_id = %s AND w.is_active = TRUE
-                    AND w.target_price IS NOT NULL
-                """, (user_id,))
-                
-                wishlist_items = cur.fetchall()
-        
-        alerts = []
-        for item in wishlist_items:
-            if item.get("best_price_PC"):
-                # Parse current price
-                current_price_str = item["best_price_PC"]
-                price_clean = re.sub(r'[€$£]', '', current_price_str).replace(',', '.')
-                try:
-                    current_price = float(price_clean)
-                    target_price = float(item["target_price"])
-                    
-                    if current_price <= target_price:
-                        alerts.append({
-                            "wishlist_id": item["id"],
-                            "game_id_rawg": item["game_id_rawg"],
-                            "title": item["title"],
-                            "current_price": current_price_str,
-                            "target_price": target_price,
-                            "savings": target_price - current_price,
-                            "shop": item.get("best_shop_PC"),
-                            "url": item.get("site_url_PC"),
-                            "alert_triggered_at": datetime.utcnow().isoformat()
-                        })
-                except ValueError:
-                    continue
-        
-        return {
-            "user_id": user_id,
-            "alerts": alerts,
-            "total_alerts": len(alerts)
-        }
-        
-    except Exception as e:
-        logger.error(f"Error fetching price alerts: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch price alerts")
-
-# =========================
-# ENDPOINTS STATISTIQUES
-# =========================
-
-@app.get("/stats", tags=["statistics"], response_model=StatsResponse)
-def get_stats():
-    """Récupère les statistiques générales de l'API"""
-    
-    try:
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                # Total des jeux
-                cur.execute("SELECT COUNT(*) as total FROM games")
-                total_games = cur.fetchone()["total"]
-                
-                # Jeux avec prix
-                cur.execute("SELECT COUNT(*) as total FROM best_price_pc")
-                total_with_prices = cur.fetchone()["total"]
-                
-                # Statistiques de similarité
-                cur.execute("""
-                    SELECT 
-                        AVG(similarity_score) as avg_similarity,
-                        COUNT(CASE WHEN similarity_score >= 0.8 THEN 1 END) as high_quality
-                    FROM best_price_pc 
-                    WHERE similarity_score IS NOT NULL
-                """)
-                similarity_stats = cur.fetchone()
-                
-                # Dernière extraction
-                cur.execute("SELECT last_extraction FROM api_state ORDER BY id DESC LIMIT 1")
-                last_extraction_row = cur.fetchone()
-                last_extraction = last_extraction_row["last_extraction"] if last_extraction_row else None
-        
-        return StatsResponse(
-            total_games=total_games,
-            total_games_with_prices=total_with_prices,
-            avg_similarity_score=float(similarity_stats["avg_similarity"]) if similarity_stats["avg_similarity"] else None,
-            high_quality_matches=similarity_stats["high_quality"],
-            last_extraction=last_extraction.isoformat() if last_extraction else None
-        )
-        
-    except Exception as e:
-        logger.error(f"Error fetching stats: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch statistics")
-
-@app.get("/stats/user", tags=["statistics"])
-def get_user_stats(username: str = Depends(verify_token)):
-    """Récupère les statistiques personnalisées de l'utilisateur"""
-    
-    try:
-        user_id = get_user_id_from_username(username)
-        
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                # Interactions utilisateur
-                cur.execute("""
-                    SELECT 
-                        COUNT(*) as total_interactions,
-                        COUNT(DISTINCT interaction_type) as unique_interaction_types,
-                        AVG(rating) as avg_user_rating
-                    FROM user_interactions 
-                    WHERE user_id = %s
-                """, (user_id,))
-                interaction_stats = cur.fetchone()
-                
-                # Wishlist stats
-                cur.execute("""
-                    SELECT 
-                        COUNT(*) as total_wishlist_items,
-                        COUNT(CASE WHEN is_active THEN 1 END) as active_items
-                    FROM wishlist 
-                    WHERE user_id = %s
-                """, (user_id,))
-                wishlist_stats = cur.fetchone()
-                
-                # Genres préférés basés sur les interactions
-                cur.execute("""
-                    SELECT g.genres, COUNT(*) as interaction_count
-                    FROM user_interactions ui
-                    JOIN games g ON ui.game_id_rawg = g.game_id_rawg
-                    WHERE ui.user_id = %s AND g.genres IS NOT NULL
-                    GROUP BY g.genres
-                    ORDER BY interaction_count DESC
-                    LIMIT 5
-                """, (user_id,))
-                favorite_genres = cur.fetchall()
-        
-        return {
-            "user_id": user_id,
-            "username": username,
-            "interactions": {
-                "total": interaction_stats["total_interactions"],
-                "unique_types": interaction_stats["unique_interaction_types"],
-                "avg_rating": float(interaction_stats["avg_user_rating"]) if interaction_stats["avg_user_rating"] else None
-            },
-            "wishlist": {
-                "total_items": wishlist_stats["total_wishlist_items"],
-                "active_items": wishlist_stats["active_items"]
-            },
-            "favorite_genres": [
-                {
-                    "genres": genre["genres"],
-                    "interaction_count": genre["interaction_count"]
-                }
-                for genre in favorite_genres
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"Error fetching user stats: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch user statistics")
-
-# =========================
-# ENDPOINTS ADMIN
-# =========================
-
-@app.get("/admin/health-detailed", tags=["admin"])
-def detailed_health_check(username: str = Depends(verify_token)):
-    """Health check détaillé pour les administrateurs"""
-    
-    try:
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                # Vérifier toutes les tables
-                tables_status = {}
-                tables = ["games", "users", "best_price_pc", "api_state", "user_interactions"]
-                
-                for table in tables:
-                    try:
-                        cur.execute(f"SELECT COUNT(*) as count FROM {table}")
-                        count = cur.fetchone()["count"]
-                        tables_status[table] = {"status": "ok", "count": count}
-                    except Exception as e:
-                        tables_status[table] = {"status": "error", "error": str(e)}
-                
-                # État de l'API
-                cur.execute("SELECT * FROM api_state ORDER BY id DESC LIMIT 1")
-                api_state = cur.fetchone()
-        
-        return {
-            "database": "connected",
-            "tables": tables_status,
-            "api_state": {
-                "last_page": api_state["last_page"] if api_state else None,
-                "last_extraction": api_state["last_extraction"].isoformat() if api_state and api_state["last_extraction"] else None,
-                "total_games_extracted": api_state["total_games_extracted"] if api_state else None
-            },
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in detailed health check: {e}")
-        raise HTTPException(status_code=500, detail="Health check failed")
-
-# =========================
-# HEALTH & MONITORING
-# =========================
-
-@app.get("/healthz", tags=["system"])
-def healthz():
-    """Health check simple"""
-    
-    try:
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-        
-        return {
-            "status": "healthy",
-            "timestamp": datetime.utcnow().isoformat(),
-            "database": "connected"
-        }
-        
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "timestamp": datetime.utcnow().isoformat(),
-            "database": "disconnected",
-            "error": str(e)
-        }
-
-# =========================
-# STARTUP EVENT
-# =========================
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialisation au démarrage"""
-    global DB_READY
-    
-    logger.info("Starting Anne's Games API...")
-    
-    try:
-        if settings.db_configured:
-            with get_db_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT VERSION()")
-                    version = cur.fetchone()
-                    logger.info(f"Database connected: {version['VERSION()']}")
-            
-            DB_READY = True
-            logger.info("Database connection established")
-            
-        else:
-            logger.warning("Database not configured")
-            
-    except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-        if settings.DB_REQUIRED:
-            raise
-    
-    logger.info("Anne's Games API startup completed")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) genre in request.genres:
+                    for genre in request.genres:
                         genre_conditions.append("g.genres LIKE %s")
                         params.append(f"%{genre}%")
                     sql += " AND (" + " OR ".join(genre_conditions) + ")"
@@ -1117,7 +647,8 @@ if __name__ == "__main__":
                 # Exclure les jeux déjà dans les interactions de l'utilisateur
                 if user_interactions:
                     interacted_games = [str(interaction["game_id_rawg"]) for interaction in user_interactions]
-                    sql += f" AND g.game_id_rawg NOT IN ({','.join(interacted_games)})"
+                    sql += f" AND g.game_id_rawg NOT IN ({','.join(['%s'] * len(interacted_games))})"
+                    params.extend(interacted_games)
                 
                 sql += " ORDER BY g.rating DESC, g.metacritic DESC LIMIT %s"
                 params.append(request.k)
@@ -1159,10 +690,7 @@ if __name__ == "__main__":
         logger.error(f"Error generating recommendations: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate recommendations")
 
-# =========================
-# ENDPOINTS INTERACTIONS UTILISATEUR
-# =========================
-
+# Endpoints interactions utilisateur
 @app.post("/interactions", tags=["user-data"], status_code=201)
 def add_user_interaction(
     game_id_rawg: int,
@@ -1237,4 +765,23 @@ def get_user_interactions(username: str = Depends(verify_token)):
                     "game_rating": interaction.get("rating"),
                     "genres": interaction.get("genres")
                 }
-                for
+                for interaction in interactions
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching user interactions: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch interactions")
+
+# Health et monitoring
+@app.get("/healthz", tags=["system"])
+def healthz():
+    """Health check simple"""
+    
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        
+        return {
