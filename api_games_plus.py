@@ -16,7 +16,7 @@ from settings import get_settings
 from monitoring_metrics import get_monitor, prediction_latency, model_prediction_counter
 
 # Nouveaux imports
-from enhanced_model_manager import get_hybrid_model, reset_hybrid_model, HybridRecommendationModel
+from model_manager import get_hybrid_model, reset_hybrid_model, HybridRecommendationModel
 from wishlist_manager import (
     WishlistManager, WishlistAddRequest, WishlistUpdateRequest, 
     WishlistResponse, NotificationResponse
