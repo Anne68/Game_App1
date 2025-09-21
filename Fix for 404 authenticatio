@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""
+Fix for 404 authentication error in Swagger UI
+This script ensures the /token endpoint is properly configured
+"""
+
+import re
+from pathlib import Path
+
+def fix_auth_endpoints():
+    """Fix authentication endpoints in api_games_plus.py"""
+    
+    api_file = Path("api_games_plus.py")
+    
+    if not api_file.exists():
+        print("❌ api_games_plus.py not found")
+        return False
+    
+    with open(api_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Check if authentication endpoints exist
+    has_token_endpoint = "/token" in content and "@app.post" in content
+    has_register_endpoint = "/register" in content and "@app.post" in content
+    
+    if has_token_endpoint and has_register_endpoint:
+        print("✅ Authentication endpoints already exist")
+        return True
+    
+    # Add authentication endpoints if missing
+    auth_endpoints = '''
+# ========================= AUTHENTICATION ENDPOINTS =========================
+
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
+# Security setup
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+def authenticate_user(username: str, password: str):
+    """Authenticate user with database or demo credentials"""
+    
+    # Demo authentication
+    if (settings.DEMO_LOGIN_ENABLED and 
+        username == settings.DEMO_USERNAME and 
+        password == settings.DEMO_PASSWORD):
+        return {"username": username, "id": 1}
+    
+    # Database authentication
+    if not settings.db_configured:
+        return None
+    
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, username, hashed_password FROM users WHERE username = %s", (username,))
+                user = cur.fetchone()
+                
+                if user and verify_password(password, user["hashed_password"]):
+                    return {"username": user["username"], "id": user["id"]}
+    except Exception as e:
+        logger.error(f"Database authentication error: {e}")
+    
+    return None
+
+def verify_token(token: str = Depends(oauth2_scheme)) -> str:
+    """Verify JWT token and return username"""
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        return username
+    except JWTError:
+        raise credentials_exception
+
+@app.post("/token", tags=["auth"])
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    """Authenticate and return access token"""
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["username"]}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    }
+
+@app.post("/register", tags=["auth"])
+async def register_user(form_data: OAuth2PasswordRequestForm = Depends()):
+    """Register a new user"""
+    
+    if not settings.db_configured:
+        # For demo mode, just return success
+        if settings.DEMO_LOGIN_ENABLED:
+            return {"message": "Demo mode - registration simulated", "username": form_data.username}
+        else:
+            raise HTTPException(status_code=503, detail="Registration not available without database")
+    
+    try:
+        hashed_password = get_password_hash(form_data.password)
+        
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Check if user already exists
+                cur.execute("SELECT username FROM users WHERE username = %s", (form_data.username,))
+                if cur.fetchone():
+                    raise HTTPException(status_code=400, detail="Username already registered")
+                
+                # Create user
+                cur.execute(
+                    "INSERT INTO users (username, hashed_password) VALUES (%s, %s)",
+                    (form_data.username, hashed_password)
+                )
+            conn.commit()
+        
+        return {"message": "User registered successfully", "username": form_data.username}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration error: {e}")
+        raise HTTPException(status_code=500, detail="Registration failed")
+
+def get_user_id_from_username(username: str) -> int:
+    """Get user ID from username"""
+    if settings.DEMO_LOGIN_ENABLED and username == settings.DEMO_USERNAME:
+        return 1
+    
+    if settings.db_configured:
+        try:
+            with get_db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+                    row = cur.fetchone()
+                    if row:
+                        return int(row["id"])
+        except Exception as e:
+            logger.error(f"Error getting user ID: {e}")
+    
+    # Fallback: use hash of username
+    return abs(hash(username)) % 1000000
+
+# =============================================================================
+'''
+    
+    # Find where to insert the authentication endpoints
+    # Look for the imports section
+    imports_end_pattern = r'(from monitoring_metrics import.*?\n)'
+    
+    if re.search(imports_end_pattern, content, re.DOTALL):
+        content = re.sub(
+            imports_end_pattern,
+            r'\1' + auth_endpoints,
+            content,
+            flags=re.DOTALL
+        )
+    else:
+        # If imports pattern not found, add after app creation
+        app_creation_pattern = r'(app = FastAPI\(.*?\)\n)'
+        if re.search(app_creation_pattern, content, re.DOTALL):
+            content = re.sub(
+                app_creation_pattern,
+                r'\1' + auth_endpoints,
+                content,
+                flags=re.DOTALL
+            )
+        else:
+            # As last resort, add at the end
+            content += auth_endpoints
+    
+    # Write the updated content
+    with open(api_file, 'w', encoding='utf-8') as f:
+        f.write(content)
+    
+    print("✅ Added authentication endpoints")
+    return True
+
+def ensure_users_table():
+    """Ensure users table exists if database is configured"""
+    
+    users_table_sql = '''
+def ensure_users_table():
+    """Create users table if it doesn't exist"""
+    if not settings.db_configured:
+        return
+    
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        username VARCHAR(190) UNIQUE NOT NULL,
+                        hashed_password VARCHAR(255) NOT NULL,
+                        email VARCHAR(255) NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        
+                        INDEX idx_username (username),
+                        INDEX idx_created_at (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """)
+            conn.commit()
+        logger.info("Users table ensured")
+    except Exception as e:
+        logger.warning(f"Could not create users table: {e}")
+'''
+    
+    # Add the table creation function
+    api_file = Path("api_games_plus.py")
+    with open(api_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    if "def ensure_users_table" not in content:
+        # Add before startup event
+        startup_pattern = r'(@app\.on_event\("startup"\))'
+        content = re.sub(
+            startup_pattern,
+            users_table_sql + r'\n\1',
+            content
+        )
+        
+        with open(api_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        print("✅ Added users table creation function")
+
+def fix_startup_event():
+    """Ensure startup event calls ensure_users_table()"""
+    
+    api_file = Path("api_games_plus.py")
+    with open(api_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Check if ensure_users_table is called in startup
+    if "ensure_users_table()" not in content:
+        # Find startup event and add the call
+        startup_pattern = r'(async def startup_event\(\):.*?logger\.info\(".*?"\))'
+        
+        replacement = r'\1\n    \n    # Ensure users table exists\n    ensure_users_table()'
+        
+        content = re.sub(startup_pattern, replacement, content, flags=re.DOTALL)
+        
+        with open(api_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        print("✅ Added ensure_users_table() call to startup")
+
+def test_auth_locally():
+    """Test authentication endpoints locally"""
+    
+    print("\n🧪 Testing authentication locally...")
+    
+    try:
+        import os
+        os.environ.update({
+            'SECRET_KEY': 'test-secret-key-for-auth-testing-very-long',
+            'DB_REQUIRED': 'false',
+            'DEMO_LOGIN_ENABLED': 'true',
+            'DEMO_USERNAME': 'demo',
+            'DEMO_PASSWORD': 'demo123',
+            'ACCESS_TOKEN_EXPIRE_MINUTES': '60'
+        })
+        
+        from fastapi.testclient import TestClient
+        import api_games_plus
+        
+        client = TestClient(api_games_plus.app)
+        
+        # Test token endpoint exists
+        response = client.post("/token", data={
+            "username": "demo",
+            "password": "demo123"
+        })
+        
+        print(f"Token endpoint status: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            print("✅ Authentication working!")
+            print(f"   Access token: {data.get('access_token', 'N/A')[:20]}...")
+            return True
+        else:
+            print(f"❌ Auth failed: {response.text}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Auth test error: {e}")
+        return False
+
+def main():
+    """Fix authentication 404 error"""
+    
+    print("🔧 FIXING AUTHENTICATION 404 ERROR")
+    print("=" * 40)
+    
+    fixes = [
+        ("Fix authentication endpoints", fix_auth_endpoints),
+        ("Ensure users table function", ensure_users_table),
+        ("Fix startup event", fix_startup_event),
+        ("Test authentication locally", test_auth_locally)
+    ]
+    
+    success_count = 0
+    
+    for name, fix_func in fixes:
+        print(f"\n📋 {name}...")
+        try:
+            if fix_func():
+                success_count += 1
+        except Exception as e:
+            print(f"❌ {name} failed: {e}")
+    
+    print(f"\n🎯 RESULTS: {success_count}/{len(fixes)} fixes applied")
+    
+    if success_count >= 3:
+        print("\n✅ AUTHENTICATION FIXES APPLIED!")
+        print("\n📋 Next steps:")
+        print("1. Commit the changes:")
+        print("   git add api_games_plus.py")
+        print("   git commit -m 'fix: Add missing authentication endpoints'")
+        print("   git push")
+        print()
+        print("2. Wait for Render deployment to complete")
+        print()
+        print("3. Test in Swagger UI:")
+        print("   - Go to https://game-app-y8be.onrender.com/docs")
+        print("   - Try the /token endpoint with demo/demo123")
+        print("   - Use 'demo' as username and 'demo123' as password")
+        print()
+        print("🎯 The 404 auth error should be resolved!")
+        return True
+    else:
+        print("\n❌ Some fixes failed")
+        return False
+
+if __name__ == "__main__":
+    success = main()
+    exit(0 if success else 1)
