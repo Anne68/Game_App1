@@ -1,11 +1,15 @@
-# api_games_plus.py — version corrigée
+# api_games_plus.py - Version corrigée (même structure d'endpoints)
 from __future__ import annotations
 
 import os
+import asyncio  # conservé comme dans ton exemple
 import logging
+import re       # conservé
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any
-from fastapi import FastAPI, HTTPException, Depends, Response, Query
+from typing import List, Dict, Optional, Any, Union
+from decimal import Decimal
+
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
@@ -13,59 +17,50 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 
 # Prometheus
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, Histogram, Info, generate_latest, CONTENT_TYPE_LATEST
 from prometheus_fastapi_instrumentator import Instrumentator
 
-
-# ---------------------------
-# Fallback settings (si import échoue)
-# ---------------------------
+# --- Imports locaux avec gestion d'erreur
 try:
-    from settings import get_settings  # type: ignore
-except Exception:
-    class _MockSettings:
-        db_configured: bool = True
-        DB_HOST: str = os.getenv("DB_HOST", "localhost")
-        DB_PORT: int = int(os.getenv("DB_PORT", "3306"))
-        DB_USER: str = os.getenv("DB_USER", "root")
-        DB_PASSWORD: str = os.getenv("DB_PASSWORD", "")
-        DB_NAME: str = os.getenv("DB_NAME", "anne_games_db")
-        ALLOW_ORIGINS: str = os.getenv("ALLOW_ORIGINS", "*")
-        SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-here")
-        ALGORITHM: str = "HS256"
-        ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
-        DB_REQUIRED: bool = False
+    from settings import get_settings
+except ImportError:
+    class MockSettings:
+        db_configured = True
+        DB_HOST = os.getenv("DB_HOST", "localhost")
+        DB_PORT = int(os.getenv("DB_PORT", "3306"))
+        DB_USER = os.getenv("DB_USER", "root")
+        DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+        DB_NAME = os.getenv("DB_NAME", "anne_games_db")
+        ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
+        SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here")
+        ALGORITHM = "HS256"
+        ACCESS_TOKEN_EXPIRE_MINUTES = 1440
+        DB_REQUIRED = True
 
-    def get_settings() -> _MockSettings:  # type: ignore
-        return _MockSettings()
+    def get_settings():
+        return MockSettings()
 
-# Monitoring mock (optionnel)
 try:
-    from monitoring_metrics import get_monitor  # type: ignore
-except Exception:
-    class _MockMonitor:
-        def record_prediction(self, *args, **kwargs) -> None:
+    from monitoring_metrics import get_monitor
+except ImportError:
+    class MockMonitor:
+        def record_prediction(self, *args, **kwargs):
             pass
 
-    def get_monitor() -> _MockMonitor:  # type: ignore
-        return _MockMonitor()
-
+    def get_monitor():
+        return MockMonitor()
 
 logger = logging.getLogger("games-api")
 logging.basicConfig(level=logging.INFO)
 
 settings = get_settings()
 
-# ---------------------------
-# Auth config
-# ---------------------------
+# --- Configuration auth
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-# ---------------------------
-# Pydantic models
-# ---------------------------
+# --- Models Pydantic
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
@@ -160,15 +155,14 @@ class StatsResponse(BaseModel):
     last_extraction: Optional[str] = None
 
 
-# ---------------------------
-# FastAPI app
-# ---------------------------
+# --- FastAPI app setup
 app = FastAPI(
     title="Anne's Games API - Complete Edition",
     version="4.0.0",
     description="API complète pour les jeux avec authentification, recommandations, prix et wishlist",
 )
 
+# Prometheus/metrics
 Instrumentator().instrument(app).expose(app, include_in_schema=True)
 
 app.add_middleware(
@@ -179,14 +173,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Variables globales
 DB_READY: bool = False
 
 
-# ---------------------------
-# Root & metrics
-# ---------------------------
+# --- Endpoints racine et health
 @app.get("/", include_in_schema=False)
 def root():
+    """Endpoint racine"""
     return {
         "name": app.title,
         "version": app.version,
@@ -208,21 +202,22 @@ def root():
 
 @app.head("/", include_in_schema=False)
 def head_root():
+    """Health probe HEAD pour Render"""
     return Response(status_code=200)
 
 
 @app.get("/metrics", include_in_schema=False)
 def get_metrics():
+    """Endpoint Prometheus pour les métriques"""
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-# ---------------------------
-# DB util
-# ---------------------------
+# --- Utilitaires base de données
 def get_db_conn():
-    import pymysql  # lazy import
+    """Fonction de connexion DB"""
+    import pymysql
 
-    if not getattr(settings, "db_configured", True):
+    if not settings.db_configured:
         raise RuntimeError("Database not configured")
 
     return pymysql.connect(
@@ -236,60 +231,65 @@ def get_db_conn():
     )
 
 
-# ---------------------------
-# Auth helpers
-# ---------------------------
+# --- Fonctions d'authentification
 def hash_password(password: str) -> str:
+    """Hache un mot de passe"""
     return pwd_ctx.hash(password)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Vérifie un mot de passe"""
     try:
         return pwd_ctx.verify(plain_password, hashed_password)
     except Exception:
         return False
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Crée un token JWT"""
     to_encode = data.copy()
     expire = datetime.utcnow() + (
         expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
 
 
-def get_user_from_db(username: str) -> Optional[Dict[str, Any]]:
+def get_user_from_db(username: str) -> Optional[Dict]:
+    """Récupère un utilisateur de la base de données"""
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, username,
-                       COALESCE(hashed_password, password_hash) AS password_hash
-                FROM users
-                WHERE username = %s
-                """,
-                (username,),
-            )
-            return cur.fetchone()
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, username,
+                           COALESCE(hashed_password, password_hash) as password_hash
+                    FROM users WHERE username = %s
+                    """,
+                    (username,),
+                )
+                return cur.fetchone()
     except Exception as e:
         logger.error(f"Error getting user from database: {e}")
         return None
 
 
-def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:
+def authenticate_user(username: str, password: str) -> Optional[Dict]:
+    """Authentifie un utilisateur"""
     user = get_user_from_db(username)
     if not user:
         return None
-    if not verify_password(password, user.get("password_hash") or ""):
+    if not verify_password(password, user["password_hash"]):
         return None
     return user
 
 
 def verify_token(token: str = Depends(oauth2_scheme)) -> str:
+    """Vérifie le token JWT"""
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: Optional[str] = payload.get("sub")
+        username: str = payload.get("sub")
         if not username:
             raise HTTPException(status_code=401, detail="Invalid token")
         return username
@@ -298,40 +298,47 @@ def verify_token(token: str = Depends(oauth2_scheme)) -> str:
 
 
 def get_user_id_from_username(username: str) -> int:
+    """Récupère l'ID utilisateur à partir du nom d'utilisateur"""
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE username = %s", (username,))
-            row = cur.fetchone()
-            if row:
-                return int(row["id"])
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+                row = cur.fetchone()
+                if row:
+                    return int(row["id"])
     except Exception as e:
         logger.error(f"Error getting user ID: {e}")
-    # Fallback stable
-    return abs(hash(username)) % 1_000_000
+    # Fallback: utiliser un hash du username
+    return abs(hash(username)) % 1000000
 
 
-# ---------------------------
-# Auth endpoints
-# ---------------------------
+# --- Endpoints d'authentification
 @app.post("/register", tags=["auth"], response_model=UserResponse, status_code=201)
 def register_user(user_data: UserCreate):
+    """Inscription d'un nouvel utilisateur"""
     try:
+        # Vérifier si l'utilisateur existe déjà
         existing_user = get_user_from_db(user_data.username)
         if existing_user:
             raise HTTPException(status_code=400, detail="Username already exists")
 
+        # Hacher le mot de passe
         hashed_password = hash_password(user_data.password)
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO users (username, hashed_password) VALUES (%s, %s)",
-                (user_data.username, hashed_password),
-            )
 
+        # Créer l'utilisateur
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO users (username, hashed_password) VALUES (%s, %s)""",
+                    (user_data.username, hashed_password),
+                )
+
+        # Récupérer l'utilisateur créé
         new_user = get_user_from_db(user_data.username)
         assert new_user is not None
         return UserResponse(
-            id=int(new_user["id"]),
-            username=str(new_user["username"]),
+            id=new_user["id"],
+            username=new_user["username"],
             is_active=True,
         )
     except HTTPException:
@@ -343,6 +350,8 @@ def register_user(user_data: UserCreate):
 
 @app.post("/token", tags=["auth"], response_model=Token)
 def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
+    """Connexion utilisateur (obtenir un token JWT)"""
+    # Authentifier l'utilisateur
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
@@ -351,8 +360,11 @@ def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Créer le token
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(data={"sub": user["username"]}, expires_delta=access_token_expires)
+    access_token = create_access_token(
+        data={"sub": user["username"]}, expires_delta=access_token_expires
+    )
     return Token(
         access_token=access_token,
         token_type="bearer",
@@ -362,19 +374,18 @@ def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
 
 @app.get("/me", tags=["auth"], response_model=UserResponse)
 def get_current_user(username: str = Depends(verify_token)):
+    """Récupère les informations de l'utilisateur connecté"""
     user = get_user_from_db(username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return UserResponse(
-        id=int(user["id"]),
-        username=str(user["username"]),
+        id=user["id"],
+        username=user["username"],
         is_active=True,
     )
 
 
-# ---------------------------
-# Games endpoints
-# ---------------------------
+# --- Endpoints jeux
 @app.get("/games", tags=["games"], response_model=List[GameResponse])
 def get_games(
     limit: int = Query(default=50, ge=1, le=500),
@@ -383,39 +394,44 @@ def get_games(
     genre: Optional[str] = Query(default=None),
     platform: Optional[str] = Query(default=None),
 ):
+    """Récupère la liste des jeux avec filtres optionnels"""
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            sql = "SELECT * FROM games WHERE 1=1"
-            params: List[Any] = []
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Construire la requête avec filtres
+                sql = "SELECT * FROM games WHERE 1=1"
+                params: List[Any] = []
 
-            if min_rating is not None:
-                sql += " AND rating >= %s"
-                params.append(min_rating)
-            if genre:
-                sql += " AND genres LIKE %s"
-                params.append(f"%{genre}%")
-            if platform:
-                sql += " AND platforms LIKE %s"
-                params.append(f"%{platform}%")
+                if min_rating is not None:
+                    sql += " AND rating >= %s"
+                    params.append(min_rating)
 
-            sql += " ORDER BY rating DESC LIMIT %s OFFSET %s"
-            params.extend([limit, offset])
+                if genre:
+                    sql += " AND genres LIKE %s"
+                    params.append(f"%{genre}%")
 
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+                if platform:
+                    sql += " AND platforms LIKE %s"
+                    params.append(f"%{platform}%")
+
+                sql += " ORDER BY rating DESC LIMIT %s OFFSET %s"
+                params.extend([limit, offset])
+
+                cur.execute(sql, params)
+                games = cur.fetchall()
 
         return [
             GameResponse(
-                game_id_rawg=row["game_id_rawg"],
-                title=row["title"],
-                release_date=row["release_date"].isoformat() if row.get("release_date") else None,
-                genres=row.get("genres"),
-                platforms=row.get("platforms"),
-                rating=row.get("rating"),
-                metacritic=row.get("metacritic"),
-                last_update=row["last_update"].isoformat() if row.get("last_update") else None,
+                game_id_rawg=game["game_id_rawg"],
+                title=game["title"],
+                release_date=game["release_date"].isoformat() if game["release_date"] else None,
+                genres=game.get("genres"),
+                platforms=game.get("platforms"),
+                rating=game.get("rating"),
+                metacritic=game.get("metacritic"),
+                last_update=game["last_update"].isoformat() if game.get("last_update") else None,
             )
-            for row in rows
+            for game in games
         ]
     except Exception as e:
         logger.error(f"Error fetching games: {e}")
@@ -424,18 +440,21 @@ def get_games(
 
 @app.get("/games/{game_id}", tags=["games"], response_model=GameWithPriceResponse)
 def get_game_by_id(game_id: int):
+    """Récupère un jeu spécifique avec son prix"""
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT g.*, p.best_price_PC, p.best_shop_PC, p.site_url_PC, p.similarity_score
-                FROM games g
-                LEFT JOIN best_price_pc p ON g.title = p.title
-                WHERE g.game_id_rawg = %s
-                """,
-                (game_id,),
-            )
-            game = cur.fetchone()
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Récupérer le jeu avec son prix
+                cur.execute(
+                    """
+                    SELECT g.*, p.best_price_PC, p.best_shop_PC, p.site_url_PC, p.similarity_score
+                    FROM games g
+                    LEFT JOIN best_price_pc p ON g.title = p.title
+                    WHERE g.game_id_rawg = %s
+                    """,
+                    (game_id,),
+                )
+                game = cur.fetchone()
 
         if not game:
             raise HTTPException(status_code=404, detail="Game not found")
@@ -443,7 +462,7 @@ def get_game_by_id(game_id: int):
         return GameWithPriceResponse(
             game_id_rawg=game["game_id_rawg"],
             title=game["title"],
-            release_date=game["release_date"].isoformat() if game.get("release_date") else None,
+            release_date=game["release_date"].isoformat() if game["release_date"] else None,
             genres=game.get("genres"),
             platforms=game.get("platforms"),
             rating=game.get("rating"),
@@ -452,7 +471,7 @@ def get_game_by_id(game_id: int):
             best_price_PC=game.get("best_price_PC"),
             best_shop_PC=game.get("best_shop_PC"),
             site_url_PC=game.get("site_url_PC"),
-            similarity_score=float(game["similarity_score"]) if game.get("similarity_score") is not None else None,
+            similarity_score=float(game["similarity_score"]) if game.get("similarity_score") else None,
         )
     except HTTPException:
         raise
@@ -462,82 +481,88 @@ def get_game_by_id(game_id: int):
 
 
 @app.get("/games/search", tags=["games"], response_model=List[GameWithPriceResponse])
-def search_games(q: str = Query(..., min_length=2), limit: int = Query(default=20, ge=1, le=100)):
+def search_games(
+    q: str = Query(..., min_length=2),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """Recherche de jeux par titre"""
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT g.*, p.best_price_PC, p.best_shop_PC, p.site_url_PC, p.similarity_score
-                FROM games g
-                LEFT JOIN best_price_pc p ON g.title = p.title
-                WHERE g.title LIKE %s
-                ORDER BY g.rating DESC
-                LIMIT %s
-                """,
-                (f"%{q}%", limit),
-            )
-            rows = cur.fetchall()
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT g.*, p.best_price_PC, p.best_shop_PC, p.site_url_PC, p.similarity_score
+                    FROM games g
+                    LEFT JOIN best_price_pc p ON g.title = p.title
+                    WHERE g.title LIKE %s
+                    ORDER BY g.rating DESC
+                    LIMIT %s
+                    """,
+                    (f"%{q}%", limit),
+                )
+                games = cur.fetchall()
 
         return [
             GameWithPriceResponse(
-                game_id_rawg=row["game_id_rawg"],
-                title=row["title"],
-                release_date=row["release_date"].isoformat() if row.get("release_date") else None,
-                genres=row.get("genres"),
-                platforms=row.get("platforms"),
-                rating=row.get("rating"),
-                metacritic=row.get("metacritic"),
-                last_update=row["last_update"].isoformat() if row.get("last_update") else None,
-                best_price_PC=row.get("best_price_PC"),
-                best_shop_PC=row.get("best_shop_PC"),
-                site_url_PC=row.get("site_url_PC"),
-                similarity_score=float(row["similarity_score"]) if row.get("similarity_score") is not None else None,
+                game_id_rawg=game["game_id_rawg"],
+                title=game["title"],
+                release_date=game["release_date"].isoformat() if game["release_date"] else None,
+                genres=game.get("genres"),
+                platforms=game.get("platforms"),
+                rating=game.get("rating"),
+                metacritic=game.get("metacritic"),
+                last_update=game["last_update"].isoformat() if game.get("last_update") else None,
+                best_price_PC=game.get("best_price_PC"),
+                best_shop_PC=game.get("best_shop_PC"),
+                site_url_PC=game.get("site_url_PC"),
+                similarity_score=float(game["similarity_score"]) if game.get("similarity_score") else None,
             )
-            for row in rows
+            for game in games
         ]
     except Exception as e:
         logger.error(f"Error searching games: {e}")
         raise HTTPException(status_code=500, detail="Failed to search games")
 
 
-# ---------------------------
-# Prices endpoints
-# ---------------------------
+# --- Endpoints prix
 @app.get("/prices", tags=["prices"], response_model=List[PriceInfo])
 def get_prices(
     limit: int = Query(default=50, ge=1, le=500),
     min_similarity: Optional[float] = Query(default=0.8, ge=0.0, le=1.0),
     shop: Optional[str] = Query(default=None),
 ):
+    """Récupère les informations de prix"""
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            sql = "SELECT * FROM best_price_pc WHERE 1=1"
-            params: List[Any] = []
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                sql = "SELECT * FROM best_price_pc WHERE 1=1"
+                params: List[Any] = []
 
-            if min_similarity is not None:
-                sql += " AND similarity_score >= %s"
-                params.append(min_similarity)
-            if shop:
-                sql += " AND best_shop_PC LIKE %s"
-                params.append(f"%{shop}%")
+                if min_similarity is not None:
+                    sql += " AND similarity_score >= %s"
+                    params.append(min_similarity)
 
-            sql += " ORDER BY similarity_score DESC LIMIT %s"
-            params.append(limit)
+                if shop:
+                    sql += " AND best_shop_PC LIKE %s"
+                    params.append(f"%{shop}%")
 
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+                sql += " ORDER BY similarity_score DESC LIMIT %s"
+                params.append(limit)
+
+                cur.execute(sql, params)
+                prices = cur.fetchall()
 
         return [
             PriceInfo(
-                title=row["title"],
-                best_price_PC=row.get("best_price_PC"),
-                best_shop_PC=row.get("best_shop_PC"),
-                site_url_PC=row.get("site_url_PC"),
-                game_id_rawg=row.get("game_id_rawg"),
-                similarity_score=float(row["similarity_score"]) if row.get("similarity_score") is not None else None,
-                last_update=row["last_update"].isoformat() if row.get("last_update") else None,
+                title=price["title"],
+                best_price_PC=price.get("best_price_PC"),
+                best_shop_PC=price.get("best_shop_PC"),
+                site_url_PC=price.get("site_url_PC"),
+                game_id_rawg=price.get("game_id_rawg"),
+                similarity_score=float(price["similarity_score"]) if price.get("similarity_score") else None,
+                last_update=price["last_update"].isoformat() if price.get("last_update") else None,
             )
-            for row in rows
+            for price in prices
         ]
     except Exception as e:
         logger.error(f"Error fetching prices: {e}")
@@ -545,109 +570,126 @@ def get_prices(
 
 
 @app.get("/prices/search", tags=["prices"], response_model=List[PriceInfo])
-def search_prices(q: str = Query(..., min_length=2), limit: int = Query(default=20, ge=1, le=100)):
+def search_prices(
+    q: str = Query(..., min_length=2),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """Recherche de prix par titre de jeu"""
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT * FROM best_price_pc
-                WHERE title LIKE %s
-                ORDER BY similarity_score DESC
-                LIMIT %s
-                """,
-                (f"%{q}%", limit),
-            )
-            rows = cur.fetchall()
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM best_price_pc
+                    WHERE title LIKE %s
+                    ORDER BY similarity_score DESC
+                    LIMIT %s
+                    """,
+                    (f"%{q}%", limit),
+                )
+                prices = cur.fetchall()
 
         return [
             PriceInfo(
-                title=row["title"],
-                best_price_PC=row.get("best_price_PC"),
-                best_shop_PC=row.get("best_shop_PC"),
-                site_url_PC=row.get("site_url_PC"),
-                game_id_rawg=row.get("game_id_rawg"),
-                similarity_score=float(row["similarity_score"]) if row.get("similarity_score") is not None else None,
-                last_update=row["last_update"].isoformat() if row.get("last_update") else None,
+                title=price["title"],
+                best_price_PC=price.get("best_price_PC"),
+                best_shop_PC=price.get("best_shop_PC"),
+                site_url_PC=price.get("site_url_PC"),
+                game_id_rawg=price.get("game_id_rawg"),
+                similarity_score=float(price["similarity_score"]) if price.get("similarity_score") else None,
+                last_update=price["last_update"].isoformat() if price.get("last_update") else None,
             )
-            for row in rows
+            for price in prices
         ]
     except Exception as e:
         logger.error(f"Error searching prices: {e}")
         raise HTTPException(status_code=500, detail="Failed to search prices")
 
 
-# ---------------------------
-# Recommendations
-# ---------------------------
+# --- Endpoints recommandations
 @app.post("/recommend", tags=["recommendations"], response_model=RecommendationResponse)
 def get_recommendations(request: RecommendationRequest, username: str = Depends(verify_token)):
+    """Système de recommandation basé sur les données utilisateur"""
     try:
         user_id = get_user_id_from_username(username)
 
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute(
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Récupérer les interactions de l'utilisateur pour personnaliser
+                cur.execute(
+                    """
+                    SELECT game_id_rawg, interaction_type, rating
+                    FROM user_interactions
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                user_interactions = cur.fetchall()
+
+                # Construire une requête de recommandation
+                sql = """
+                    SELECT g.*, p.best_price_PC, p.best_shop_PC, p.site_url_PC, p.similarity_score
+                    FROM games g
+                    LEFT JOIN best_price_pc p ON g.title = p.title
+                    WHERE 1=1
                 """
-                SELECT game_id_rawg, interaction_type, rating
-                FROM user_interactions
-                WHERE user_id = %s
-                """,
-                (user_id,),
-            )
-            user_interactions = cur.fetchall() or []
+                params: List[Any] = []
 
-            sql = """
-                SELECT g.*, p.best_price_PC, p.best_shop_PC, p.site_url_PC, p.similarity_score
-                FROM games g
-                LEFT JOIN best_price_pc p ON g.title = p.title
-                WHERE 1=1
-            """
-            params: List[Any] = []
+                # Filtrer par rating minimum
+                if request.min_rating > 0:
+                    sql += " AND g.rating >= %s"
+                    params.append(request.min_rating)
 
-            if request.min_rating > 0:
-                sql += " AND g.rating >= %s"
-                params.append(request.min_rating)
+                # Filtrer par genres
+                if request.genres:
+                    genre_conditions = []
+                    for genre in request.genres:
+                        genre_conditions.append("g.genres LIKE %s")
+                        params.append(f"%{genre}%")
+                    sql += " AND (" + " OR ".join(genre_conditions) + ")"
 
-            if request.genres:
-                sql += " AND (" + " OR ".join(["g.genres LIKE %s"] * len(request.genres)) + ")"
-                params.extend([f"%{genre}%" for genre in request.genres])
+                # Filtrer par plateformes
+                if request.platforms:
+                    platform_conditions = []
+                    for platform in request.platforms:
+                        platform_conditions.append("g.platforms LIKE %s")
+                        params.append(f"%{platform}%")
+                    sql += " AND (" + " OR ".join(platform_conditions) + ")"
 
-            if request.platforms:
-                sql += " AND (" + " OR ".join(["g.platforms LIKE %s"] * len(request.platforms)) + ")"
-                params.extend([f"%{p}%" for p in request.platforms])
+                # Recherche textuelle si fournie
+                if request.query.strip():
+                    sql += " AND (g.title LIKE %s OR g.genres LIKE %s)"
+                    query_param = f"%{request.query}%"
+                    params.extend([query_param, query_param])
 
-            if request.query.strip():
-                sql += " AND (g.title LIKE %s OR g.genres LIKE %s)"
-                qp = f"%{request.query}%"
-                params.extend([qp, qp])
+                # Exclure les jeux déjà dans les interactions de l'utilisateur
+                if user_interactions:
+                    interacted_games = [str(interaction["game_id_rawg"]) for interaction in user_interactions]
+                    sql += f" AND g.game_id_rawg NOT IN ({','.join(['%s'] * len(interacted_games))})"
+                    params.extend(interacted_games)
 
-            if user_interactions:
-                ids = [str(i["game_id_rawg"]) for i in user_interactions]
-                placeholders = ",".join(["%s"] * len(ids))
-                sql += f" AND g.game_id_rawg NOT IN ({placeholders})"
-                params.extend(ids)
+                sql += " ORDER BY g.rating DESC, g.metacritic DESC LIMIT %s"
+                params.append(request.k)
 
-            sql += " ORDER BY g.rating DESC, g.metacritic DESC LIMIT %s"
-            params.append(request.k)
-
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+                cur.execute(sql, params)
+                recommended_games = cur.fetchall()
 
         games = [
             GameWithPriceResponse(
-                game_id_rawg=row["game_id_rawg"],
-                title=row["title"],
-                release_date=row["release_date"].isoformat() if row.get("release_date") else None,
-                genres=row.get("genres"),
-                platforms=row.get("platforms"),
-                rating=row.get("rating"),
-                metacritic=row.get("metacritic"),
-                last_update=row["last_update"].isoformat() if row.get("last_update") else None,
-                best_price_PC=row.get("best_price_PC"),
-                best_shop_PC=row.get("best_shop_PC"),
-                site_url_PC=row.get("site_url_PC"),
-                similarity_score=float(row["similarity_score"]) if row.get("similarity_score") is not None else None,
+                game_id_rawg=game["game_id_rawg"],
+                title=game["title"],
+                release_date=game["release_date"].isoformat() if game["release_date"] else None,
+                genres=game.get("genres"),
+                platforms=game.get("platforms"),
+                rating=game.get("rating"),
+                metacritic=game.get("metacritic"),
+                last_update=game["last_update"].isoformat() if game.get("last_update") else None,
+                best_price_PC=game.get("best_price_PC"),
+                best_shop_PC=game.get("best_shop_PC"),
+                site_url_PC=game.get("site_url_PC"),
+                similarity_score=float(game["similarity_score"]) if game.get("similarity_score") else None,
             )
-            for row in rows
+            for game in recommended_games
         ]
 
         return RecommendationResponse(
@@ -666,9 +708,7 @@ def get_recommendations(request: RecommendationRequest, username: str = Depends(
         raise HTTPException(status_code=500, detail="Failed to generate recommendations")
 
 
-# ---------------------------
-# Interactions
-# ---------------------------
+# --- Endpoints interactions utilisateur
 @app.post("/interactions", tags=["user-data"], status_code=201)
 def add_user_interaction(
     game_id_rawg: int,
@@ -676,24 +716,29 @@ def add_user_interaction(
     rating: Optional[float] = None,
     username: str = Depends(verify_token),
 ):
+    """Ajoute une interaction utilisateur"""
     try:
         user_id = get_user_id_from_username(username)
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute("SELECT game_id_rawg FROM games WHERE game_id_rawg = %s", (game_id_rawg,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="Game not found")
 
-            cur.execute(
-                """
-                INSERT INTO user_interactions (user_id, game_id_rawg, interaction_type, rating, timestamp)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON DUPLICATE KEY UPDATE
-                    interaction_type = VALUES(interaction_type),
-                    rating = VALUES(rating),
-                    timestamp = NOW()
-                """,
-                (user_id, game_id_rawg, interaction_type, rating),
-            )
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Vérifier si le jeu existe
+                cur.execute("SELECT game_id_rawg FROM games WHERE game_id_rawg = %s", (game_id_rawg,))
+                if not cur.fetchone():
+                    raise HTTPException(status_code=404, detail="Game not found")
+
+                # Ajouter ou mettre à jour l'interaction
+                cur.execute(
+                    """
+                    INSERT INTO user_interactions (user_id, game_id_rawg, interaction_type, rating, timestamp)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON DUPLICATE KEY UPDATE
+                        interaction_type = VALUES(interaction_type),
+                        rating = VALUES(rating),
+                        timestamp = NOW()
+                    """,
+                    (user_id, game_id_rawg, interaction_type, rating),
+                )
 
         return {
             "message": "Interaction added successfully",
@@ -711,34 +756,37 @@ def add_user_interaction(
 
 @app.get("/interactions", tags=["user-data"])
 def get_user_interactions(username: str = Depends(verify_token)):
+    """Récupère les interactions de l'utilisateur"""
     try:
         user_id = get_user_id_from_username(username)
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT ui.*, g.title, g.rating AS game_rating, g.genres
-                FROM user_interactions ui
-                JOIN games g ON ui.game_id_rawg = g.game_id_rawg
-                WHERE ui.user_id = %s
-                ORDER BY ui.timestamp DESC
-                """,
-                (user_id,),
-            )
-            rows = cur.fetchall()
+
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT ui.*, g.title, g.rating, g.genres
+                    FROM user_interactions ui
+                    JOIN games g ON ui.game_id_rawg = g.game_id_rawg
+                    WHERE ui.user_id = %s
+                    ORDER BY ui.timestamp DESC
+                    """,
+                    (user_id,),
+                )
+                interactions = cur.fetchall()
 
         return {
             "user_id": user_id,
             "interactions": [
                 {
-                    "game_id_rawg": r["game_id_rawg"],
-                    "title": r["title"],
-                    "interaction_type": r["interaction_type"],
-                    "rating": r.get("rating"),
-                    "timestamp": r["timestamp"].isoformat() if r.get("timestamp") else None,
-                    "game_rating": r.get("game_rating"),
-                    "genres": r.get("genres"),
+                    "game_id_rawg": interaction["game_id_rawg"],
+                    "title": interaction["title"],
+                    "interaction_type": interaction["interaction_type"],
+                    "rating": interaction.get("rating"),
+                    "timestamp": interaction["timestamp"].isoformat() if interaction.get("timestamp") else None,
+                    "game_rating": interaction.get("rating"),
+                    "genres": interaction.get("genres"),
                 }
-                for r in rows
+                for interaction in interactions
             ],
         }
     except Exception as e:
@@ -746,39 +794,43 @@ def get_user_interactions(username: str = Depends(verify_token)):
         raise HTTPException(status_code=500, detail="Failed to fetch interactions")
 
 
-# ---------------------------
-# Stats & Health
-# ---------------------------
+# --- Endpoints statistiques
 @app.get("/stats", tags=["statistics"], response_model=StatsResponse)
 def get_stats():
+    """Récupère les statistiques générales de l'API"""
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS total FROM games")
-            total_games = int(cur.fetchone()["total"])
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Total des jeux
+                cur.execute("SELECT COUNT(*) as total FROM games")
+                total_games = cur.fetchone()["total"]
 
-            cur.execute("SELECT COUNT(*) AS total FROM best_price_pc")
-            total_with_prices = int(cur.fetchone()["total"])
+                # Jeux avec prix
+                cur.execute("SELECT COUNT(*) as total FROM best_price_pc")
+                total_with_prices = cur.fetchone()["total"]
 
-            cur.execute(
-                """
-                SELECT
-                    AVG(similarity_score) AS avg_similarity,
-                    COUNT(CASE WHEN similarity_score >= 0.8 THEN 1 END) AS high_quality
-                FROM best_price_pc
-                WHERE similarity_score IS NOT NULL
-                """
-            )
-            sim = cur.fetchone() or {}
+                # Statistiques de similarité
+                cur.execute(
+                    """
+                    SELECT
+                        AVG(similarity_score) as avg_similarity,
+                        COUNT(CASE WHEN similarity_score >= 0.8 THEN 1 END) as high_quality
+                    FROM best_price_pc
+                    WHERE similarity_score IS NOT NULL
+                    """
+                )
+                similarity_stats = cur.fetchone()
 
-            cur.execute("SELECT last_extraction FROM api_state ORDER BY id DESC LIMIT 1")
-            row = cur.fetchone()
-            last_extraction = row["last_extraction"] if row else None
+                # Dernière extraction
+                cur.execute("SELECT last_extraction FROM api_state ORDER BY id DESC LIMIT 1")
+                last_extraction_row = cur.fetchone()
+                last_extraction = last_extraction_row["last_extraction"] if last_extraction_row else None
 
         return StatsResponse(
             total_games=total_games,
             total_games_with_prices=total_with_prices,
-            avg_similarity_score=float(sim["avg_similarity"]) if sim.get("avg_similarity") is not None else None,
-            high_quality_matches=int(sim.get("high_quality") or 0),
+            avg_similarity_score=float(similarity_stats["avg_similarity"]) if similarity_stats["avg_similarity"] else None,
+            high_quality_matches=similarity_stats["high_quality"],
             last_extraction=last_extraction.isoformat() if last_extraction else None,
         )
     except Exception as e:
@@ -786,12 +838,15 @@ def get_stats():
         raise HTTPException(status_code=500, detail="Failed to fetch statistics")
 
 
+# --- Health et monitoring
 @app.get("/healthz", tags=["system"])
 def healthz():
+    """Health check simple"""
     try:
-        with get_db_conn() as conn, conn.cursor() as cur:
-            cur.execute("SELECT 1")
-            cur.fetchone()
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
         return {
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
@@ -806,26 +861,27 @@ def healthz():
         }
 
 
-# ---------------------------
-# Startup
-# ---------------------------
+# --- Startup event
 @app.on_event("startup")
 async def startup_event():
+    """Initialisation au démarrage"""
     global DB_READY
+
     logger.info("Starting Anne's Games API...")
     try:
-        if getattr(settings, "db_configured", True):
-            with get_db_conn() as conn, conn.cursor() as cur:
-                cur.execute("SELECT VERSION()")
-                version = cur.fetchone()
-                logger.info(f"Database connected: {version.get('VERSION()')}")
+        if settings.db_configured:
+            with get_db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT VERSION()")
+                    version = cur.fetchone()
+                    logger.info(f"Database connected: {version['VERSION()']}")
             DB_READY = True
             logger.info("Database connection established")
         else:
             logger.warning("Database not configured")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
-        if getattr(settings, "DB_REQUIRED", False):
+        if getattr(settings, 'DB_REQUIRED', False):
             raise
     logger.info("Anne's Games API startup completed")
 
