@@ -662,7 +662,7 @@ def get_recommendations(request: RecommendationRequest, username: str = Depends(
                 if request.genres:
                     genre_conditions = []
                     for interaction in interactions
-            ]
+            
         }
         
     except Exception as e:
