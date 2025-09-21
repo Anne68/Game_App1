@@ -29,6 +29,16 @@ bleach==6.1.0
 # System utilities
 psutil==5.9.0
 
+# Ajouts pour le modèle hybride
+scikit-learn>=1.4.0,<2.0.0
+xgboost==1.7.6  # Alternative à GradientBoosting de sklearn
+lightgbm==4.1.0  # Autre option de gradient boosting
+scipy>=1.12.0,<2.0.0
+
+# Ajouts pour les tâches asynchrones (monitoring prix)
+celery==5.3.4  # Pour les tâches en arrière-plan
+redis==5.0.1   # Backend pour Celery (optionnel)
+
 # Build tools
 setuptools>=70.0.0
 wheel>=0.42.0
