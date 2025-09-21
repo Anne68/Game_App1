@@ -721,6 +721,94 @@ def add_user_interaction(
                 """, (user_id, game_id_rawg, interaction_type, rating))
         
         return {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "database": "connected"
+        }
+        
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "database": "disconnected",
+            "error": str(e)
+        }
+
+# Endpoints statistiques
+@app.get("/stats", tags=["statistics"], response_model=StatsResponse)
+def get_stats():
+    """Récupère les statistiques générales de l'API"""
+    
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Total des jeux
+                cur.execute("SELECT COUNT(*) as total FROM games")
+                total_games = cur.fetchone()["total"]
+                
+                # Jeux avec prix
+                cur.execute("SELECT COUNT(*) as total FROM best_price_pc")
+                total_with_prices = cur.fetchone()["total"]
+                
+                # Statistiques de similarité
+                cur.execute("""
+                    SELECT 
+                        AVG(similarity_score) as avg_similarity,
+                        COUNT(CASE WHEN similarity_score >= 0.8 THEN 1 END) as high_quality
+                    FROM best_price_pc 
+                    WHERE similarity_score IS NOT NULL
+                """)
+                similarity_stats = cur.fetchone()
+                
+                # Dernière extraction
+                cur.execute("SELECT last_extraction FROM api_state ORDER BY id DESC LIMIT 1")
+                last_extraction_row = cur.fetchone()
+                last_extraction = last_extraction_row["last_extraction"] if last_extraction_row else None
+        
+        return StatsResponse(
+            total_games=total_games,
+            total_games_with_prices=total_with_prices,
+            avg_similarity_score=float(similarity_stats["avg_similarity"]) if similarity_stats["avg_similarity"] else None,
+            high_quality_matches=similarity_stats["high_quality"],
+            last_extraction=last_extraction.isoformat() if last_extraction else None
+        )
+        
+    except Exception as e:
+        logger.error(f"Error fetching stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch statistics")
+
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialisation au démarrage"""
+    global DB_READY
+    
+    logger.info("Starting Anne's Games API...")
+    
+    try:
+        if settings.db_configured:
+            with get_db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT VERSION()")
+                    version = cur.fetchone()
+                    logger.info(f"Database connected: {version['VERSION()']}")
+            
+            DB_READY = True
+            logger.info("Database connection established")
+            
+        else:
+            logger.warning("Database not configured")
+            
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        if getattr(settings, 'DB_REQUIRED', False):
+            raise
+    
+    logger.info("Anne's Games API startup completed")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
             "message": "Interaction added successfully",
             "user_id": user_id,
             "game_id_rawg": game_id_rawg,
