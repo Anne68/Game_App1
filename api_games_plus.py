@@ -7,9 +7,13 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# Imports Prometheus
+from prometheus_client import Counter, Gauge, Histogram, Info, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_fastapi_instrumentator import Instrumentator
 
 # Imports existants
 from settings import get_settings
@@ -62,6 +66,9 @@ app = FastAPI(
     description="API avec modèle hybride (Content+Collaborative+GradientBoosting) et système de wishlist avec notifications",
 )
 
+# Configuration Prometheus/metrics
+Instrumentator().instrument(app).expose(app, include_in_schema=True)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o for o in settings.ALLOW_ORIGINS.split(",") if o] or ["*"],
@@ -75,6 +82,36 @@ DB_READY: bool = False
 HYBRID_MODEL_READY: bool = False
 PRICE_MONITORING_TASK: Optional[asyncio.Task] = None
 wishlist_manager: Optional[WishlistManager] = None
+
+# =========================
+# ENDPOINTS RACINE ET HEALTH
+# =========================
+
+@app.get("/", include_in_schema=False)
+def root():
+    """Endpoint racine"""
+    return {
+        "name": app.title, 
+        "version": app.version,
+        "message": "Enhanced Games API with Hybrid ML & Wishlist - Ready",
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/healthz",
+        "metrics": "/metrics"
+    }
+
+@app.head("/", include_in_schema=False)
+def head_root():
+    """Health probe HEAD pour Render"""
+    return Response(status_code=200)
+
+@app.get("/metrics", include_in_schema=False)
+def get_metrics():
+    """Endpoint Prometheus pour les métriques"""
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )
 
 # =========================
 # UTILITAIRES BASE DE DONNÉES
