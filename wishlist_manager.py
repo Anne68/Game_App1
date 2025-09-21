@@ -2,523 +2,588 @@
 from __future__ import annotations
 
 import os
+import json
 import logging
+import asyncio
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass
+from typing import List, Dict, Optional, Any
+from dataclasses import dataclass, asdict
 from enum import Enum
+
 import pymysql
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger("wishlist-manager")
 
 class NotificationStatus(Enum):
     PENDING = "pending"
     SENT = "sent"
-    READ = "read"
+    FAILED = "failed"
+
+class NotificationType(Enum):
+    PRICE_DROP = "price_drop"
+    AVAILABILITY = "availability"
+    WISHLIST_REMINDER = "wishlist_reminder"
 
 @dataclass
 class WishlistItem:
     """Item de wishlist"""
-    id: Optional[int]
-    user_id: int
-    game_title: str
-    max_price: float
-    currency: str = "EUR"
+    id: Optional[int] = None
+    user_id: int = 0
+    game_title: str = ""
+    target_price: float = 0.0
+    current_price: Optional[float] = None
+    price_currency: str = "EUR"
     created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     is_active: bool = True
-    notification_count: int = 0
-    last_notification: Optional[datetime] = None
+    notification_sent: bool = False
 
 @dataclass
 class PriceAlert:
     """Alerte de prix"""
-    id: Optional[int]
-    wishlist_item_id: int
-    game_title: str
-    current_price: float
-    threshold_price: float
-    shop_name: str
-    shop_url: str
+    id: Optional[int] = None
+    wishlist_item_id: int = 0
+    old_price: Optional[float] = None
+    new_price: float = 0.0
+    shop_name: str = ""
+    notification_type: NotificationType = NotificationType.PRICE_DROP
+    notification_status: NotificationStatus = NotificationStatus.PENDING
     created_at: Optional[datetime] = None
-    status: NotificationStatus = NotificationStatus.PENDING
-    user_id: int = None
+    message: str = ""
+
+# === Models Pydantic pour l'API ===
+
+class WishlistAddRequest(BaseModel):
+    game_title: str = Field(..., min_length=1, max_length=255)
+    target_price: float = Field(..., gt=0, le=1000)
+    price_currency: str = Field(default="EUR", pattern="^(EUR|USD|GBP)$")
+
+class WishlistUpdateRequest(BaseModel):
+    target_price: Optional[float] = Field(None, gt=0, le=1000)
+    is_active: Optional[bool] = None
+
+class WishlistResponse(BaseModel):
+    id: int
+    game_title: str
+    target_price: float
+    current_price: Optional[float]
+    price_currency: str
+    created_at: str
+    is_active: bool
+    notification_sent: bool
+    price_difference: Optional[float] = None
+    alert_triggered: bool = False
+
+class NotificationResponse(BaseModel):
+    id: int
+    wishlist_item_id: int
+    message: str
+    notification_type: str
+    created_at: str
+    is_read: bool = False
 
 class WishlistManager:
-    """Gestionnaire de wishlist avec notifications de prix"""
+    """Gestionnaire principal de la wishlist"""
     
-    def __init__(self, db_config: Dict[str, any]):
-        self.db_config = db_config
-        self._ensure_tables()
+    def __init__(self, db_connection_func):
+        self.get_db_conn = db_connection_func
+        self.price_check_interval = 3600  # 1 heure
+        self.notification_batch_size = 50
+        
+    # === Gestion de la base de données ===
     
-    def _get_connection(self):
-        """Obtient une connexion à la base de données"""
-        return pymysql.connect(
-            host=self.db_config.get("host", "localhost"),
-            port=self.db_config.get("port", 3306),
-            user=self.db_config.get("user"),
-            password=self.db_config.get("password"),
-            database=self.db_config.get("database"),
-            cursorclass=pymysql.cursors.DictCursor,
-            autocommit=True
-        )
-    
-    def _ensure_tables(self):
-        """Crée les tables nécessaires pour la wishlist"""
-        create_wishlist_table = """
+    def ensure_wishlist_tables(self):
+        """Crée les tables de wishlist si elles n'existent pas"""
+        
+        create_tables_sql = """
+        -- Table wishlist
         CREATE TABLE IF NOT EXISTS user_wishlist (
             id INT AUTO_INCREMENT PRIMARY KEY,
             user_id INT NOT NULL,
             game_title VARCHAR(500) NOT NULL,
-            max_price DECIMAL(10,2) NOT NULL,
-            currency VARCHAR(3) DEFAULT 'EUR',
+            target_price DECIMAL(10,2) NOT NULL,
+            current_price DECIMAL(10,2) NULL,
+            price_currency VARCHAR(3) DEFAULT 'EUR',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             is_active BOOLEAN DEFAULT TRUE,
-            notification_count INT DEFAULT 0,
-            last_notification TIMESTAMP NULL,
+            notification_sent BOOLEAN DEFAULT FALSE,
             
             INDEX idx_user_id (user_id),
-            INDEX idx_game_title (game_title(100)),
+            INDEX idx_game_title (game_title),
             INDEX idx_is_active (is_active),
-            UNIQUE KEY unique_user_game (user_id, game_title)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        """
+            INDEX idx_target_price (target_price)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         
-        create_price_alerts_table = """
+        -- Table des alertes de prix
         CREATE TABLE IF NOT EXISTS price_alerts (
             id INT AUTO_INCREMENT PRIMARY KEY,
             wishlist_item_id INT NOT NULL,
-            user_id INT NOT NULL,
-            game_title VARCHAR(500) NOT NULL,
-            current_price DECIMAL(10,2) NOT NULL,
-            threshold_price DECIMAL(10,2) NOT NULL,
-            shop_name VARCHAR(255) NOT NULL,
-            shop_url TEXT,
-            currency VARCHAR(3) DEFAULT 'EUR',
+            old_price DECIMAL(10,2) NULL,
+            new_price DECIMAL(10,2) NOT NULL,
+            shop_name VARCHAR(255) DEFAULT '',
+            notification_type ENUM('price_drop', 'availability', 'wishlist_reminder') DEFAULT 'price_drop',
+            notification_status ENUM('pending', 'sent', 'failed') DEFAULT 'pending',
+            message TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status ENUM('pending', 'sent', 'read') DEFAULT 'pending',
+            is_read BOOLEAN DEFAULT FALSE,
             
             FOREIGN KEY (wishlist_item_id) REFERENCES user_wishlist(id) ON DELETE CASCADE,
-            INDEX idx_user_id (user_id),
-            INDEX idx_status (status),
+            INDEX idx_wishlist_item (wishlist_item_id),
+            INDEX idx_notification_status (notification_status),
             INDEX idx_created_at (created_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        
+        -- Table des logs de notifications
+        CREATE TABLE IF NOT EXISTS notification_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NOT NULL,
+            wishlist_item_id INT NOT NULL,
+            notification_type VARCHAR(50) NOT NULL,
+            status VARCHAR(20) NOT NULL,
+            message TEXT,
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            
+            INDEX idx_user_id (user_id),
+            INDEX idx_sent_at (sent_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """
         
-        create_notification_settings_table = """
-        CREATE TABLE IF NOT EXISTS notification_settings (
-            user_id INT PRIMARY KEY,
-            email_notifications BOOLEAN DEFAULT TRUE,
-            push_notifications BOOLEAN DEFAULT TRUE,
-            notification_frequency ENUM('immediate', 'daily', 'weekly') DEFAULT 'immediate',
-            quiet_hours_start TIME DEFAULT '22:00:00',
-            quiet_hours_end TIME DEFAULT '08:00:00',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        """
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                # Exécuter chaque instruction CREATE TABLE séparément
+                for statement in create_tables_sql.split(';'):
+                    statement = statement.strip()
+                    if statement and not statement.startswith('--'):
+                        cursor.execute(statement)
+            conn.commit()
         
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(create_wishlist_table)
-                    cursor.execute(create_price_alerts_table)
-                    cursor.execute(create_notification_settings_table)
-                    
-            logger.info("Wishlist tables created/verified successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to create wishlist tables: {e}")
-            raise
+        logger.info("Wishlist tables ensured")
     
-    def add_to_wishlist(self, user_id: int, game_title: str, max_price: float, currency: str = "EUR") -> bool:
+    # === CRUD Operations ===
+    
+    def add_to_wishlist(self, user_id: int, request: WishlistAddRequest) -> WishlistItem:
         """Ajoute un jeu à la wishlist"""
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    # Vérifier si le jeu existe déjà dans la wishlist
-                    cursor.execute(
-                        "SELECT id FROM user_wishlist WHERE user_id = %s AND game_title = %s",
-                        (user_id, game_title)
-                    )
-                    
-                    if cursor.fetchone():
-                        # Mettre à jour le prix maximum
-                        cursor.execute("""
-                            UPDATE user_wishlist 
-                            SET max_price = %s, currency = %s, updated_at = CURRENT_TIMESTAMP, is_active = TRUE
-                            WHERE user_id = %s AND game_title = %s
-                        """, (max_price, currency, user_id, game_title))
-                        
-                        logger.info(f"Updated wishlist item for user {user_id}: {game_title} <= {max_price} {currency}")
-                    else:
-                        # Ajouter nouveau item
-                        cursor.execute("""
-                            INSERT INTO user_wishlist (user_id, game_title, max_price, currency)
-                            VALUES (%s, %s, %s, %s)
-                        """, (user_id, game_title, max_price, currency))
-                        
-                        logger.info(f"Added to wishlist for user {user_id}: {game_title} <= {max_price} {currency}")
-                    
-                    return True
-                    
-        except Exception as e:
-            logger.error(f"Failed to add to wishlist: {e}")
-            return False
+        
+        # Vérifier si le jeu n'est pas déjà dans la wishlist
+        existing = self.get_wishlist_item_by_title(user_id, request.game_title)
+        if existing:
+            raise ValueError(f"Game '{request.game_title}' already in wishlist")
+        
+        # Chercher le prix actuel du jeu
+        current_price = self._find_current_price(request.game_title)
+        
+        sql = """
+        INSERT INTO user_wishlist (user_id, game_title, target_price, current_price, price_currency)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (
+                    user_id, 
+                    request.game_title, 
+                    request.target_price, 
+                    current_price,
+                    request.price_currency
+                ))
+                wishlist_id = cursor.lastrowid
+            conn.commit()
+        
+        # Vérifier immédiatement si le prix cible est déjà atteint
+        if current_price and current_price <= request.target_price:
+            self._create_price_alert(wishlist_id, None, current_price, "Price target already met!")
+        
+        logger.info(f"Added '{request.game_title}' to wishlist for user {user_id}")
+        
+        return self.get_wishlist_item(wishlist_id)
     
-    def remove_from_wishlist(self, user_id: int, wishlist_id: int) -> bool:
-        """Supprime un item de la wishlist"""
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "DELETE FROM user_wishlist WHERE id = %s AND user_id = %s",
-                        (wishlist_id, user_id)
-                    )
-                    
-                    return cursor.rowcount > 0
-                    
-        except Exception as e:
-            logger.error(f"Failed to remove from wishlist: {e}")
-            return False
-    
-    def get_user_wishlist(self, user_id: int) -> List[WishlistItem]:
+    def get_user_wishlist(self, user_id: int, active_only: bool = True) -> List[WishlistItem]:
         """Récupère la wishlist d'un utilisateur"""
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT id, user_id, game_title, max_price, currency, created_at, 
-                               is_active, notification_count, last_notification
-                        FROM user_wishlist 
-                        WHERE user_id = %s AND is_active = TRUE
-                        ORDER BY created_at DESC
-                    """, (user_id,))
-                    
-                    items = []
-                    for row in cursor.fetchall():
-                        items.append(WishlistItem(
-                            id=row['id'],
-                            user_id=row['user_id'],
-                            game_title=row['game_title'],
-                            max_price=float(row['max_price']),
-                            currency=row['currency'],
-                            created_at=row['created_at'],
-                            is_active=row['is_active'],
-                            notification_count=row['notification_count'],
-                            last_notification=row['last_notification']
-                        ))
-                    
-                    return items
-                    
-        except Exception as e:
-            logger.error(f"Failed to get wishlist: {e}")
-            return []
-    
-    def check_price_alerts(self) -> List[PriceAlert]:
-        """Vérifie les alertes de prix en comparant avec best_price_pc"""
-        alerts = []
         
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    # Requête pour trouver les jeux en wishlist avec des prix inférieurs au seuil
-                    query = """
-                    SELECT 
-                        w.id as wishlist_id,
-                        w.user_id,
-                        w.game_title,
-                        w.max_price,
-                        w.currency,
-                        p.best_price_PC,
-                        p.best_shop_PC,
-                        p.site_url_PC,
-                        p.title as exact_title
-                    FROM user_wishlist w
-                    LEFT JOIN best_price_pc p ON (
-                        LOWER(TRIM(p.title)) LIKE CONCAT('%', LOWER(TRIM(w.game_title)), '%')
-                        OR LOWER(TRIM(w.game_title)) LIKE CONCAT('%', LOWER(TRIM(p.title)), '%')
-                    )
-                    WHERE w.is_active = TRUE 
-                    AND p.best_price_PC IS NOT NULL
-                    AND p.best_price_PC != ''
-                    """
-                    
-                    cursor.execute(query)
-                    matches = cursor.fetchall()
-                    
-                    for match in matches:
-                        try:
-                            # Parser le prix (gérer différents formats)
-                            price_str = match['best_price_PC']
-                            current_price = self._parse_price(price_str)
-                            
-                            if current_price is not None and current_price <= float(match['max_price']):
-                                # Vérifier si on n'a pas déjà envoyé une alerte récemment
-                                if not self._has_recent_alert(match['wishlist_id'], current_price):
-                                    alert = PriceAlert(
-                                        id=None,
-                                        wishlist_item_id=match['wishlist_id'],
-                                        user_id=match['user_id'],
-                                        game_title=match['exact_title'] or match['game_title'],
-                                        current_price=current_price,
-                                        threshold_price=float(match['max_price']),
-                                        shop_name=match['best_shop_PC'] or "Unknown",
-                                        shop_url=match['site_url_PC'] or "",
-                                        created_at=datetime.utcnow()
-                                    )
-                                    
-                                    # Sauvegarder l'alerte
-                                    alert_id = self._save_alert(alert)
-                                    if alert_id:
-                                        alert.id = alert_id
-                                        alerts.append(alert)
-                                        
-                                        # Mettre à jour les stats de notification
-                                        self._update_notification_stats(match['wishlist_id'])
-                        
-                        except Exception as e:
-                            logger.warning(f"Error processing price match: {e}")
-                            continue
-                    
-        except Exception as e:
-            logger.error(f"Failed to check price alerts: {e}")
+        sql = """
+        SELECT id, user_id, game_title, target_price, current_price, price_currency,
+               created_at, updated_at, is_active, notification_sent
+        FROM user_wishlist 
+        WHERE user_id = %s
+        """
         
-        return alerts
+        params = [user_id]
+        
+        if active_only:
+            sql += " AND is_active = 1"
+        
+        sql += " ORDER BY created_at DESC"
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+        
+        wishlist_items = []
+        for row in rows:
+            item = WishlistItem(
+                id=row['id'],
+                user_id=row['user_id'],
+                game_title=row['game_title'],
+                target_price=float(row['target_price']),
+                current_price=float(row['current_price']) if row['current_price'] else None,
+                price_currency=row['price_currency'],
+                created_at=row['created_at'],
+                updated_at=row['updated_at'],
+                is_active=bool(row['is_active']),
+                notification_sent=bool(row['notification_sent'])
+            )
+            wishlist_items.append(item)
+        
+        return wishlist_items
     
-    def _parse_price(self, price_str: str) -> Optional[float]:
-        """Parse un prix depuis différents formats"""
-        if not price_str:
+    def get_wishlist_item(self, wishlist_id: int) -> Optional[WishlistItem]:
+        """Récupère un item de wishlist par ID"""
+        
+        sql = """
+        SELECT id, user_id, game_title, target_price, current_price, price_currency,
+               created_at, updated_at, is_active, notification_sent
+        FROM user_wishlist 
+        WHERE id = %s
+        """
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (wishlist_id,))
+                row = cursor.fetchone()
+        
+        if not row:
             return None
         
-        import re
+        return WishlistItem(
+            id=row['id'],
+            user_id=row['user_id'],
+            game_title=row['game_title'],
+            target_price=float(row['target_price']),
+            current_price=float(row['current_price']) if row['current_price'] else None,
+            price_currency=row['price_currency'],
+            created_at=row['created_at'],
+            updated_at=row['updated_at'],
+            is_active=bool(row['is_active']),
+            notification_sent=bool(row['notification_sent'])
+        )
+    
+    def get_wishlist_item_by_title(self, user_id: int, game_title: str) -> Optional[WishlistItem]:
+        """Récupère un item de wishlist par titre"""
         
-        # Nettoyer la chaîne
-        clean_price = re.sub(r'[^\d.,€$]', '', price_str)
+        sql = """
+        SELECT id, user_id, game_title, target_price, current_price, price_currency,
+               created_at, updated_at, is_active, notification_sent
+        FROM user_wishlist 
+        WHERE user_id = %s AND game_title = %s
+        """
         
-        # Patterns de prix courants
-        patterns = [
-            r'(\d+[.,]\d+)',  # 19.99 ou 19,99
-            r'(\d+)',         # 19
-        ]
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (user_id, game_title))
+                row = cursor.fetchone()
         
-        for pattern in patterns:
-            match = re.search(pattern, clean_price)
-            if match:
-                try:
-                    price_value = float(match.group(1).replace(',', '.'))
-                    return price_value
-                except ValueError:
-                    continue
+        if not row:
+            return None
+        
+        return WishlistItem(
+            id=row['id'],
+            user_id=row['user_id'],
+            game_title=row['game_title'],
+            target_price=float(row['target_price']),
+            current_price=float(row['current_price']) if row['current_price'] else None,
+            price_currency=row['price_currency'],
+            created_at=row['created_at'],
+            updated_at=row['updated_at'],
+            is_active=bool(row['is_active']),
+            notification_sent=bool(row['notification_sent'])
+        )
+    
+    def update_wishlist_item(self, wishlist_id: int, user_id: int, request: WishlistUpdateRequest) -> WishlistItem:
+        """Met à jour un item de wishlist"""
+        
+        # Vérifier que l'item appartient à l'utilisateur
+        item = self.get_wishlist_item(wishlist_id)
+        if not item or item.user_id != user_id:
+            raise ValueError("Wishlist item not found or access denied")
+        
+        update_parts = []
+        params = []
+        
+        if request.target_price is not None:
+            update_parts.append("target_price = %s")
+            params.append(request.target_price)
+        
+        if request.is_active is not None:
+            update_parts.append("is_active = %s")
+            params.append(request.is_active)
+        
+        if not update_parts:
+            return item
+        
+        update_parts.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(wishlist_id)
+        
+        sql = f"UPDATE user_wishlist SET {', '.join(update_parts)} WHERE id = %s"
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+            conn.commit()
+        
+        logger.info(f"Updated wishlist item {wishlist_id}")
+        
+        return self.get_wishlist_item(wishlist_id)
+    
+    def remove_from_wishlist(self, wishlist_id: int, user_id: int) -> bool:
+        """Supprime un item de la wishlist"""
+        
+        # Vérifier que l'item appartient à l'utilisateur
+        item = self.get_wishlist_item(wishlist_id)
+        if not item or item.user_id != user_id:
+            raise ValueError("Wishlist item not found or access denied")
+        
+        sql = "DELETE FROM user_wishlist WHERE id = %s AND user_id = %s"
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (wishlist_id, user_id))
+                deleted = cursor.rowcount > 0
+            conn.commit()
+        
+        if deleted:
+            logger.info(f"Removed wishlist item {wishlist_id} for user {user_id}")
+        
+        return deleted
+    
+    # === Gestion des prix et notifications ===
+    
+    def _find_current_price(self, game_title: str) -> Optional[float]:
+        """Trouve le prix actuel d'un jeu dans la table best_price_pc"""
+        
+        sql = """
+        SELECT best_price_PC, similarity_score 
+        FROM best_price_pc 
+        WHERE LOWER(title) LIKE LOWER(%s) 
+        ORDER BY similarity_score DESC 
+        LIMIT 1
+        """
+        
+        try:
+            with self.get_db_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, (f"%{game_title}%",))
+                    row = cursor.fetchone()
+            
+            if row and row['best_price_PC']:
+                price_str = row['best_price_PC']
+                # Extraire le prix de chaînes comme "€12.99" ou "$19.99"
+                import re
+                price_match = re.search(r'[\d,]+\.?\d*', price_str.replace(',', '.'))
+                if price_match:
+                    return float(price_match.group())
+        
+        except Exception as e:
+            logger.warning(f"Error finding current price for '{game_title}': {e}")
         
         return None
     
-    def _has_recent_alert(self, wishlist_item_id: int, price: float, hours: int = 24) -> bool:
-        """Vérifie si une alerte récente existe pour ce prix"""
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT COUNT(*) as count
-                        FROM price_alerts 
-                        WHERE wishlist_item_id = %s 
-                        AND ABS(current_price - %s) < 0.50
-                        AND created_at > DATE_SUB(NOW(), INTERVAL %s HOUR)
-                    """, (wishlist_item_id, price, hours))
+    def check_price_alerts(self) -> int:
+        """Vérifie tous les items de wishlist pour les alertes de prix"""
+        
+        logger.info("Starting price alerts check...")
+        
+        # Récupérer tous les items actifs de wishlist
+        sql = """
+        SELECT id, user_id, game_title, target_price, current_price
+        FROM user_wishlist 
+        WHERE is_active = 1 AND notification_sent = 0
+        """
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql)
+                items = cursor.fetchall()
+        
+        alerts_created = 0
+        
+        for item in items:
+            try:
+                # Chercher le nouveau prix
+                new_price = self._find_current_price(item['game_title'])
+                
+                if new_price is None:
+                    continue
+                
+                old_price = float(item['current_price']) if item['current_price'] else None
+                target_price = float(item['target_price'])
+                
+                # Vérifier si le prix cible est atteint
+                if new_price <= target_price:
+                    message = f"🎯 Price target reached for '{item['game_title']}'! Current price: €{new_price:.2f} (target: €{target_price:.2f})"
                     
-                    result = cursor.fetchone()
-                    return result['count'] > 0
+                    self._create_price_alert(
+                        item['id'], old_price, new_price, message,
+                        NotificationType.PRICE_DROP
+                    )
                     
-        except Exception as e:
-            logger.error(f"Error checking recent alerts: {e}")
-            return False
-    
-    def _save_alert(self, alert: PriceAlert) -> Optional[int]:
-        """Sauvegarde une alerte en base"""
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        INSERT INTO price_alerts 
-                        (wishlist_item_id, user_id, game_title, current_price, threshold_price, 
-                         shop_name, shop_url, status)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        alert.wishlist_item_id,
-                        alert.user_id,
-                        alert.game_title,
-                        alert.current_price,
-                        alert.threshold_price,
-                        alert.shop_name,
-                        alert.shop_url,
-                        alert.status.value
-                    ))
+                    # Marquer comme notifié
+                    self._mark_notification_sent(item['id'])
                     
-                    return cursor.lastrowid
-                    
-        except Exception as e:
-            logger.error(f"Failed to save alert: {e}")
-            return None
-    
-    def _update_notification_stats(self, wishlist_item_id: int):
-        """Met à jour les statistiques de notification"""
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        UPDATE user_wishlist 
-                        SET notification_count = notification_count + 1,
-                            last_notification = CURRENT_TIMESTAMP
-                        WHERE id = %s
-                    """, (wishlist_item_id,))
-                    
-        except Exception as e:
-            logger.error(f"Failed to update notification stats: {e}")
-    
-    def get_user_alerts(self, user_id: int, status: Optional[NotificationStatus] = None) -> List[PriceAlert]:
-        """Récupère les alertes d'un utilisateur"""
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    base_query = """
-                        SELECT id, wishlist_item_id, user_id, game_title, current_price,
-                               threshold_price, shop_name, shop_url, created_at, status
-                        FROM price_alerts 
-                        WHERE user_id = %s
-                    """
-                    
-                    params = [user_id]
-                    
-                    if status:
-                        base_query += " AND status = %s"
-                        params.append(status.value)
-                    
-                    base_query += " ORDER BY created_at DESC LIMIT 50"
-                    
-                    cursor.execute(base_query, params)
-                    
-                    alerts = []
-                    for row in cursor.fetchall():
-                        alerts.append(PriceAlert(
-                            id=row['id'],
-                            wishlist_item_id=row['wishlist_item_id'],
-                            user_id=row['user_id'],
-                            game_title=row['game_title'],
-                            current_price=float(row['current_price']),
-                            threshold_price=float(row['threshold_price']),
-                            shop_name=row['shop_name'],
-                            shop_url=row['shop_url'],
-                            created_at=row['created_at'],
-                            status=NotificationStatus(row['status'])
-                        ))
-                    
-                    return alerts
-                    
-        except Exception as e:
-            logger.error(f"Failed to get user alerts: {e}")
-            return []
-    
-    def mark_alert_as_read(self, user_id: int, alert_id: int) -> bool:
-        """Marque une alerte comme lue"""
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        UPDATE price_alerts 
-                        SET status = 'read'
-                        WHERE id = %s AND user_id = %s
-                    """, (alert_id, user_id))
-                    
-                    return cursor.rowcount > 0
-                    
-        except Exception as e:
-            logger.error(f"Failed to mark alert as read: {e}")
-            return False
-    
-    def get_wishlist_stats(self, user_id: int) -> Dict[str, any]:
-        """Statistiques de la wishlist utilisateur"""
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    # Stats wishlist
-                    cursor.execute("""
-                        SELECT 
-                            COUNT(*) as total_items,
-                            AVG(max_price) as avg_price_threshold,
-                            SUM(notification_count) as total_notifications
-                        FROM user_wishlist 
-                        WHERE user_id = %s AND is_active = TRUE
-                    """, (user_id,))
-                    
-                    wishlist_stats = cursor.fetchone()
-                    
-                    # Stats alertes
-                    cursor.execute("""
-                        SELECT 
-                            COUNT(*) as total_alerts,
-                            COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_alerts,
-                            COUNT(CASE WHEN status = 'read' THEN 1 END) as read_alerts,
-                            AVG(current_price - threshold_price) as avg_savings
-                        FROM price_alerts 
-                        WHERE user_id = %s
-                        AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
-                    """, (user_id,))
-                    
-                    alert_stats = cursor.fetchone()
-                    
-                    return {
-                        "wishlist": {
-                            "total_items": wishlist_stats['total_items'] or 0,
-                            "avg_price_threshold": float(wishlist_stats['avg_price_threshold'] or 0),
-                            "total_notifications": wishlist_stats['total_notifications'] or 0
-                        },
-                        "alerts_30_days": {
-                            "total_alerts": alert_stats['total_alerts'] or 0,
-                            "pending_alerts": alert_stats['pending_alerts'] or 0,
-                            "read_alerts": alert_stats['read_alerts'] or 0,
-                            "avg_savings": float(alert_stats['avg_savings'] or 0)
-                        }
-                    }
-                    
-        except Exception as e:
-            logger.error(f"Failed to get wishlist stats: {e}")
-            return {"wishlist": {}, "alerts_30_days": {}}
-
-
-# Singleton pour l'accès global
-_wishlist_manager_instance: Optional[WishlistManager] = None
-
-def get_wishlist_manager() -> Optional[WishlistManager]:
-    """Récupère l'instance du gestionnaire de wishlist"""
-    global _wishlist_manager_instance
-    
-    if _wishlist_manager_instance is None:
-        try:
-            from settings import get_settings
-            settings = get_settings()
+                    alerts_created += 1
+                    logger.info(f"Price alert created for '{item['game_title']}'")
+                
+                # Mettre à jour le prix actuel même si pas d'alerte
+                elif old_price != new_price:
+                    self._update_current_price(item['id'], new_price)
             
-            if settings.db_configured:
-                db_config = {
-                    "host": settings.DB_HOST,
-                    "port": settings.DB_PORT,
-                    "user": settings.DB_USER,
-                    "password": settings.DB_PASSWORD,
-                    "database": settings.DB_NAME
-                }
-                
-                _wishlist_manager_instance = WishlistManager(db_config)
-                logger.info("Wishlist manager initialized successfully")
-            else:
-                logger.warning("Database not configured - wishlist features disabled")
-                
-        except Exception as e:
-            logger.error(f"Failed to initialize wishlist manager: {e}")
+            except Exception as e:
+                logger.error(f"Error checking price for item {item['id']}: {e}")
+        
+        logger.info(f"Price check completed. Created {alerts_created} alerts.")
+        return alerts_created
     
-    return _wishlist_manager_instance
-
-def reset_wishlist_manager():
-    """Reset l'instance du gestionnaire"""
-    global _wishlist_manager_instance
-    _wishlist_manager_instance = None
+    def _create_price_alert(self, wishlist_item_id: int, old_price: Optional[float], 
+                           new_price: float, message: str, 
+                           notification_type: NotificationType = NotificationType.PRICE_DROP):
+        """Crée une alerte de prix"""
+        
+        sql = """
+        INSERT INTO price_alerts (wishlist_item_id, old_price, new_price, message, notification_type)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (
+                    wishlist_item_id, old_price, new_price, message, notification_type.value
+                ))
+            conn.commit()
+    
+    def _mark_notification_sent(self, wishlist_item_id: int):
+        """Marque un item comme notifié"""
+        
+        sql = "UPDATE user_wishlist SET notification_sent = 1 WHERE id = %s"
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (wishlist_item_id,))
+            conn.commit()
+    
+    def _update_current_price(self, wishlist_item_id: int, new_price: float):
+        """Met à jour le prix actuel d'un item"""
+        
+        sql = "UPDATE user_wishlist SET current_price = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s"
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (new_price, wishlist_item_id))
+            conn.commit()
+    
+    # === Notifications ===
+    
+    def get_user_notifications(self, user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        """Récupère les notifications d'un utilisateur"""
+        
+        sql = """
+        SELECT pa.id, pa.wishlist_item_id, pa.message, pa.notification_type, 
+               pa.created_at, pa.is_read, uw.game_title, pa.new_price
+        FROM price_alerts pa
+        JOIN user_wishlist uw ON pa.wishlist_item_id = uw.id
+        WHERE uw.user_id = %s
+        ORDER BY pa.created_at DESC
+        LIMIT %s
+        """
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (user_id, limit))
+                rows = cursor.fetchall()
+        
+        notifications = []
+        for row in rows:
+            notifications.append({
+                "id": row['id'],
+                "wishlist_item_id": row['wishlist_item_id'],
+                "game_title": row['game_title'],
+                "message": row['message'],
+                "notification_type": row['notification_type'],
+                "price": float(row['new_price']),
+                "created_at": row['created_at'].isoformat(),
+                "is_read": bool(row['is_read'])
+            })
+        
+        return notifications
+    
+    def mark_notification_read(self, notification_id: int, user_id: int) -> bool:
+        """Marque une notification comme lue"""
+        
+        sql = """
+        UPDATE price_alerts pa
+        JOIN user_wishlist uw ON pa.wishlist_item_id = uw.id
+        SET pa.is_read = 1
+        WHERE pa.id = %s AND uw.user_id = %s
+        """
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (notification_id, user_id))
+                updated = cursor.rowcount > 0
+            conn.commit()
+        
+        return updated
+    
+    def get_notification_count(self, user_id: int, unread_only: bool = True) -> int:
+        """Compte les notifications d'un utilisateur"""
+        
+        sql = """
+        SELECT COUNT(*) as count
+        FROM price_alerts pa
+        JOIN user_wishlist uw ON pa.wishlist_item_id = uw.id
+        WHERE uw.user_id = %s
+        """
+        
+        params = [user_id]
+        
+        if unread_only:
+            sql += " AND pa.is_read = 0"
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                row = cursor.fetchone()
+        
+        return row['count'] if row else 0
+    
+    # === Tâches de maintenance ===
+    
+    async def start_price_monitoring(self):
+        """Démarre la surveillance des prix en arrière-plan"""
+        logger.info("Starting price monitoring service...")
+        
+        while True:
+            try:
+                await asyncio.sleep(self.price_check_interval)
+                self.check_price_alerts()
+            except Exception as e:
+                logger.error(f"Error in price monitoring: {e}")
+                await asyncio.sleep(60)  # Attendre 1 minute en cas d'erreur
+    
+    def cleanup_old_notifications(self, days_old: int = 30) -> int:
+        """Nettoie les anciennes notifications"""
+        
+        sql = """
+        DELETE FROM price_alerts 
+        WHERE created_at < DATE_SUB(NOW(), INTERVAL %s DAY)
+        """
+        
+        with self.get_db_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (days_old,))
+                deleted = cursor.rowcount
+            conn.commit()
+        
+        logger.info(f"Cleaned up {deleted} old notifications")
+        return deleted
