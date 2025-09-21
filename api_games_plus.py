@@ -625,48 +625,88 @@ def search_prices(
 # ENDPOINTS RECOMMANDATIONS
 # =========================
 
-@app.post("/recommend", tags=["recommendations"], response_model=RecommendationResponse)
-def get_recommendations(request: RecommendationRequest, username: str = Depends(verify_token)):
+from fastapi import HTTPException, Depends
+from typing import List
+
+@app.post(
+    "/recommend",
+    tags=["recommendations"],
+    response_model=RecommendationResponse
+)
+def get_recommendations(
+    request: RecommendationRequest,
+    username: str = Depends(verify_token)
+):
     """Système de recommandation basé sur les données utilisateur"""
-    
     try:
         user_id = get_user_id_from_username(username)
-        
+    except Exception as e:
+        logger.error(f"Error resolving user id from username: {e}")
+        raise HTTPException(status_code=500, detail="Failed to resolve user")
+
+    try:
         with get_db_conn() as conn:
             with conn.cursor() as cur:
                 # Récupérer les interactions de l'utilisateur pour personnaliser
-                cur.execute("""
-                    SELECT game_id_rawg, interaction_type, rating 
-                    FROM user_interactions 
+                cur.execute(
+                    """
+                    SELECT game_id_rawg, interaction_type, rating
+                    FROM user_interactions
                     WHERE user_id = %s
-                """, (user_id,))
+                    """,
+                    (user_id,)
+                )
                 user_interactions = cur.fetchall()
-                
-                # Construire une requête de recommandation
+
+                # Construire la requête de recommandation
                 sql = """
-                    SELECT g.*, 
-                           p.best_price_PC, p.best_shop_PC, p.site_url_PC,
-                           p.similarity_score
+                    SELECT
+                        g.*,
+                        p.best_price_PC,
+                        p.best_shop_PC,
+                        p.site_url_PC,
+                        p.similarity_score
                     FROM games g
                     LEFT JOIN best_price_pc p ON g.title = p.title
                     WHERE 1=1
                 """
-                params = []
-                
+                params: List[object] = []
+
                 # Filtrer par rating minimum
-                if request.min_rating > 0:
+                if getattr(request, "min_rating", 0) and request.min_rating > 0:
                     sql += " AND g.rating >= %s"
                     params.append(request.min_rating)
-                
-                # Filtrer par genres
-                if request.genres:
+
+                # Filtrer par genres (champ texte contenant une liste/chaîne de genres)
+                if getattr(request, "genres", None):
                     genre_conditions = []
-                    for interaction in interactions
-            
-        
+                    for genre in request.genres:
+                        genre_conditions.append("g.genres ILIKE %s")
+                        params.append(f"%{genre}%")
+                    # Regrouper les conditions par genre avec OR
+                    sql += f" AND ({' OR '.join(genre_conditions)})"
+
+                # (Optionnel) tri par score de similarité si présent
+                sql += " ORDER BY COALESCE(p.similarity_score, 0) DESC, g.rating DESC"
+
+                cur.execute(sql, tuple(params))
+                rows = cur.fetchall()
+
+                # Mapper rows -> objets du response_model (à adapter à ton schéma)
+                recommendations = map_rows_to_recommendations(rows, user_interactions)
+
+                return RecommendationResponse(
+                    user_id=user_id,
+                    count=len(recommendations),
+                    items=recommendations
+                )
+
+    except HTTPException:
+        # déjà levée plus haut
+        raise
     except Exception as e:
-        logger.error(f"Error fetching user interactions: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch interactions")
+        logger.error(f"Error fetching recommendations: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch recommendations")
 
 # =========================
 # ENDPOINTS WISHLIST
