@@ -731,6 +731,231 @@ with tabs[3]:
             
             # Graphique de performance (simulé)
             if st.session_state.hybrid_model_enabled:
+        st.info("""
+        🧠 **Modèle Hybride Activé**
+        - Combine TF-IDF, SVD et Gradient Boosting
+        - Prédiction intelligente des ratings
+        - Classification des genres améliorée
+        - Meilleure précision sur les recommandations
+        """)
+    else:
+        st.info("""
+        📊 **Modèle Classique Activé**
+        - Pipeline TF-IDF + SVD traditionnel
+        - Recommandations basées sur la similarité textuelle
+        - Plus rapide mais moins précis
+        """)
+    
+    # Entraînement du modèle
+    st.markdown("#### 🚀 Entraînement")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        version = st.text_input("Version du modèle", placeholder="3.0.0-hybrid")
+        force = st.checkbox("Forcer le re-entraînement")
+    
+    with col2:
+        st.markdown(" ")
+        if st.button("🚀 Entraîner le Modèle", use_container_width=True):
+            endpoint = "/model/train/hybrid" if st.session_state.hybrid_model_enabled else "/model/train"
+            payload = {"version": version or None, "force_retrain": force}
+            
+            with st.spinner("🤖 Entraînement en cours..."):
+                r = post(endpoint, payload, timeout=120)
+                
+                if r.ok:
+                    data = r.json()
+                    st.success(f"✅ Entraînement terminé — v{data.get('version')} — {round(data.get('training_duration',0),2)}s")
+                    
+                    # Afficher les métriques de performance
+                    if "performance" in data:
+                        perf = data["performance"]
+                        col_m1, col_m2, col_m3 = st.columns(3)
+                        
+                        with col_m1:
+                            if "rating_r2" in perf:
+                                st.metric("R² Score", f"{perf['rating_r2']:.3f}")
+                        with col_m2:
+                            if "rating_mse" in perf:
+                                st.metric("MSE", f"{perf['rating_mse']:.3f}")
+                        with col_m3:
+                            if "cross_val" in perf:
+                                st.metric("Cross-Val", f"{perf['cross_val']:.3f}")
+                        
+                        # Feature importance si disponible
+                        if "feature_importance" in perf and perf["feature_importance"]:
+                            st.markdown("**🎯 Feature Importance:**")
+                            importance_df = pd.DataFrame([
+                                {"Feature": k, "Importance": v} 
+                                for k, v in perf["feature_importance"].items()
+                            ]).sort_values("Importance", ascending=False).head(10)
+                            
+                            fig_importance = px.bar(
+                                importance_df,
+                                x="Importance",
+                                y="Feature",
+                                orientation="h",
+                                title="Top 10 Features les plus Importantes"
+                            )
+                            fig_importance.update_layout(
+                                plot_bgcolor="rgba(0,0,0,0)",
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                font_color="#e6f3ff"
+                            )
+                            st.plotly_chart(fig_importance, use_container_width=True)
+                else:
+                    st.error(f"❌ Erreur d'entraînement: {r.status_code} — {r.text}")
+    
+    # Tests du modèle
+    st.markdown("#### 🧪 Tests & Évaluation")
+    
+    test_queries = st.text_area(
+        "Requêtes de test (une par ligne)",
+        value="RPG fantasy\nAction shooter\nIndie platformer\nStrategy simulation",
+        height=100
+    )
+    
+    if st.button("🧪 Tester le Modèle"):
+        queries = [q.strip() for q in test_queries.split('\n') if q.strip()]
+        
+        with st.spinner("Test en cours..."):
+            endpoint = "/model/evaluate/hybrid" if st.session_state.hybrid_model_enabled else "/model/evaluate"
+            
+            try:
+                # Construire les paramètres pour les queries multiples
+                params = [("test_queries", q) for q in queries]
+                url = f"{api_base()}{endpoint}"
+                r = requests.get(url, headers=bearer_headers(), params=params, timeout=60)
+                
+                if r.ok:
+                    results = r.json()
+                    st.success("✅ Tests terminés")
+                    
+                    # Affichage des résultats
+                    col_r1, col_r2, col_r3 = st.columns(3)
+                    
+                    with col_r1:
+                        st.metric("Queries testées", len(queries))
+                    with col_r2:
+                        if "avg_confidence" in results:
+                            st.metric("Confiance moyenne", f"{results['avg_confidence']:.3f}")
+                    with col_r3:
+                        if "total_recommendations" in results:
+                            st.metric("Recommandations", results["total_recommendations"])
+                    
+                    # Détail par query
+                    if "query_results" in results:
+                        st.markdown("**📊 Détail par requête:**")
+                        for query_result in results["query_results"]:
+                            with st.expander(f"🔍 '{query_result.get('query', 'Unknown')}'"):
+                                recs = query_result.get("recommendations", [])
+                                if recs:
+                                    for rec in recs[:3]:  # Top 3
+                                        st.markdown(f"• **{rec.get('title')}** — Score: {rec.get('confidence', 0):.3f}")
+                                else:
+                                    st.warning("Aucune recommandation")
+                else:
+                    st.error(f"❌ Erreur de test: {r.status_code}")
+            except Exception as e:
+                st.error(f"❌ Erreur: {e}")
+    
+    # Analyse du modèle hybride
+    if st.session_state.hybrid_model_enabled:
+        st.markdown("#### 🔬 Analyse du Modèle Hybride")
+        
+        if st.button("📊 Analyser le Modèle"):
+            try:
+                r = get("/model/analysis/hybrid")
+                if r.ok:
+                    analysis = r.json()
+                    
+                    # Informations générales
+                    st.markdown("**🎯 Informations Générales:**")
+                    st.json({
+                        "Type": analysis.get("model_type", "Unknown"),
+                        "Version": analysis.get("version", "Unknown"),
+                        "Components": analysis.get("components", {})
+                    })
+                    
+                    # Performance
+                    if "performance" in analysis:
+                        perf = analysis["performance"]
+                        st.markdown("**📈 Performance:**")
+                        
+                        perf_metrics = {
+                            "R² Score": perf.get("r2_score", 0),
+                            "MSE": perf.get("mse", 0),
+                            "Temps entraînement (s)": perf.get("training_time", 0),
+                            "Taille modèle (MB)": perf.get("model_size_mb", 0)
+                        }
+                        
+                        for metric, value in perf_metrics.items():
+                            if isinstance(value, float):
+                                st.metric(metric, f"{value:.3f}")
+                            else:
+                                st.metric(metric, str(value))
+                else:
+                    st.warning("Analyse non disponible")
+            except Exception as e:
+                st.error(f"Erreur analyse: {e}")
+    
+    # Nettoyage et maintenance
+    st.markdown("#### 🧹 Maintenance")
+    
+    col_m1, col_m2, col_m3 = st.columns(3)
+    
+    with col_m1:
+        if st.button("🗑️ Vider le Cache"):
+            try:
+                r = post("/model/clear-cache", {})
+                if r.ok:
+                    st.success("✅ Cache vidé")
+                else:
+                    st.warning("Cache non vidé")
+            except Exception:
+                st.warning("Fonction non disponible")
+    
+    with col_m2:
+        if st.button("💾 Sauvegarder Modèle"):
+            try:
+                r = post("/model/save", {})
+                if r.ok:
+                    st.success("✅ Modèle sauvegardé")
+                else:
+                    st.warning("Sauvegarde échouée")
+            except Exception:
+                st.warning("Fonction non disponible")
+    
+    with col_m3:
+        if st.button("📤 Export Modèle"):
+            st.info("Fonctionnalité d'export à implémenter")
+    
+    # Configuration avancée
+    with st.expander("⚙️ Configuration Avancée"):
+        st.markdown("**🔧 Paramètres du Modèle Hybride:**")
+        
+        # Paramètres TF-IDF
+        st.markdown("**📝 TF-IDF:**")
+        max_features = st.slider("Max features", 1000, 10000, 5000)
+        ngram_range = st.selectbox("N-gram range", ["(1,1)", "(1,2)", "(1,3)"], index=2)
+        
+        # Paramètres Gradient Boosting
+        st.markdown("**🌳 Gradient Boosting:**")
+        n_estimators = st.slider("N estimators", 50, 200, 100)
+        learning_rate = st.slider("Learning rate", 0.01, 0.3, 0.1, 0.01)
+        max_depth = st.slider("Max depth", 3, 10, 6)
+        
+        st.warning("⚠️ La modification de ces paramètres nécessite un re-entraînement")
+
+# Footer avec tips
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; color: #9fb6d1; font-size: 12px;">
+💡 <strong>Tips:</strong> Utilisez <span class="kbd">Ctrl+R</span> pour actualiser | 
+Le modèle hybride offre de meilleures recommandations | 
+Ajoutez des jeux à votre wishlist pour des alertes automatiques
+</div>
+""", unsafe_allow_html=True)enabled:
                 # Données simulées pour le modèle hybride
                 performance_data = {
                     "Métrique": ["Précision", "Rappel", "F1-Score", "R² Score"],
