@@ -2,32 +2,54 @@ import os
 import requests
 import streamlit as st
 from typing import Any, Dict, List, Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # -----------------------------
 # Config de base
 # -----------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "180"))  # ⏱️ Augmenté pour l'entraînement initial
 
 st.set_page_config(page_title="Games+ Reco & Prix", page_icon="🎮", layout="wide")
 
 # -----------------------------
+# Session HTTP avec retries + timeouts
+# -----------------------------
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=0.8, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET", "POST"])  # type: ignore[arg-type]
+session.mount("http://", HTTPAdapter(max_retries=retries))
+session.mount("https://", HTTPAdapter(max_retries=retries))
+
+# -----------------------------
 # Helpers HTTP
 # -----------------------------
+def _build_url(path: str) -> str:
+    base = API_BASE_URL.rstrip("/")
+    if not path.startswith("/"):
+        path = "/" + path
+    # Sécurise les espaces & caractères spéciaux dans l'URL entière
+    return requests.utils.requote_uri(f"{base}{path}")
+
+
 def api_get(path: str, token: Optional[str] = None, **params) -> requests.Response:
     headers = {"accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    url = f"{API_BASE_URL}{path}"
-    return requests.get(url, headers=headers, params=params, timeout=30)
+    url = _build_url(path)
+    return session.get(url, headers=headers, params=params, timeout=API_TIMEOUT)
 
 
 def api_post(path: str, token: Optional[str] = None, json: Optional[Dict[str, Any]] = None, data: Optional[Dict[str, Any]] = None) -> requests.Response:
     headers = {"accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    url = f"{API_BASE_URL}{path}"
-    return requests.post(url, headers=headers, json=json, data=data, timeout=60)
+    url = _build_url(path)
+    return session.post(url, headers=headers, json=json, data=data, timeout=API_TIMEOUT)
 
+
+def safe_path_component(s: str) -> str:
+    return requests.utils.quote(s, safe="")
 
 # -----------------------------
 # UI helpers
@@ -64,6 +86,8 @@ def ensure_token() -> Optional[str]:
                         st.rerun()
                     else:
                         st.error(f"Échec connexion: {r.status_code} - {r.text}")
+                except requests.exceptions.ReadTimeout:
+                    st.error("La connexion a expiré (timeout). Vérifie que l'API répond bien.")
                 except Exception as e:
                     st.error(f"Erreur réseau: {e}")
     return None
@@ -86,8 +110,11 @@ def reco_cards(items: List[Dict[str, Any]]):
 
             st.markdown(f"### {title}")
             if score is not None:
-                st.progress(min(max(float(score), 0.0), 1.0))
-                st.caption(f"Score modèle: {score:.2f}")
+                try:
+                    st.progress(min(max(float(score), 0.0), 1.0))
+                    st.caption(f"Score modèle: {float(score):.2f}")
+                except Exception:
+                    st.caption(f"Score modèle: {score}")
             if rating is not None or meta is not None:
                 st.text(f"Rating: {rating if rating is not None else '-'} | Metacritic: {meta if meta is not None else '-'}")
             if platforms:
@@ -121,6 +148,17 @@ st.title("🎯 Recommandations & Meilleur prix")
 # Login (obligatoire pour consommer les endpoints protégés)
 token = ensure_token()
 
+# ⚡ Pré-chargement modèle (évite gros délai sur 1er appel)
+if token and not st.session_state.get("warmed_up", False):
+    try:
+        m = api_get("/model/metrics", token=token)
+        if m.ok and not m.json().get("is_trained", False):
+            with st.spinner("Préparation du modèle (une seule fois)…"):
+                _ = api_post("/model/train", token=token, json={"force_retrain": False})
+        st.session_state["warmed_up"] = True
+    except Exception:
+        pass
+
 # Onglets
 onglets = st.tabs([
     "🔎 Par titre",
@@ -144,13 +182,21 @@ with onglets[0]:
         elif not title:
             st.warning("Saisissez un titre.")
         else:
-            r = api_get(f"/recommend/by-title/{title}", token=token, k=k)
-            if r.ok:
-                data = r.json()
-                items = data.get("recommendations") or []
-                reco_cards(items)
-            else:
-                st.error(f"Erreur API: {r.status_code} - {r.text}")
+            try:
+                # Encode le titre dans le path pour éviter les 404/timeout sur espaces & caractères spéciaux
+                encoded_title = safe_path_component(title)
+                with st.spinner("Requête en cours…"):
+                    r = api_get(f"/recommend/by-title/{encoded_title}", token=token, k=k)
+                if r.ok:
+                    data = r.json()
+                    items = data.get("recommendations") or []
+                    reco_cards(items)
+                else:
+                    st.error(f"Erreur API: {r.status_code} - {r.text}")
+            except requests.exceptions.ReadTimeout:
+                st.error("Timeout côté client. Le backend peut entraîner le modèle au 1er appel. Réessaie, ou utilise l'onglet 📊 pour pré-entraîner.")
+            except Exception as e:
+                st.error(f"Erreur: {e}")
 
 # ------------- Onglet: Par genre -------------
 with onglets[1]:
@@ -166,13 +212,20 @@ with onglets[1]:
         elif not genre:
             st.warning("Saisissez un genre.")
         else:
-            r = api_get(f"/recommend/by-genre/{genre}", token=token, k=k2)
-            if r.ok:
-                data = r.json()
-                items = data.get("recommendations") or []
-                reco_cards(items)
-            else:
-                st.error(f"Erreur API: {r.status_code} - {r.text}")
+            try:
+                encoded_genre = safe_path_component(genre)
+                with st.spinner("Requête en cours…"):
+                    r = api_get(f"/recommend/by-genre/{encoded_genre}", token=token, k=k2)
+                if r.ok:
+                    data = r.json()
+                    items = data.get("recommendations") or []
+                    reco_cards(items)
+                else:
+                    st.error(f"Erreur API: {r.status_code} - {r.text}")
+            except requests.exceptions.ReadTimeout:
+                st.error("Timeout côté client. Réessaie après avoir ouvert l'onglet 📊 pour précharger le modèle.")
+            except Exception as e:
+                st.error(f"Erreur: {e}")
 
 # ------------- Onglet: Recherche ML (mots-clés) -------------
 with onglets[2]:
@@ -192,14 +245,20 @@ with onglets[2]:
         elif not query.strip():
             st.warning("Saisissez une requête.")
         else:
-            r = api_post("/recommend/ml", token=token, json={"query": query, "k": k3, "min_confidence": min_conf})
-            if r.ok:
-                j = r.json()
-                st.caption(f"Version modèle: {j.get('model_version','?')} — Latence: {j.get('latency_ms',0):.0f} ms")
-                items = j.get("recommendations") or []
-                reco_cards(items)
-            else:
-                st.error(f"Erreur API: {r.status_code} - {r.text}")
+            try:
+                with st.spinner("Requête ML en cours…"):
+                    r = api_post("/recommend/ml", token=token, json={"query": query, "k": k3, "min_confidence": min_conf})
+                if r.ok:
+                    j = r.json()
+                    st.caption(f"Version modèle: {j.get('model_version','?')} — Latence: {j.get('latency_ms',0):.0f} ms")
+                    items = j.get("recommendations") or []
+                    reco_cards(items)
+                else:
+                    st.error(f"Erreur API: {r.status_code} - {r.text}")
+            except requests.exceptions.ReadTimeout:
+                st.error("Timeout côté client sur /recommend/ml. Essaie à nouveau après préchauffage du modèle.")
+            except Exception as e:
+                st.error(f"Erreur: {e}")
 
 # ------------- Onglet: Meilleur prix -------------
 with onglets[3]:
@@ -214,13 +273,14 @@ with onglets[3]:
         got_result = False
         if token:
             try:
-                r = api_get("/price/best", token=token, title=title_price, region=None if region == "auto" else region)
+                encoded_t = safe_path_component(title_price)
+                with st.spinner("Recherche du meilleur prix…"):
+                    r = api_get("/price/best", token=token, title=title_price, region=None if region == "auto" else region)
                 if r.ok:
                     data = r.json()
                     got_result = True
                     st.success("Résultats via API backend")
                     st.json(data)
-                # 404 ou autre -> fallback liens
             except Exception:
                 pass
         if not got_result:
@@ -242,11 +302,15 @@ with onglets[4]:
     with colm1:
         st.markdown("**Métriques modèle**")
         if token:
-            r = api_get("/model/metrics", token=token)
-            if r.ok:
-                st.json(r.json())
-            else:
-                st.error(f"Erreur /model/metrics: {r.status_code}")
+            try:
+                with st.spinner("Lecture métriques…"):
+                    r = api_get("/model/metrics", token=token)
+                if r.ok:
+                    st.json(r.json())
+                else:
+                    st.error(f"Erreur /model/metrics: {r.status_code}")
+            except requests.exceptions.ReadTimeout:
+                st.error("Timeout sur /model/metrics.")
         else:
             st.info("Connectez-vous pour voir les métriques.")
 
@@ -254,13 +318,16 @@ with onglets[4]:
         if token:
             tests = st.text_input("Requêtes (séparées par virgules)", value="RPG, Action, Indie, Simulation")
             if st.button("Évaluer"):
-                queries = [t.strip() for t in tests.split(",") if t.strip()]
-                r = api_post("/model/evaluate", token=token, json=None, data=None,)
-                # NB: l'endpoint /model/evaluate du backend lit la Query param côté FastAPI; ici, on affichera le retour brut
-                if r.ok:
-                    st.json(r.json())
-                else:
-                    st.error(f"Erreur /model/evaluate: {r.status_code} - {r.text}")
+                try:
+                    # L'endpoint lit la Query param côté backend; appel simple
+                    with st.spinner("Évaluation en cours…"):
+                        r = api_post("/model/evaluate", token=token)
+                    if r.ok:
+                        st.json(r.json())
+                    else:
+                        st.error(f"Erreur /model/evaluate: {r.status_code} - {r.text}")
+                except requests.exceptions.ReadTimeout:
+                    st.error("Timeout sur /model/evaluate.")
 
     with colm2:
         st.markdown("**Explorer un cluster**")
@@ -268,23 +335,31 @@ with onglets[4]:
             cid = st.number_input("ID cluster", min_value=0, value=0, step=1)
             sample = st.slider("Taille d'échantillon", 1, 200, 20)
             if st.button("Voir les jeux du cluster"):
-                r = api_get(f"/recommend/cluster/{int(cid)}", token=token, sample=sample)
-                if r.ok:
-                    data = r.json()
-                    st.write(f"Cluster {data.get('cluster')} — {data.get('count')} jeux")
-                    items = data.get("games") or []
-                    reco_cards(items)
-                else:
-                    st.error(f"Erreur /recommend/cluster: {r.status_code} - {r.text}")
+                try:
+                    with st.spinner("Chargement cluster…"):
+                        r = api_get(f"/recommend/cluster/{int(cid)}", token=token, sample=sample)
+                    if r.ok:
+                        data = r.json()
+                        st.write(f"Cluster {data.get('cluster')} — {data.get('count')} jeux")
+                        items = data.get("games") or []
+                        reco_cards(items)
+                    else:
+                        st.error(f"Erreur /recommend/cluster: {r.status_code} - {r.text}")
+                except requests.exceptions.ReadTimeout:
+                    st.error("Timeout sur /recommend/cluster.")
 
         st.markdown("**Termes top par cluster**")
         if token and st.button("Afficher les top termes"):
-            r = api_get("/recommend/cluster-explore", token=token, top_terms=10)
-            if r.ok:
-                st.json(r.json())
-            else:
-                st.error(f"Erreur /recommend/cluster-explore: {r.status_code} - {r.text}")
+            try:
+                with st.spinner("Lecture des top termes…"):
+                    r = api_get("/recommend/cluster-explore", token=token, top_terms=10)
+                if r.ok:
+                    st.json(r.json())
+                else:
+                    st.error(f"Erreur /recommend/cluster-explore: {r.status_code} - {r.text}")
+            except requests.exceptions.ReadTimeout:
+                st.error("Timeout sur /recommend/cluster-explore.")
 
 # Footer
 st.divider()
-st.caption("Propulsé par votre API Games+ (C9→C13) — Auth JWT, reco ML, monitoring Prometheus.")
+st.caption("Propulsé par votre API Games+ (C9→C13) — Auth JWT, reco ML, monitoring Prometheus. ⏱️ Timeouts augmentés & encodage des URLs pour éviter les ReadTimeout/404.")
