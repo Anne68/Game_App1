@@ -1,528 +1,417 @@
-# enhanced_model_manager.py - Modèle hybride avec Gradient Boosting
+# model_manager.py - Gestion du modèle de recommandation (Pipeline TF-IDF → SVD → KMeans → KNN)
 from __future__ import annotations
 
 import os
 import pickle
 import logging
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Any
-from dataclasses import dataclass
 
-# Imports ML
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.cluster import KMeans
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import mean_squared_error, r2_score
 
-logger = logging.getLogger("enhanced-model-manager")
+logger = logging.getLogger("model-manager")
 
-@dataclass
-class ModelMetrics:
-    """Métriques du modèle hybride"""
-    content_based_accuracy: float
-    collaborative_accuracy: float
-    gb_score: float
-    combined_score: float
-    training_time: float
-    prediction_time: float
-
-class HybridRecommendationModel:
+class RecommendationModel:
     """
-    Modèle de recommandation hybride avec Gradient Boosting
-    
-    Architecture:
-    1. Content-Based: TF-IDF + SVD (similarité contenu)
-    2. Collaborative: Matrix Factorization (NMF-style)
-    3. Gradient Boosting: Prédiction de rating basée sur features
-    4. Ensemble: Combinaison pondérée des 3 approches
+    Modèle de recommandation avec pipeline :
+      TF-IDF (titre+genres+plateformes) -> SVD -> KMeans (8 clusters) -> KNN (NearestNeighbors)
+    Méthodes spécialisées :
+      - predict(query)
+      - predict_by_game_id(game_id)
+      - recommend_by_title_similarity(query_title)
+      - recommend_by_genre(genre)
+      - get_cluster_games(cluster_id)
+      - cluster_explore() / random_cluster()
     """
-    
-    def __init__(self, model_version: str = "3.0.0-hybrid"):
+
+    def __init__(self, model_version: str = "2.0.0"):
         self.model_version = model_version
-        
-        # === Composants Content-Based ===
-        self.content_vectorizer = TfidfVectorizer(
-            max_features=2000,
-            ngram_range=(1, 3),
+
+        # Texte (contenu)
+        self.vectorizer = TfidfVectorizer(
+            max_features=5000,
+            ngram_range=(1, 2),
             stop_words="english",
-            lowercase=True,
-            min_df=2
+            lowercase=True
         )
-        self.content_svd = TruncatedSVD(n_components=50, random_state=42)
-        
-        # === Composants Collaborative ===
-        self.user_item_matrix = None
-        self.user_features = None
-        self.item_features = None
-        self.collab_knn = NearestNeighbors(metric="cosine", n_neighbors=20)
-        
-        # === Gradient Boosting pour Rating Prediction ===
-        self.gb_regressor = GradientBoostingRegressor(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=6,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            subsample=0.8,
-            random_state=42
+        self.svd = TruncatedSVD(n_components=128, random_state=42)
+
+        # Titre seul (pour similarité stricte par titre)
+        self.title_vectorizer = TfidfVectorizer(
+            max_features=8000,
+            analyzer="char",
+            ngram_range=(3, 5),
+            lowercase=True
         )
-        self.feature_scaler = StandardScaler()
-        self.genre_encoder = LabelEncoder()
-        self.platform_encoder = LabelEncoder()
-        
-        # === Clustering ===
-        self.kmeans = KMeans(n_clusters=12, random_state=42, n_init="auto")
-        
-        # === État du modèle ===
-        self.is_trained = False
-        self.games_df = None
-        self.content_features = None
-        self.numerical_features = None
-        self.cluster_labels = None
-        
-        # === Poids pour l'ensemble ===
-        self.ensemble_weights = {
-            "content": 0.4,
-            "collaborative": 0.3,
-            "gradient_boosting": 0.3
+
+        # Clustering et KNN
+        self.kmeans = KMeans(n_clusters=8, random_state=42, n_init="auto")
+        self.knn = NearestNeighbors(metric="cosine", n_neighbors=50, algorithm="auto")
+
+        # Données/features
+        self.game_features: Optional[np.ndarray] = None          # features réduites + numériques
+        self.features_reduced: Optional[np.ndarray] = None       # uniquement SVD
+        self.tfidf_matrix: Optional[np.ndarray] = None           # TF-IDF brut (sparse)
+        self.cluster_labels: Optional[np.ndarray] = None
+        self.games_df: Optional[pd.DataFrame] = None
+        self.is_trained: bool = False
+
+        # Caches
+        self._id_to_index: Dict[int, int] = {}
+        self._neighbors_cache: Dict[int, List[Tuple[int, float]]] = {}
+
+        # Métriques
+        self.metrics = {
+            "total_predictions": 0,
+            "avg_confidence": 0.0,
+            "last_training": None,
+            "model_version": model_version,
+            "feature_dim": 0
         }
-        
-        # === Métriques ===
-        self.metrics = ModelMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        self.prediction_count = 0
-        
+
+    # -----------------------------
+    # Préparation des features
+    # -----------------------------
     def prepare_features(self, games: List[Dict]) -> pd.DataFrame:
-        """Préparation avancée des features pour le modèle hybride"""
         df = pd.DataFrame(games)
-        
-        # === Nettoyage des données ===
-        df["title"] = df["title"].fillna("Unknown Game")
-        df["genres"] = df["genres"].fillna("Unknown")
-        df["platforms"] = df["platforms"].apply(
-            lambda x: " ".join(x) if isinstance(x, list) else str(x or "Unknown")
-        )
-        
-        # === Features textuelles combinées ===
-        df["combined_text"] = (
-            df["title"] + " " + 
-            df["genres"] + " " + 
-            df["platforms"]
-        )
-        
-        # === Features numériques robustes ===
-        df["rating"] = pd.to_numeric(df["rating"], errors="coerce").fillna(4.0)
-        df["metacritic"] = pd.to_numeric(df["metacritic"], errors="coerce").fillna(75)
-        
-        # === Features d'ingénierie ===
-        # Popularité basée sur le nombre de plateformes
-        df["platform_count"] = df["platforms"].apply(lambda x: len(x.split()))
-        
-        # Score composite
-        df["composite_score"] = (df["rating"] * 0.7 + df["metacritic"] / 20 * 0.3)
-        
-        # Catégorisation des genres
-        df["is_action"] = df["genres"].str.contains("Action", case=False, na=False).astype(int)
-        df["is_rpg"] = df["genres"].str.contains("RPG", case=False, na=False).astype(int)
-        df["is_indie"] = df["genres"].str.contains("Indie", case=False, na=False).astype(int)
-        df["is_strategy"] = df["genres"].str.contains("Strategy", case=False, na=False).astype(int)
-        
-        # Normalisation
-        for col in ["rating", "metacritic", "composite_score"]:
-            col_min, col_max = df[col].min(), df[col].max()
-            if col_max > col_min:
-                df[f"{col}_norm"] = (df[col] - col_min) / (col_max - col_min)
-            else:
-                df[f"{col}_norm"] = 0.5
-        
+
+        # Texte combiné pour le contenu
+        df["platforms_str"] = df["platforms"].apply(lambda x: " ".join(x) if isinstance(x, list) else str(x or ""))
+        df["combined_features"] = (df["title"].fillna("") + " " +
+                                   df["genres"].fillna("") + " " +
+                                   df["platforms_str"].fillna(""))
+
+        # Normalisation numérique robuste (évite division par zéro)
+        for col in ["rating", "metacritic"]:
+            if col not in df:
+                df[col] = 0
+        df["rating"] = pd.to_numeric(df["rating"], errors="coerce").fillna(0.0)
+        df["metacritic"] = pd.to_numeric(df["metacritic"], errors="coerce").fillna(0.0)
+
+        def norm_col(x: pd.Series) -> pd.Series:
+            x_min, x_max = float(x.min()), float(x.max())
+            if x_max == x_min:
+                return pd.Series(np.zeros(len(x)))
+            return (x - x_min) / (x_max - x_min)
+
+        df["rating_norm"] = norm_col(df["rating"])
+        df["metacritic_norm"] = norm_col(df["metacritic"])
+
         return df
-    
-    def train(self, games: List[Dict]) -> Dict[str, Any]:
-        """Entraînement du modèle hybride"""
-        start_time = datetime.utcnow()
-        logger.info(f"Training hybrid model v{self.model_version} with {len(games)} games")
-        
-        # === 1. Préparation des données ===
+
+    # -----------------------------
+    # Entraînement
+    # -----------------------------
+    def train(self, games: List[Dict]) -> Dict:
+        logger.info(f"Training model v{self.model_version} with {len(games)} games")
+
         self.games_df = self.prepare_features(games)
-        
-        # === 2. Entraînement Content-Based ===
-        content_metrics = self._train_content_based()
-        
-        # === 3. Entraînement Collaborative ===
-        collab_metrics = self._train_collaborative()
-        
-        # === 4. Entraînement Gradient Boosting ===
-        gb_metrics = self._train_gradient_boosting()
-        
-        # === 5. Clustering ===
-        self._train_clustering()
-        
-        # === 6. Validation croisée ===
-        validation_metrics = self._cross_validate()
-        
+
+        # TF-IDF contenu -> SVD
+        self.tfidf_matrix = self.vectorizer.fit_transform(self.games_df["combined_features"])
+        self.features_reduced = self.svd.fit_transform(self.tfidf_matrix)
+
+        # Concat avec numériques
+        numeric = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float)
+        self.game_features = np.hstack([self.features_reduced, numeric])
+
+        # KMeans + KNN
+        self.cluster_labels = self.kmeans.fit_predict(self.features_reduced)
+        self.knn.fit(self.game_features)
+
+        # Vectoriseur de titres pour similarité stricte titres
+        self.title_tfidf = self.title_vectorizer.fit_transform(self.games_df["title"].fillna(""))
+
+        # Index rapides
+        self._id_to_index = {int(self.games_df.iloc[idx]["id"]): idx for idx in range(len(self.games_df))}
+        self._neighbors_cache.clear()
+
         self.is_trained = True
-        training_time = (datetime.utcnow() - start_time).total_seconds()
-        
-        # === 7. Mise à jour des métriques ===
-        self.metrics = ModelMetrics(
-            content_based_accuracy=content_metrics.get("accuracy", 0.0),
-            collaborative_accuracy=collab_metrics.get("accuracy", 0.0),
-            gb_score=gb_metrics.get("r2_score", 0.0),
-            combined_score=validation_metrics.get("ensemble_score", 0.0),
-            training_time=training_time,
-            prediction_time=0.0
-        )
-        
-        logger.info(f"Hybrid model trained in {training_time:.2f}s")
-        
+        self.metrics["last_training"] = datetime.utcnow().isoformat()
+        self.metrics["feature_dim"] = int(self.game_features.shape[1])
+
+        validation = self._validate_model()
+        logger.info(f"Model trained. Features: {self.game_features.shape}, clusters: {len(np.unique(self.cluster_labels))}")
         return {
             "status": "success",
             "model_version": self.model_version,
-            "training_time": training_time,
             "games_count": len(games),
-            "content_metrics": content_metrics,
-            "collaborative_metrics": collab_metrics,
-            "gb_metrics": gb_metrics,
-            "validation_metrics": validation_metrics,
-            "ensemble_weights": self.ensemble_weights
+            "feature_dim": int(self.game_features.shape[1]),
+            "validation_metrics": validation
         }
-    
-    def _train_content_based(self) -> Dict[str, float]:
-        """Entraînement du composant content-based"""
-        logger.info("Training content-based component...")
-        
-        # TF-IDF sur le texte combiné
-        tfidf_matrix = self.content_vectorizer.fit_transform(self.games_df["combined_text"])
-        
-        # SVD pour réduction dimensionnelle
-        n_features = tfidf_matrix.shape[1]
-        n_components = min(50, max(5, n_features - 1))
-        self.content_svd = TruncatedSVD(n_components=n_components, random_state=42)
-        
-        self.content_features = self.content_svd.fit_transform(tfidf_matrix)
-        
-        # Métriques de qualité (variance expliquée par SVD)
-        explained_variance = self.content_svd.explained_variance_ratio_.sum()
-        
-        return {
-            "accuracy": explained_variance,
-            "n_components": n_components,
-            "n_features": n_features,
-            "explained_variance": explained_variance
-        }
-    
-    def _train_collaborative(self) -> Dict[str, float]:
-        """Entraînement du composant collaborative filtering"""
-        logger.info("Training collaborative filtering component...")
-        
-        # Simulation d'interactions utilisateur-jeu pour la démo
-        # En production, ces données viendraient de vraies interactions
-        n_users = min(100, len(self.games_df) * 2)
-        n_games = len(self.games_df)
-        
-        # Création d'une matrice d'interactions simulée
-        np.random.seed(42)
-        user_game_matrix = np.zeros((n_users, n_games))
-        
-        # Simulation d'interactions basées sur les genres préférés
-        for user_id in range(n_users):
-            # Chaque utilisateur a des préférences pour certains genres
-            preferred_genres = np.random.choice(
-                ["Action", "RPG", "Indie", "Strategy", "Simulation"], 
-                size=np.random.randint(1, 4), 
-                replace=False
-            )
-            
-            for game_idx, game_row in self.games_df.iterrows():
-                # Probabilité d'interaction basée sur les genres
-                genre_match = any(genre in game_row["genres"] for genre in preferred_genres)
-                
-                if genre_match and np.random.random() < 0.3:
-                    # Rating basé sur le rating réel du jeu + bruit
-                    base_rating = game_row["rating"]
-                    noise = np.random.normal(0, 0.5)
-                    rating = np.clip(base_rating + noise, 1, 5)
-                    user_game_matrix[user_id, game_idx] = rating
-        
-        self.user_item_matrix = user_game_matrix
-        
-        # Factorisation matricielle simple avec SVD
-        from scipy.sparse.linalg import svds
-        
-        # Centrer les données
-        user_ratings_mean = np.mean(user_game_matrix, axis=1)
-        user_game_matrix_centered = user_game_matrix - user_ratings_mean.reshape(-1, 1)
-        
-        # SVD sur la matrice centrée
-        k = min(20, min(user_game_matrix.shape) - 1)
-        U, sigma, Vt = svds(user_game_matrix_centered, k=k)
-        
-        self.user_features = U
-        self.item_features = Vt.T
-        
-        # Entraîner KNN sur les features d'items
-        self.collab_knn.fit(self.item_features)
-        
-        # Métrique: reconstruction error
-        reconstructed = np.dot(np.dot(U, np.diag(sigma)), Vt)
-        mse = np.mean((user_game_matrix_centered - reconstructed) ** 2)
-        accuracy = max(0, 1 - mse / np.var(user_game_matrix_centered))
-        
-        return {
-            "accuracy": accuracy,
-            "n_factors": k,
-            "reconstruction_mse": mse,
-            "sparsity": np.count_nonzero(user_game_matrix) / user_game_matrix.size
-        }
-    
-    def _train_gradient_boosting(self) -> Dict[str, float]:
-        """Entraînement du modèle Gradient Boosting pour prédiction de rating"""
-        logger.info("Training Gradient Boosting component...")
-        
-        # === Préparation des features pour GB ===
-        gb_features = []
-        
-        # Features numériques
-        numerical_cols = ["metacritic", "platform_count", "composite_score", 
-                         "is_action", "is_rpg", "is_indie", "is_strategy"]
-        
-        for col in numerical_cols:
-            if col in self.games_df.columns:
-                gb_features.append(self.games_df[col].values)
-        
-        # Features de contenu (réduites)
-        content_features_reduced = self.content_features[:, :10]  # Top 10 composantes
-        gb_features.append(content_features_reduced)
-        
-        # Encodage des genres principaux
-        main_genres = self.games_df["genres"].apply(lambda x: x.split()[0] if x.split() else "Unknown")
-        self.genre_encoder.fit(main_genres)
-        genre_encoded = self.genre_encoder.transform(main_genres)
-        gb_features.append(genre_encoded.reshape(-1, 1))
-        
-        # Concaténation de toutes les features
-        X = np.hstack(gb_features)
-        y = self.games_df["rating"].values
-        
-        # === Division train/test ===
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
-        
-        # === Normalisation ===
-        X_train_scaled = self.feature_scaler.fit_transform(X_train)
-        X_test_scaled = self.feature_scaler.transform(X_test)
-        
-        # === Entraînement Gradient Boosting ===
-        self.gb_regressor.fit(X_train_scaled, y_train)
-        
-        # === Évaluation ===
-        y_pred = self.gb_regressor.predict(X_test_scaled)
-        
-        mse = mean_squared_error(y_test, y_pred)
-        r2 = r2_score(y_test, y_pred)
-        
-        # Sauvegarder les features pour prédiction
-        self.numerical_features = X
-        
-        return {
-            "r2_score": r2,
-            "mse": mse,
-            "feature_importance": self.gb_regressor.feature_importances_.tolist(),
-            "n_features": X.shape[1],
-            "train_size": len(X_train),
-            "test_size": len(X_test)
-        }
-    
-    def _train_clustering(self):
-        """Entraînement du clustering sur les features de contenu"""
-        self.cluster_labels = self.kmeans.fit_predict(self.content_features)
-        logger.info(f"Clustering completed with {self.kmeans.n_clusters} clusters")
-    
-    def _cross_validate(self) -> Dict[str, float]:
-        """Validation croisée de l'ensemble"""
-        # Simulation d'une validation croisée simple
-        # En production, cela serait plus sophistiqué
-        
-        ensemble_score = (
-            self.metrics.content_based_accuracy * self.ensemble_weights["content"] +
-            self.metrics.collaborative_accuracy * self.ensemble_weights["collaborative"] +
-            self.metrics.gb_score * self.ensemble_weights["gradient_boosting"]
-        )
-        
-        return {
-            "ensemble_score": ensemble_score,
-            "validation_method": "weighted_average"
-        }
-    
+
+    def _validate_model(self) -> Dict:
+        if not self.is_trained or self.game_features is None:
+            return {"error": "Model not trained"}
+
+        # Mesure de compacité inter/intra cluster simple
+        try:
+            centers = self.kmeans.cluster_centers_  # espace réduit
+            # Distance moyenne jeu->centre de son cluster
+            dists = []
+            for i, z in enumerate(self.features_reduced):
+                c = centers[self.cluster_labels[i]]
+                dists.append(np.linalg.norm(z - c))
+            return {
+                "mean_distance_to_center": float(np.mean(dists)),
+                "std_distance_to_center": float(np.std(dists)),
+                "max_distance_to_center": float(np.max(dists))
+            }
+        except Exception:
+            return {"note": "validation skipped"}
+
+    # -----------------------------
+    # Prédictions & recommandations
+    # -----------------------------
+    def _neighbors_for_index(self, idx: int, k: int) -> List[Tuple[int, float]]:
+        if idx in self._neighbors_cache and len(self._neighbors_cache[idx]) >= k:
+            return self._neighbors_cache[idx][:k]
+        distances, indices = self.knn.kneighbors([self.game_features[idx]], n_neighbors=min(k + 1, len(self.game_features)))
+        # Exclure soi-même (distance zéro)
+        pairs = [(int(j), float(1.0 - distances[0][t])) for t, j in enumerate(indices[0]) if int(j) != idx]
+        self._neighbors_cache[idx] = pairs
+        return pairs[:k]
+
     def predict(self, query: str, k: int = 10, min_confidence: float = 0.1) -> List[Dict]:
-        """Prédiction hybride combinant les 3 approches"""
+        """Recommandations par requête libre (contenu)."""
         if not self.is_trained:
             raise ValueError("Model not trained")
-        
-        start_time = datetime.utcnow()
-        
-        # === 1. Prédictions Content-Based ===
-        content_scores = self._predict_content_based(query, k * 2)
-        
-        # === 2. Prédictions Collaborative ===
-        collab_scores = self._predict_collaborative(k * 2)
-        
-        # === 3. Prédictions Gradient Boosting ===
-        gb_scores = self._predict_gradient_boosting()
-        
-        # === 4. Combinaison Ensemble ===
-        combined_scores = self._combine_predictions(
-            content_scores, collab_scores, gb_scores, k, min_confidence
-        )
-        
-        # === 5. Mise à jour des métriques ===
-        prediction_time = (datetime.utcnow() - start_time).total_seconds()
-        self.metrics.prediction_time = (
-            self.metrics.prediction_time * self.prediction_count + prediction_time
-        ) / (self.prediction_count + 1)
-        self.prediction_count += 1
-        
-        return combined_scores
-    
-    def _predict_content_based(self, query: str, k: int) -> Dict[int, float]:
-        """Prédictions basées sur le contenu"""
-        query_tfidf = self.content_vectorizer.transform([query])
-        query_features = self.content_svd.transform(query_tfidf)
-        
-        similarities = cosine_similarity(query_features, self.content_features)[0]
-        
-        scores = {}
-        for idx, similarity in enumerate(similarities):
-            game_id = int(self.games_df.iloc[idx]["id"])
-            scores[game_id] = float(similarity)
-        
-        return scores
-    
-    def _predict_collaborative(self, k: int) -> Dict[int, float]:
-        """Prédictions collaboratives (simulation)"""
-        # Simulation d'un utilisateur moyen
-        if self.item_features is not None:
-            avg_user_profile = np.mean(self.user_features, axis=0)
-            similarities = cosine_similarity([avg_user_profile], self.item_features)[0]
-            
-            scores = {}
-            for idx, similarity in enumerate(similarities):
-                game_id = int(self.games_df.iloc[idx]["id"])
-                scores[game_id] = float(similarity)
-            
-            return scores
-        
-        return {}
-    
-    def _predict_gradient_boosting(self) -> Dict[int, float]:
-        """Prédictions Gradient Boosting"""
-        if self.numerical_features is not None:
-            X_scaled = self.feature_scaler.transform(self.numerical_features)
-            predicted_ratings = self.gb_regressor.predict(X_scaled)
-            
-            scores = {}
-            for idx, rating in enumerate(predicted_ratings):
-                game_id = int(self.games_df.iloc[idx]["id"])
-                # Normaliser le rating en score 0-1
-                scores[game_id] = float(rating / 5.0)
-            
-            return scores
-        
-        return {}
-    
-    def _combine_predictions(self, content_scores: Dict, collab_scores: Dict, 
-                           gb_scores: Dict, k: int, min_confidence: float) -> List[Dict]:
-        """Combinaison des prédictions avec poids d'ensemble"""
-        
-        all_game_ids = set(content_scores.keys()) | set(collab_scores.keys()) | set(gb_scores.keys())
-        
-        combined_scores = []
-        
-        for game_id in all_game_ids:
-            content_score = content_scores.get(game_id, 0.0)
-            collab_score = collab_scores.get(game_id, 0.0)
-            gb_score = gb_scores.get(game_id, 0.0)
-            
-            # Score combiné
-            final_score = (
-                content_score * self.ensemble_weights["content"] +
-                collab_score * self.ensemble_weights["collaborative"] +
-                gb_score * self.ensemble_weights["gradient_boosting"]
-            )
-            
-            if final_score >= min_confidence:
-                # Récupérer les infos du jeu
-                game_row = self.games_df[self.games_df["id"] == game_id].iloc[0]
-                
-                combined_scores.append({
-                    "id": int(game_id),
-                    "title": game_row["title"],
-                    "genres": game_row["genres"],
-                    "confidence": final_score,
-                    "rating": float(game_row["rating"]),
-                    "metacritic": int(game_row["metacritic"]),
-                    "prediction_breakdown": {
-                        "content_based": content_score,
-                        "collaborative": collab_score,
-                        "gradient_boosting": gb_score
-                    },
-                    "algorithm": "hybrid_ensemble"
-                })
-        
-        # Trier par score et retourner top-k
-        combined_scores.sort(key=lambda x: x["confidence"], reverse=True)
-        return combined_scores[:k]
-    
-    def get_model_info(self) -> Dict[str, Any]:
-        """Informations détaillées sur le modèle hybride"""
+
+        # Projeter la requête dans l'espace
+        q_tfidf = self.vectorizer.transform([query])
+        q_red = self.svd.transform(q_tfidf)
+        avg_num = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float).mean(axis=0)
+        q_feat = np.hstack([q_red[0], avg_num])
+
+        # KNN global
+        distances, indices = self.knn.kneighbors([q_feat], n_neighbors=min(k * 3, len(self.game_features)))
+        recs = []
+        for t, j in enumerate(indices[0]):
+            score = 1.0 - float(distances[0][t])  # convertir distance cos en similarité
+            if score < min_confidence:
+                continue
+            row = self.games_df.iloc[int(j)]
+            recs.append({
+                "id": int(row["id"]),
+                "title": row["title"],
+                "genres": row["genres"],
+                "confidence": score,
+                "rating": float(row["rating"]),
+                "metacritic": int(row["metacritic"]),
+                "cluster": int(self.cluster_labels[int(j)])
+            })
+            if len(recs) >= k:
+                break
+
+        # métriques
+        self._update_metrics(recs, k)
+        return recs
+
+    def predict_by_game_id(self, game_id: int, k: int = 10) -> List[Dict]:
+        """Recommandations type 'jeux similaires' à un jeu existant (KNN)."""
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        if game_id not in self._id_to_index:
+            raise ValueError(f"Game with id {game_id} not found")
+
+        idx = self._id_to_index[game_id]
+        pairs = self._neighbors_for_index(idx, k)
+        recs = []
+        for j, score in pairs:
+            row = self.games_df.iloc[j]
+            recs.append({
+                "id": int(row["id"]),
+                "title": row["title"],
+                "genres": row["genres"],
+                "confidence": score,
+                "rating": float(row["rating"]),
+                "metacritic": int(row["metacritic"]),
+                "cluster": int(self.cluster_labels[j])
+            })
+        self._update_metrics(recs, k)
+        return recs
+
+    def recommend_by_title_similarity(self, query_title: str, k: int = 10, min_confidence: float = 0.0) -> List[Dict]:
+        """Similarité stricte sur les titres (TF-IDF caractères) — utile pour typo/fuzzy."""
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        q = self.title_vectorizer.transform([query_title])
+        sims = cosine_similarity(q, self.title_tfidf)[0]
+        order = np.argsort(sims)[::-1]
+        recs = []
+        for idx in order[:k * 2]:
+            score = float(sims[idx])
+            if score < min_confidence:
+                continue
+            row = self.games_df.iloc[int(idx)]
+            recs.append({
+                "id": int(row["id"]),
+                "title": row["title"],
+                "genres": row["genres"],
+                "confidence": score,
+                "rating": float(row["rating"]),
+                "metacritic": int(row["metacritic"]),
+                "cluster": int(self.cluster_labels[int(idx)])
+            })
+            if len(recs) >= k:
+                break
+        self._update_metrics(recs, k)
+        return recs
+
+    def recommend_by_genre(self, genre: str, k: int = 10) -> List[Dict]:
+        """Filtrage simple par genre: prend les plus proches d'une 'requête-genre'."""
+        return self.predict(query=genre, k=k, min_confidence=0.0)
+
+    # -----------------------------
+    # Clusters
+    # -----------------------------
+    def get_cluster_games(self, cluster_id: int, sample: Optional[int] = None) -> List[Dict]:
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        if cluster_id < 0 or cluster_id >= self.kmeans.n_clusters:
+            raise ValueError(f"Cluster id must be in [0, {self.kmeans.n_clusters-1}]")
+        idxs = np.where(self.cluster_labels == cluster_id)[0]
+        if sample is not None and sample > 0:
+            if sample < len(idxs):
+                rng = np.random.default_rng(42)
+                idxs = rng.choice(idxs, size=sample, replace=False)
+        out = []
+        for i in idxs:
+            row = self.games_df.iloc[int(i)]
+            out.append({
+                "id": int(row["id"]),
+                "title": row["title"],
+                "genres": row["genres"],
+                "rating": float(row["rating"]),
+                "metacritic": int(row["metacritic"])
+            })
+        return out
+
+    def _top_terms_per_cluster(self, top_n: int = 10) -> List[Dict]:
+        """
+        Approximation: moyenne TF-IDF par cluster, top features textuelles.
+        """
+        if self.tfidf_matrix is None:
+            return []
+        terms = np.array(self.vectorizer.get_feature_names_out())
+        result = []
+        for c in range(self.kmeans.n_clusters):
+            idxs = np.where(self.cluster_labels == c)[0]
+            if len(idxs) == 0:
+                result.append({"cluster": c, "size": 0, "top_terms": []})
+                continue
+            # moyenne TF-IDF cluster (sparse -> dense mean via .mean(axis=0))
+            mean_vec = self.tfidf_matrix[idxs].mean(axis=0).A1
+            top_idx = np.argsort(mean_vec)[::-1][:top_n]
+            result.append({
+                "cluster": c,
+                "size": int(len(idxs)),
+                "top_terms": terms[top_idx].tolist()
+            })
+        return result
+
+    def cluster_explore(self, top_n_terms: int = 10) -> Dict:
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        sizes = np.bincount(self.cluster_labels, minlength=self.kmeans.n_clusters).tolist()
         return {
-            "model_version": self.model_version,
-            "is_trained": self.is_trained,
-            "components": {
-                "content_based": {
-                    "vectorizer_features": len(self.content_vectorizer.get_feature_names_out()) if self.is_trained else 0,
-                    "svd_components": self.content_svd.n_components if self.is_trained else 0
-                },
-                "collaborative": {
-                    "user_features_shape": self.user_features.shape if self.user_features is not None else None,
-                    "item_features_shape": self.item_features.shape if self.item_features is not None else None
-                },
-                "gradient_boosting": {
-                    "n_estimators": self.gb_regressor.n_estimators,
-                    "max_depth": self.gb_regressor.max_depth,
-                    "learning_rate": self.gb_regressor.learning_rate
-                }
-            },
-            "ensemble_weights": self.ensemble_weights,
-            "metrics": {
-                "content_accuracy": self.metrics.content_based_accuracy,
-                "collaborative_accuracy": self.metrics.collaborative_accuracy,
-                "gb_r2_score": self.metrics.gb_score,
-                "combined_score": self.metrics.combined_score,
-                "training_time": self.metrics.training_time,
-                "avg_prediction_time": self.metrics.prediction_time,
-                "total_predictions": self.prediction_count
-            }
+            "n_clusters": int(self.kmeans.n_clusters),
+            "sizes": sizes,
+            "top_terms": self._top_terms_per_cluster(top_n_terms)
         }
 
-# Fonction singleton mise à jour
-_hybrid_model_instance: Optional[HybridRecommendationModel] = None
+    def random_cluster(self, sample: int = 12) -> Dict:
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        c = int(np.random.default_rng().integers(0, self.kmeans.n_clusters))
+        games = self.get_cluster_games(c, sample=sample)
+        return {"cluster": c, "sample": games}
 
-def get_hybrid_model() -> HybridRecommendationModel:
-    """Récupère l'instance du modèle hybride"""
-    global _hybrid_model_instance
-    if _hybrid_model_instance is None:
-        _hybrid_model_instance = HybridRecommendationModel()
-    return _hybrid_model_instance
+    # -----------------------------
+    # Persistance & métriques
+    # -----------------------------
+    def save_model(self, filepath: str = "model/recommendation_model.pkl") -> bool:
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            model_data = {
+                "version": self.model_version,
+                "vectorizer": self.vectorizer,
+                "svd": self.svd,
+                "kmeans": self.kmeans,
+                "knn": self.knn,
+                "title_vectorizer": self.title_vectorizer,
+                "title_tfidf": getattr(self, "title_tfidf", None),
+                "tfidf_matrix": self.tfidf_matrix,
+                "features_reduced": self.features_reduced,
+                "game_features": self.game_features,
+                "cluster_labels": self.cluster_labels,
+                "games_df": self.games_df,
+                "metrics": self.metrics,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            with open(filepath, "wb") as f:
+                pickle.dump(model_data, f)
+            logger.info(f"Model saved to {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save model: {e}")
+            return False
 
-def reset_hybrid_model():
-    """Reset l'instance du modèle hybride"""
-    global _hybrid_model_instance
-    _hybrid_model_instance = None
+    def load_model(self, filepath: str = "model/recommendation_model.pkl") -> bool:
+        try:
+            with open(filepath, "rb") as f:
+                m = pickle.load(f)
+
+            self.model_version = m["version"]
+            self.vectorizer = m["vectorizer"]
+            self.svd = m["svd"]
+            self.kmeans = m["kmeans"]
+            self.knn = m["knn"]
+            self.title_vectorizer = m["title_vectorizer"]
+            self.title_tfidf = m["title_tfidf"]
+            self.tfidf_matrix = m["tfidf_matrix"]
+            self.features_reduced = m["features_reduced"]
+            self.game_features = m["game_features"]
+            self.cluster_labels = m["cluster_labels"]
+            self.games_df = m["games_df"]
+            self.metrics = m["metrics"]
+            self._id_to_index = {int(row.id): idx for idx, row in self.games_df[["id"]].itertuples(index=True)}
+            self._neighbors_cache.clear()
+            self.is_trained = True
+            logger.info(f"Model v{self.model_version} loaded from {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            return False
+
+    def _update_metrics(self, recs: List[Dict], k: int):
+        self.metrics["total_predictions"] += 1
+        if recs:
+            avg_conf = float(np.mean([r["confidence"] for r in recs[:k]]))
+            n = self.metrics["total_predictions"]
+            self.metrics["avg_confidence"] = (self.metrics["avg_confidence"] * (n - 1) + avg_conf) / n
+
+    def get_metrics(self) -> Dict:
+        return {
+            **self.metrics,
+            "is_trained": self.is_trained,
+            "games_count": len(self.games_df) if self.games_df is not None else 0
+        }
+
+
+# Singleton
+_model_instance: Optional[RecommendationModel] = None
+
+def get_model() -> RecommendationModel:
+    global _model_instance
+    if _model_instance is None:
+        _model_instance = RecommendationModel()
+        if os.path.exists("model/recommendation_model.pkl"):
+            _model_instance.load_model()
+    return _model_instance
