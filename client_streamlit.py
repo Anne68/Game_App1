@@ -13,9 +13,9 @@ import pandas as pd
 # Point this to your deployed FastAPI base URL (without trailing slash)
 # Examples:
 #   - Local:        http://127.0.0.1:8000
-#   - Render:       https://your-service.onrender.com
+#   - Render:       https://game-app-y8be.onrender.com
 #   - AlwaysData:   https://your-domain.alwaysdata.net
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://game-app-y8be.onrender.com")
 
 # Optional demo credentials if your API is in demo mode when DB is unavailable
 DEMO_USERNAME = os.getenv("DEMO_USERNAME", "demo")
