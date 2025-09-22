@@ -1,65 +1,58 @@
-# api_enhanced_games.py - API intégrée avec modèle hybride et wishlist
+# api_games_plus.py
 from __future__ import annotations
-
 import os
-import asyncio
+import time
+import math
 import logging
-from datetime import datetime
-from typing import List, Dict, Optional, Any
+import inspect
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any, Tuple
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+import pymysql
+from fastapi import FastAPI, HTTPException, Depends, Form, Query, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
+from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel
 
-# Imports existants
 from settings import get_settings
-from monitoring_metrics import get_monitor, prediction_latency, model_prediction_counter
-
-# Nouveaux imports
-from model_manager import get_hybrid_model, reset_hybrid_model, HybridRecommendationModel
-from wishlist_manager import (
-    WishlistManager, WishlistAddRequest, WishlistUpdateRequest, 
-    WishlistResponse, NotificationResponse
+from model_manager import get_model
+from monitoring_metrics import (
+    prediction_latency,
+    model_prediction_counter,
+    get_monitor,
 )
 
-logger = logging.getLogger("enhanced-games-api")
+logger = logging.getLogger("games-api-ml")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+
+# Compliance (optionnel)
+try:
+    from compliance.standards_compliance import SecurityValidator, AccessibilityValidator
+    COMPLIANCE_AVAILABLE = True
+    logger.info("Compliance module loaded successfully")
+except ImportError as e:
+    COMPLIANCE_AVAILABLE = False
+    logger.warning(f"Compliance module not available: {e}")
+
 settings = get_settings()
+SECRET_KEY = settings.SECRET_KEY
+ALGORITHM = settings.ALGORITHM
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
-# =========================
-# NOUVEAUX MODELS PYDANTIC
-# =========================
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+pwd_ctx = CryptContext(schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"], deprecated="auto")
 
-class HybridPredictionRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=500)
-    k: int = Field(default=10, ge=1, le=50)
-    min_confidence: float = Field(default=0.1, ge=0.0, le=1.0)
-    algorithm: str = Field(default="hybrid_ensemble", 
-                          pattern="^(hybrid_ensemble|content_only|collaborative_only|gradient_boosting_only)$")
-
-class HybridTrainRequest(BaseModel):
-    version: Optional[str] = None
-    force_retrain: bool = False
-    ensemble_weights: Optional[Dict[str, float]] = None
-
-class PriceCheckRequest(BaseModel):
-    check_all: bool = False
-    user_id: Optional[int] = None
-
-class ModelInfoResponse(BaseModel):
-    model_version: str
-    is_trained: bool
-    components: Dict[str, Any]
-    ensemble_weights: Dict[str, float]
-    metrics: Dict[str, Any]
-
-# =========================
-# FASTAPI APP SETUP
-# =========================
+DB_READY: bool = False
+DB_LAST_ERROR: Optional[str] = None
 
 app = FastAPI(
-    title="Enhanced Games API with Hybrid ML & Wishlist",
-    version="3.0.0",
-    description="API avec modèle hybride (Content+Collaborative+GradientBoosting) et système de wishlist avec notifications",
+    title="Games API ML (C9→C13)",
+    version="2.5.0",
+    description="API avec modèle ML, monitoring avancé et MySQL (AlwaysData) pour les utilisateurs",
 )
 
 app.add_middleware(
@@ -70,23 +63,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Variables globales
-DB_READY: bool = False
-HYBRID_MODEL_READY: bool = False
-PRICE_MONITORING_TASK: Optional[asyncio.Task] = None
-wishlist_manager: Optional[WishlistManager] = None
+# ----------------- Compliance helpers -----------------
+def setup_compliance():
+    if COMPLIANCE_AVAILABLE:
+        try:
+            app.state.security_validator = SecurityValidator()
+            app.state.accessibility_validator = AccessibilityValidator()
+            logger.info("Compliance validators attached to app state")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to setup compliance validators: {e}")
+            return False
+    logger.info("Compliance not available - continuing without")
+    return False
 
-# =========================
-# UTILITAIRES BASE DE DONNÉES
-# =========================
+COMPLIANCE_ENABLED = setup_compliance()
+
+def get_security_validator():
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'security_validator'):
+        return app.state.security_validator
+    return None
+
+def get_accessibility_validator():
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'accessibility_validator'):
+        return app.state.accessibility_validator
+    return None
+
+# ----------------- Models -----------------
+class TrainRequest(BaseModel):
+    version: Optional[str] = None
+    force_retrain: bool = False
+
+class PredictionRequest(BaseModel):
+    query: str
+    k: int = 10
+    min_confidence: float = 0.1
+
+class SimilarGameRequest(BaseModel):
+    game_id: Optional[int] = None
+    title: Optional[str] = None
+    k: int = 10
+
+class ModelMetricsResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    model_version: str
+    is_trained: bool
+    total_predictions: int
+    avg_confidence: float
+    last_training: Optional[str]
+    games_count: int
+    feature_dimension: int
+
+class TrainResponse(BaseModel):
+    status: str
+    version: Optional[str] = None
+    duration: Optional[float] = None
+    result: Optional[Dict[str, Any]] = None
+
+# ----------------- Utils -----------------
+def get_setting_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = getattr(settings, name, None)
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return default
+
+# ----------------- DB helpers -----------------
+def _ssl_kwargs() -> dict:
+    ssl_dict: Dict[str, str] = {}
+    if getattr(settings, "DB_SSL_CA", None):
+        ssl_dict["ca"] = settings.DB_SSL_CA
+    if getattr(settings, "DB_SSL_CERT", None) and getattr(settings, "DB_SSL_KEY", None):
+        ssl_dict["cert"] = settings.DB_SSL_CERT
+        ssl_dict["key"] = settings.DB_SSL_KEY
+    return {"ssl": ssl_dict} if ssl_dict else {}
 
 def get_db_conn():
-    """Fonction de connexion DB (reprise de l'API existante)"""
-    import pymysql
-    
     if not settings.db_configured:
-        raise RuntimeError("Database not configured")
-    
+        raise RuntimeError("Database not configured (missing DB_* env vars)")
     return pymysql.connect(
         host=settings.DB_HOST,
         port=settings.DB_PORT,
@@ -94,674 +152,609 @@ def get_db_conn():
         password=settings.DB_PASSWORD,
         database=settings.DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True
+        connect_timeout=5,
+        read_timeout=10,
+        write_timeout=10,
+        **_ssl_kwargs(),
     )
 
-def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Récupère les jeux pour l'entraînement ML"""
-    
-    sql = """
-        SELECT game_id_rawg AS id, title, genres, rating, metacritic, platforms
-        FROM games
-        WHERE COALESCE(title,'') <> ''
-        ORDER BY rating DESC
-    """
-    
-    if limit and limit > 0:
-        sql += " LIMIT %s"
-    
+def ensure_users_table():
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SHOW TABLES LIKE 'users';")
+        if not cur.fetchone():
+            cur.execute(
+                """
+                CREATE TABLE users (
+                  id INT AUTO_INCREMENT PRIMARY KEY,
+                  username VARCHAR(190) UNIQUE NOT NULL,
+                  hashed_password VARCHAR(255) NOT NULL,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+            )
+            conn.commit()
+            logger.info("Created users table.")
+            return
+        cur.execute("SHOW COLUMNS FROM users LIKE 'hashed_password';")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE users ADD COLUMN hashed_password VARCHAR(255) NOT NULL;")
+            conn.commit()
+            logger.info("Added 'hashed_password' column.")
+
+def users_has_column(column: str) -> bool:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SHOW COLUMNS FROM users LIKE %s;", (column,))
+        return cur.fetchone() is not None
+
+def get_user(username: str) -> Optional[dict]:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        return cur.fetchone()
+
+def create_user(username: str, password: str) -> int:
+    hpwd = pwd_ctx.hash(password)
+    with get_db_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                "INSERT INTO users(username, hashed_password) VALUES(%s,%s)",
+                (username, hpwd),
+            )
+            user_id = int(cur.lastrowid)
+            if users_has_column("password_hash"):
+                cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (hpwd, user_id))
+            conn.commit()
+            logger.info("User '%s' created (id=%s)", username, user_id)
+            return user_id
+        except pymysql.err.IntegrityError:
+            cur.execute("SELECT id FROM users WHERE username=%s", (username,))
+            row = cur.fetchone()
+            return int(row["id"]) if row and "id" in row else 0
+
+def extract_stored_password(row: dict) -> Tuple[Optional[str], str]:
+    for col in ("hashed_password", "password_hash", "password"):
+        if col in row:
+            v = (row[col] or "").strip()
+            if v:
+                return col, v
+    return None, ""
+
+def update_user_password(username: str, new_hash: str) -> None:
+    set_parts = ["hashed_password=%s"]
+    params = [new_hash]
+    if users_has_column("password_hash"):
+        set_parts.append("password_hash=%s")
+        params.append(new_hash)
+    params.append(username)
+    sql = f"UPDATE users SET {', '.join(set_parts)} WHERE username=%s"
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        conn.commit()
+
+def count_games_in_db() -> int:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM games WHERE COALESCE(title,'') <> ''")
+        row = cur.fetchone()
+        return int(row["n"]) if row else 0
+
+def _parse_platforms(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [p.strip() for p in str(value).split(",") if p.strip()]
+
+def _safe_float(x, default: float = 0.0) -> float:
     try:
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (limit,) if limit else None)
-                rows = cur.fetchall() or []
-    except Exception as e:
-        logger.warning(f"Database error, using fallback data: {e}")
-        # Données de fallback
+        if x is None:
+            return default
+        if isinstance(x, float) and math.isnan(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _safe_int(x, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float) and math.isnan(x):
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+# ---------- IMPORTANT: lire TOUJOURS la BDD (pas de fallback, sauf USE_DEMO_GAMES=true) ----------
+def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    use_demo = get_setting_bool("USE_DEMO_GAMES", False)
+    if not DB_READY and not use_demo:
+        raise RuntimeError("Database not ready and USE_DEMO_GAMES is false")
+
+    if not DB_READY and use_demo:
+        logger.warning("DB not ready. Falling back to demo games because USE_DEMO_GAMES=true")
         return [
             {"id": 1, "title": "The Witcher 3", "genres": "RPG Action", "rating": 4.9, "metacritic": 93, "platforms": ["PC", "PS4"]},
             {"id": 2, "title": "Hades", "genres": "Action Roguelike", "rating": 4.8, "metacritic": 93, "platforms": ["PC", "Switch"]},
             {"id": 3, "title": "Stardew Valley", "genres": "Simulation RPG", "rating": 4.7, "metacritic": 89, "platforms": ["PC", "Switch"]},
             {"id": 4, "title": "Celeste", "genres": "Platformer Indie", "rating": 4.6, "metacritic": 94, "platforms": ["PC", "Switch"]},
             {"id": 5, "title": "Doom Eternal", "genres": "Action FPS", "rating": 4.5, "metacritic": 88, "platforms": ["PC", "PS4"]},
-            {"id": 6, "title": "Cyberpunk 2077", "genres": "RPG Action", "rating": 4.0, "metacritic": 76, "platforms": ["PC", "PS4", "Xbox"]},
-            {"id": 7, "title": "Hollow Knight", "genres": "Metroidvania Indie", "rating": 4.7, "metacritic": 90, "platforms": ["PC", "Switch"]},
+            {"id": 6, "title": "Hollow Knight", "genres": "Metroidvania Indie", "rating": 4.7, "metacritic": 90, "platforms": ["PC", "Switch"]},
+            {"id": 7, "title": "Cyberpunk 2077", "genres": "RPG Action", "rating": 4.0, "metacritic": 76, "platforms": ["PC", "PS4", "Xbox"]},
         ]
-    
-    games = []
+
+    sql = """
+        SELECT
+            game_id_rawg AS id,
+            title,
+            genres,
+            rating,
+            metacritic,
+            platforms
+        FROM games
+        WHERE COALESCE(title,'') <> ''
+    """
+    if limit and limit > 0:
+        sql += " LIMIT %s"
+
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, (limit,) if limit else None)
+        rows = cur.fetchall() or []
+
+    games: List[Dict[str, Any]] = []
     for r in rows:
-        # Parse platforms si c'est une chaîne
-        platforms = r.get("platforms", "")
-        if isinstance(platforms, str):
-            platforms = [p.strip() for p in platforms.split(",") if p.strip()]
-        elif not isinstance(platforms, list):
-            platforms = ["PC"]
-        
         games.append({
             "id": int(r["id"]),
             "title": r.get("title") or "",
             "genres": r.get("genres") or "",
-            "rating": float(r.get("rating") or 0.0),
-            "metacritic": int(r.get("metacritic") or 0),
-            "platforms": platforms,
+            "rating": _safe_float(r.get("rating"), 0.0),
+            "metacritic": _safe_int(r.get("metacritic"), 0),
+            "platforms": _parse_platforms(r.get("platforms")),
         })
-    
-    logger.info(f"Loaded {len(games)} games from database")
+
+    logger.info("Loaded %s games from DB", len(games))
+    if not games:
+        raise RuntimeError("Aucun jeu exploitable trouvé dans la table 'games'.")
     return games
 
-# =========================
-# AUTH HELPERS (repris de l'API existante)
-# =========================
+def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
+    use_demo = get_setting_bool("USE_DEMO_GAMES", False)
+    if not DB_READY and not use_demo:
+        raise RuntimeError("Database not ready and USE_DEMO_GAMES is false")
+    if not DB_READY and use_demo:
+        # recherche simple dans la démo
+        default_games = fetch_games_for_ml()
+        q_lower = q.strip().lower()
+        results = []
+        for game in default_games:
+            if q_lower in game["title"].lower():
+                results.append({
+                    "id": game["id"],
+                    "title": game["title"],
+                    "rating": game["rating"],
+                    "metacritic": game["metacritic"],
+                    "platforms": ",".join(game["platforms"]) if isinstance(game["platforms"], list) else game["platforms"]
+                })
+        return results[:limit]
 
-from fastapi.security import OAuth2PasswordBearer
-from jose import jwt, JWTError
-from passlib.context import CryptContext
+    like = f"%{q.strip().lower()}%"
+    sql = """
+        SELECT
+            g.game_id_rawg AS id,
+            g.title,
+            g.rating,
+            g.metacritic,
+            g.platforms
+        FROM games g
+        WHERE LOWER(g.title) LIKE %s
+        ORDER BY CHAR_LENGTH(g.title) ASC
+        LIMIT %s
+    """
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, (like, max(1, limit)))
+        return cur.fetchall() or []
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# ----------------- Auth helpers -----------------
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def verify_token(token: str = Depends(oauth2_scheme)) -> str:
-    """Vérifie le token JWT"""
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: str = payload.get("sub")
-        if not username:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        sub: str = payload.get("sub")
+        if not sub:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return username
+        return sub
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def get_user_id_from_username(username: str) -> int:
-    """Récupère l'ID utilisateur à partir du nom d'utilisateur"""
+# ----------------- Decorator (latency) -----------------
+def measure_latency(endpoint: str):
+    def decorator(func):
+        if inspect.iscoroutinefunction(func):
+            async def async_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = await func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            async_wrapper.__name__ = func.__name__
+            async_wrapper.__signature__ = inspect.signature(func)
+            return async_wrapper
+        else:
+            def sync_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            sync_wrapper.__name__ = func.__name__
+            sync_wrapper.__signature__ = inspect.signature(func)
+            return sync_wrapper
+    return decorator
+
+# ----------------- System & monitoring -----------------
+@app.get("/healthz", tags=["system"])
+def healthz():
+    model = get_model()
+    model_path = os.path.join("model", "recommendation_model.pkl")
     try:
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM users WHERE username = %s", (username,))
-                row = cur.fetchone()
-                if row:
-                    return int(row["id"])
+        if os.path.exists(model_path):
+            if model.load_model():
+                logger.info("Model %s loaded successfully", getattr(model, "model_version", "unknown"))
+            else:
+                logger.info("No saved model found; will train on first request")
+        else:
+            logger.info("No saved model found; will train on first request")
     except Exception as e:
-        logger.error(f"Error getting user ID: {e}")
-    
-    # Fallback: utiliser un hash du username
-    return abs(hash(username)) % 1000000
+        logger.warning("Error while loading model: %s. Will train on first request.", e)
 
-# =========================
-# ENDPOINTS MODÈLE HYBRIDE
-# =========================
+    if COMPLIANCE_ENABLED:
+        logger.info("E4 Compliance standards active")
+        logger.info(f"Security validator: {get_security_validator() is not None}")
+        logger.info(f"Accessibility validator: {get_accessibility_validator() is not None}")
+    else:
+        logger.warning("E4 Compliance standards not available")
 
-@app.post("/recommend/hybrid", tags=["hybrid-model"])
-def recommend_hybrid(request: HybridPredictionRequest, username: str = Depends(verify_token)):
-    """Recommandations avec le modèle hybride"""
-    
-    if not HYBRID_MODEL_READY:
-        raise HTTPException(status_code=503, detail="Hybrid model not ready")
-    
-    hybrid_model = get_hybrid_model()
-    
-    if not hybrid_model.is_trained:
-        # Auto-entraînement si nécessaire
-        logger.info("Auto-training hybrid model...")
-        games_data = fetch_games_for_ml()
-        hybrid_model.train(games_data)
-    
-    start_time = datetime.utcnow()
-    
-    try:
-        # Selon l'algorithme demandé
-        if request.algorithm == "content_only":
-            recommendations = hybrid_model._predict_content_based_only(request.query, request.k)
-        elif request.algorithm == "collaborative_only":
-            recommendations = hybrid_model._predict_collaborative_only(request.k)
-        elif request.algorithm == "gradient_boosting_only":
-            recommendations = hybrid_model._predict_gradient_boosting_only(request.k)
-        else:  # hybrid_ensemble
-            recommendations = hybrid_model.predict(request.query, request.k, request.min_confidence)
-        
-        latency_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
-        
-        # Enregistrer les métriques
-        get_monitor().record_prediction("recommend_hybrid", request.query, recommendations, latency_ms / 1000)
-        
-        return {
-            "query": request.query,
-            "algorithm": request.algorithm,
-            "recommendations": recommendations,
-            "latency_ms": latency_ms,
-            "model_version": hybrid_model.model_version,
-            "total_results": len(recommendations)
-        }
-        
-    except Exception as e:
-        logger.error(f"Hybrid prediction error: {e}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+    monitor = get_monitor()
+    return {
+        "status": "healthy" if (DB_READY or not settings.DB_REQUIRED) else "degraded",
+        "time": datetime.utcnow().isoformat(),
+        "db_ready": DB_READY,
+        "db_error": DB_LAST_ERROR,
+        "model_loaded": model.is_trained,
+        "model_version": model.model_version,
+        "monitoring": monitor.get_metrics_summary(),
+        "compliance_enabled": COMPLIANCE_ENABLED,
+    }
 
-@app.post("/model/train-hybrid", tags=["hybrid-model"])
-def train_hybrid_model(request: HybridTrainRequest, username: str = Depends(verify_token)):
-    """Entraîne le modèle hybride"""
-    
-    hybrid_model = get_hybrid_model()
-    
-    # Mettre à jour les poids d'ensemble si fournis
-    if request.ensemble_weights:
-        # Validation des poids
-        total_weight = sum(request.ensemble_weights.values())
-        if abs(total_weight - 1.0) > 0.01:
-            raise HTTPException(status_code=400, detail="Ensemble weights must sum to 1.0")
-        
-        hybrid_model.ensemble_weights.update(request.ensemble_weights)
-    
-    # Définir la version
-    if request.version:
-        hybrid_model.model_version = request.version
-    
-    # Récupérer les données d'entraînement
-    games_data = fetch_games_for_ml()
-    
-    if len(games_data) < 5:
-        raise HTTPException(status_code=400, detail="Insufficient training data")
-    
-    try:
-        result = hybrid_model.train(games_data)
-        
-        # Sauvegarder le modèle
+@app.get("/", include_in_schema=False)
+def root():
+    return {"name": app.title, "version": app.version, "status": "ok"}
+
+# Health probe Render HEAD /
+@app.head("/", include_in_schema=False)
+def head_root():
+    return Response(status_code=200)
+
+Instrumentator().instrument(app).expose(app, include_in_schema=True)
+
+# ----------------- Training & metrics -----------------
+def _ensure_model_trained_with_db(force: bool = False):
+    model = get_model()
+    if (not model.is_trained) or force:
+        games = fetch_games_for_ml()
         try:
-            model_path = f"model/hybrid_model_{hybrid_model.model_version}.pkl"
-            hybrid_model.save_model(model_path)
-            result["model_saved"] = True
-            result["model_path"] = model_path
+            model.train(games)
+        except ValueError as e:
+            logger.warning("Training error (%s). Retrying with sanitized numeric fields.", e)
+            for g in games:
+                g["rating"] = _safe_float(g.get("rating"), 0.0)
+                g["metacritic"] = _safe_int(g.get("metacritic"), 0)
+            model.train(games)
+        try:
+            model.save_model()
         except Exception as e:
-            logger.warning(f"Could not save hybrid model: {e}")
-            result["model_saved"] = False
-        
-        global HYBRID_MODEL_READY
-        HYBRID_MODEL_READY = True
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Hybrid training error: {e}")
-        raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
+            logger.warning("Could not save model: %s", e)
 
-@app.get("/model/hybrid/info", tags=["hybrid-model"], response_model=ModelInfoResponse)
-def get_hybrid_model_info(username: str = Depends(verify_token)):
-    """Informations détaillées sur le modèle hybride"""
-    
-    hybrid_model = get_hybrid_model()
-    info = hybrid_model.get_model_info()
-    
-    return ModelInfoResponse(**info)
+@app.post("/model/train", tags=["model"], response_model=TrainResponse)
+def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: str = Depends(verify_token)):
+    start_time = time.time()
+    version = request.version or f"api-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    model = get_model()
+    model.model_version = version
+    games = fetch_games_for_ml()
+    result = model.train(games)
+    duration = time.time() - start_time
+    monitor = get_monitor()
+    monitor.record_training(
+        model_version=version,
+        games_count=len(games),
+        feature_dim=model.game_features.shape[1],
+        duration=duration,
+        metrics=result,
+    )
+    background_tasks.add_task(model.save_model)
+    return TrainResponse(status="success", version=version, duration=duration, result=result)
 
-# Ajouter des méthodes simplifiées au modèle hybride pour les algorithmes séparés
-def add_single_algorithm_methods():
-    """Ajoute des méthodes pour les algorithmes individuels"""
-    
-    def _predict_content_based_only(self, query: str, k: int) -> List[Dict]:
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-        
-        content_scores = self._predict_content_based(query, k * 2)
-        
-        results = []
-        for game_id, score in sorted(content_scores.items(), key=lambda x: x[1], reverse=True)[:k]:
-            game_row = self.games_df[self.games_df["id"] == game_id].iloc[0]
-            results.append({
-                "id": int(game_id),
-                "title": game_row["title"],
-                "genres": game_row["genres"],
-                "confidence": float(score),
-                "rating": float(game_row["rating"]),
-                "metacritic": int(game_row["metacritic"]),
-                "algorithm": "content_only"
-            })
-        
-        return results
-    
-    def _predict_collaborative_only(self, k: int) -> List[Dict]:
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-        
-        collab_scores = self._predict_collaborative(k * 2)
-        
-        results = []
-        for game_id, score in sorted(collab_scores.items(), key=lambda x: x[1], reverse=True)[:k]:
-            game_row = self.games_df[self.games_df["id"] == game_id].iloc[0]
-            results.append({
-                "id": int(game_id),
-                "title": game_row["title"],
-                "genres": game_row["genres"],
-                "confidence": float(score),
-                "rating": float(game_row["rating"]),
-                "metacritic": int(game_row["metacritic"]),
-                "algorithm": "collaborative_only"
-            })
-        
-        return results
-    
-    def _predict_gradient_boosting_only(self, k: int) -> List[Dict]:
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-        
-        gb_scores = self._predict_gradient_boosting()
-        
-        results = []
-        for game_id, score in sorted(gb_scores.items(), key=lambda x: x[1], reverse=True)[:k]:
-            game_row = self.games_df[self.games_df["id"] == game_id].iloc[0]
-            results.append({
-                "id": int(game_id),
-                "title": game_row["title"],
-                "genres": game_row["genres"],
-                "confidence": float(score),
-                "rating": float(game_row["rating"]),
-                "metacritic": int(game_row["metacritic"]),
-                "algorithm": "gradient_boosting_only"
-            })
-        
-        return results
-    
-    # Ajouter les méthodes à la classe
-    HybridRecommendationModel._predict_content_based_only = _predict_content_based_only
-    HybridRecommendationModel._predict_collaborative_only = _predict_collaborative_only
-    HybridRecommendationModel._predict_gradient_boosting_only = _predict_gradient_boosting_only
+@app.get("/model/metrics", tags=["model"], response_model=ModelMetricsResponse)
+def get_model_metrics(user: str = Depends(verify_token)):
+    model = get_model()
+    metrics = model.get_metrics()
+    return ModelMetricsResponse(
+        model_version=metrics.get("model_version", "unknown"),
+        is_trained=metrics.get("is_trained", False),
+        total_predictions=metrics.get("total_predictions", 0),
+        avg_confidence=metrics.get("avg_confidence", 0.0),
+        last_training=metrics.get("last_training"),
+        games_count=metrics.get("games_count", 0),
+        feature_dimension=metrics.get("feature_dim", 0),
+    )
 
-# =========================
-# ENDPOINTS WISHLIST
-# =========================
+@app.post("/model/evaluate", tags=["model"])
+def evaluate_model(test_queries: List[str] = Query(default=["RPG", "Action", "Indie", "Simulation"]),
+                   user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    monitor = get_monitor()
+    return monitor.evaluate_model(model, test_queries)
 
-@app.post("/wishlist", tags=["wishlist"], status_code=201)
-def add_to_wishlist(request: WishlistAddRequest, username: str = Depends(verify_token)):
-    """Ajoute un jeu à la wishlist"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
-    user_id = get_user_id_from_username(username)
-    
+# ----------------- Recos (ML) -----------------
+@app.post("/recommend/ml", tags=["recommend"])
+@measure_latency("recommend_ml")
+def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    clean_query = request.query.strip()
+    sec = get_security_validator()
+    if sec:
+        try:
+            clean_query = sec.sanitize_input(clean_query)
+        except Exception as e:
+            logger.warning(f"Compliance sanitization failed: {e}")
+    if not clean_query:
+        raise HTTPException(status_code=400, detail="Query is empty")
+    start_time = time.time()
     try:
-        wishlist_item = wishlist_manager.add_to_wishlist(user_id, request)
-        
-        return {
-            "id": wishlist_item.id,
-            "game_title": wishlist_item.game_title,
-            "target_price": wishlist_item.target_price,
-            "current_price": wishlist_item.current_price,
-            "price_currency": wishlist_item.price_currency,
-            "created_at": wishlist_item.created_at.isoformat() if wishlist_item.created_at else None,
-            "is_active": wishlist_item.is_active,
-            "message": "Game added to wishlist successfully"
-        }
-        
+        recommendations = model.predict(query=clean_query, k=request.k, min_confidence=request.min_confidence)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Bad input for model: {e}")
+    except Exception:
+        logger.exception("Prediction failed")
+        raise HTTPException(status_code=500, detail="Prediction failed")
+    latency = time.time() - start_time
+    get_monitor().record_prediction("recommend_ml", clean_query, recommendations, latency)
+    response = {
+        "query": clean_query,
+        "recommendations": recommendations,
+        "latency_ms": latency * 1000,
+        "model_version": model.model_version,
+    }
+    acc = get_accessibility_validator()
+    if acc:
+        try:
+            response = acc.enhance_response_accessibility(response)
+        except Exception as e:
+            logger.warning(f"Accessibility enhancement failed: {e}")
+    return response
+
+@app.post("/recommend/similar-game", tags=["recommend"])
+def recommend_similar_game(payload: SimilarGameRequest, user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    game_id = payload.game_id
+    if not game_id and payload.title:
+        matches = find_games_by_title(payload.title, limit=1)
+        if not matches:
+            raise HTTPException(status_code=404, detail="Game not found with given title")
+        game_id = int(matches[0]["id"])
+    if not game_id:
+        raise HTTPException(status_code=400, detail="Provide either 'game_id' or 'title'")
+    try:
+        recs = model.predict_by_game_id(int(game_id), k=max(1, payload.k))
+        return {"source_id": int(game_id), "recommendations": recs, "model_version": model.model_version}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/recommend/cluster/{cluster_id}", tags=["recommend"])
+def recommend_cluster(cluster_id: int, sample: int = Query(50, ge=1, le=500), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    try:
+        games = model.get_cluster_games(cluster_id, sample=sample)
+        return {"cluster": cluster_id, "count": len(games), "games": games}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error adding to wishlist: {e}")
-        raise HTTPException(status_code=500, detail="Failed to add to wishlist")
 
-@app.get("/wishlist", tags=["wishlist"])
-def get_user_wishlist(username: str = Depends(verify_token), active_only: bool = True) -> List[WishlistResponse]:
-    """Récupère la wishlist de l'utilisateur"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
-    user_id = get_user_id_from_username(username)
-    
-    try:
-        wishlist_items = wishlist_manager.get_user_wishlist(user_id, active_only)
-        
-        response_items = []
-        for item in wishlist_items:
-            # Calculer si une alerte est déclenchée
-            alert_triggered = (
-                item.current_price is not None and 
-                item.current_price <= item.target_price
-            )
-            
-            # Calculer la différence de prix
-            price_difference = None
-            if item.current_price:
-                price_difference = item.current_price - item.target_price
-            
-            response_items.append(WishlistResponse(
-                id=item.id,
-                game_title=item.game_title,
-                target_price=item.target_price,
-                current_price=item.current_price,
-                price_currency=item.price_currency,
-                created_at=item.created_at.isoformat() if item.created_at else "",
-                is_active=item.is_active,
-                notification_sent=item.notification_sent,
-                price_difference=price_difference,
-                alert_triggered=alert_triggered
-            ))
-        
-        return response_items
-        
-    except Exception as e:
-        logger.error(f"Error getting wishlist: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get wishlist")
+@app.get("/recommend/cluster-explore", tags=["recommend"])
+def recommend_cluster_explore(top_terms: int = Query(10, ge=3, le=30), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    return model.cluster_explore(top_n_terms=top_terms)
 
-@app.put("/wishlist/{wishlist_id}", tags=["wishlist"])
-def update_wishlist_item(wishlist_id: int, request: WishlistUpdateRequest, username: str = Depends(verify_token)):
-    """Met à jour un item de wishlist"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
-    user_id = get_user_id_from_username(username)
-    
+@app.get("/recommend/random-cluster", tags=["recommend"])
+def recommend_random_cluster(sample: int = Query(12, ge=1, le=200), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    return model.random_cluster(sample=sample)
+
+@app.get("/recommend/by-title/{title}", tags=["recommend"])
+def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
     try:
-        updated_item = wishlist_manager.update_wishlist_item(wishlist_id, user_id, request)
-        
-        return {
-            "id": updated_item.id,
-            "game_title": updated_item.game_title,
-            "target_price": updated_item.target_price,
-            "current_price": updated_item.current_price,
-            "is_active": updated_item.is_active,
-            "updated_at": updated_item.updated_at.isoformat() if updated_item.updated_at else None,
-            "message": "Wishlist item updated successfully"
-        }
-        
+        recos = model.recommend_by_title_similarity(title, k=k)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error updating wishlist item: {e}")
-        raise HTTPException(status_code=500, detail="Failed to update wishlist item")
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"title": title, "recommendations": recos}
 
-@app.delete("/wishlist/{wishlist_id}", tags=["wishlist"])
-def remove_from_wishlist(wishlist_id: int, username: str = Depends(verify_token)):
-    """Supprime un item de la wishlist"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
-    user_id = get_user_id_from_username(username)
-    
+@app.get("/recommend/by-genre/{genre}", tags=["recommend"])
+def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    recos = model.recommend_by_genre(genre, k=k)
+    return {"genre": genre, "recommendations": recos}
+
+# ----------------- Auth (auto-create au login) -----------------
+def _issue_token_core(username: str, password: str):
+    if not DB_READY:
+        if settings.DEMO_LOGIN_ENABLED and username == settings.DEMO_USERNAME and password == settings.DEMO_PASSWORD:
+            access_token = create_access_token({"sub": username})
+            return {"access_token": access_token, "token_type": "bearer", "mode": "demo"}
+        raise HTTPException(status_code=503, detail="Database unavailable: cannot authenticate")
+
+    auto_create = get_setting_bool("AUTO_CREATE_USER_ON_LOGIN", True)
+
     try:
-        success = wishlist_manager.remove_from_wishlist(wishlist_id, user_id)
-        
-        if success:
-            return {"message": "Item removed from wishlist successfully"}
-        else:
-            raise HTTPException(status_code=404, detail="Wishlist item not found")
-        
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        u = get_user(username)
     except Exception as e:
-        logger.error(f"Error removing from wishlist: {e}")
-        raise HTTPException(status_code=500, detail="Failed to remove from wishlist")
+        logger.error("DB error on login lookup: %s", e)
+        raise HTTPException(status_code=503, detail="Database error during login")
 
-@app.post("/wishlist/check-prices", tags=["wishlist"])
-def check_wishlist_prices(username: str = Depends(verify_token)):
-    """Vérifie manuellement les prix de la wishlist de l'utilisateur"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
+    if not u and auto_create:
+        logger.info("Auto-creating user '%s' on first login", username)
+        try:
+            sec = get_security_validator()
+            if sec:
+                pv = sec.validate_password(password)
+                if not pv.get("valid", True):
+                    raise HTTPException(status_code=400, detail={
+                        "message": "Password does not meet security requirements",
+                        "issues": pv.get("issues", []),
+                        "strength": pv.get("strength"),
+                    })
+                username = sec.sanitize_input(username)
+            create_user(username, password)
+            u = get_user(username)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Auto-create user failed: %s", e)
+            raise HTTPException(status_code=503, detail="Database error creating user")
+
+    if not u:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    col, stored = extract_stored_password(u)
+    if not stored:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
     try:
-        alerts_created = wishlist_manager.check_price_alerts()
-        
-        return {
-            "message": "Price check completed",
-            "alerts_created": alerts_created,
-            "checked_at": datetime.utcnow().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Error checking prices: {e}")
-        raise HTTPException(status_code=500, detail="Failed to check prices")
+        if not pwd_ctx.verify(password, stored):
+            raise HTTPException(status_code=401, detail="Incorrect username or password")
+    except UnknownHashError:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-# =========================
-# ENDPOINTS NOTIFICATIONS
-# =========================
+    if col != "hashed_password" and users_has_column("hashed_password"):
+        try:
+            update_user_password(username, pwd_ctx.hash(password))
+        except Exception as e:
+            logger.warning("Cannot upgrade user hash for %s: %s", username, e)
 
-@app.get("/wishlist/notifications", tags=["notifications"])
-def get_user_notifications(username: str = Depends(verify_token), limit: int = 20) -> List[NotificationResponse]:
-    """Récupère les notifications de l'utilisateur"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
-    user_id = get_user_id_from_username(username)
-    
+    access_token = create_access_token({"sub": username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/token", tags=["auth"])
+def token(username: str = Form(...), password: str = Form(...)):
+    return _issue_token_core(username, password)
+
+@app.post("/auth/token", tags=["auth"])
+def token_alias(username: str = Form(...), password: str = Form(...)):
+    return _issue_token_core(username, password)
+
+@app.post("/register", tags=["auth"])
+def register(username: str = Form(...), password: str = Form(...)):
+    if not DB_READY:
+        raise HTTPException(status_code=503, detail="Database unavailable: cannot register now")
     try:
-        notifications = wishlist_manager.get_user_notifications(user_id, limit)
-        
-        response_notifications = []
-        for notif in notifications:
-            response_notifications.append(NotificationResponse(
-                id=notif["id"],
-                wishlist_item_id=notif["wishlist_item_id"],
-                message=notif["message"],
-                notification_type=notif["notification_type"],
-                created_at=notif["created_at"],
-                is_read=notif["is_read"]
-            ))
-        
-        return response_notifications
-        
+        ensure_users_table()
     except Exception as e:
-        logger.error(f"Error getting notifications: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get notifications")
-
-@app.put("/wishlist/notifications/{notification_id}/read", tags=["notifications"])
-def mark_notification_read(notification_id: int, username: str = Depends(verify_token)):
-    """Marque une notification comme lue"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
-    user_id = get_user_id_from_username(username)
-    
+        logger.error("DB error ensuring users table: %s", e)
+        raise HTTPException(status_code=503, detail="Database error preparing table")
+    username = username.strip()
+    sec = get_security_validator()
+    if sec:
+        try:
+            username = sec.sanitize_input(username)
+            pv = sec.validate_password(password)
+            if not pv["valid"]:
+                raise HTTPException(status_code=400, detail={
+                    "message": "Password does not meet security requirements",
+                    "issues": pv["issues"],
+                    "strength": pv["strength"]
+                })
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Compliance validation failed: {e}")
+    if get_user(username):
+        raise HTTPException(status_code=400, detail="User already exists")
     try:
-        success = wishlist_manager.mark_notification_read(notification_id, user_id)
-        
-        if success:
-            return {"message": "Notification marked as read"}
-        else:
-            raise HTTPException(status_code=404, detail="Notification not found")
-        
+        user_id = create_user(username, password)
     except Exception as e:
-        logger.error(f"Error marking notification as read: {e}")
-        raise HTTPException(status_code=500, detail="Failed to mark notification as read")
+        logger.error("DB error on register: %s", e)
+        raise HTTPException(status_code=503, detail="Database error during register")
+    return {"ok": True, "user_id": user_id}
 
-@app.get("/wishlist/notifications/count", tags=["notifications"])
-def get_notification_count(username: str = Depends(verify_token), unread_only: bool = True):
-    """Compte les notifications de l'utilisateur"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
-    user_id = get_user_id_from_username(username)
-    
-    try:
-        count = wishlist_manager.get_notification_count(user_id, unread_only)
-        
-        return {
-            "count": count,
-            "unread_only": unread_only,
-            "user_id": user_id
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting notification count: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get notification count")
-
-# =========================
-# ENDPOINTS ADMIN
-# =========================
-
-@app.post("/admin/check-all-prices", tags=["admin"])
-def admin_check_all_prices(username: str = Depends(verify_token)):
-    """Vérifie tous les prix de toutes les wishlists (admin)"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
-    try:
-        alerts_created = wishlist_manager.check_price_alerts()
-        
-        return {
-            "message": "Mass price check completed",
-            "alerts_created": alerts_created,
-            "checked_at": datetime.utcnow().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in mass price check: {e}")
-        raise HTTPException(status_code=500, detail="Failed to check all prices")
-
-@app.post("/admin/cleanup-notifications", tags=["admin"])
-def admin_cleanup_notifications(days_old: int = 30, username: str = Depends(verify_token)):
-    """Nettoie les anciennes notifications (admin)"""
-    
-    if not wishlist_manager:
-        raise HTTPException(status_code=503, detail="Wishlist service not available")
-    
-    try:
-        deleted_count = wishlist_manager.cleanup_old_notifications(days_old)
-        
-        return {
-            "message": "Notification cleanup completed",
-            "deleted": deleted_count,
-            "days_old": days_old,
-            "cleaned_at": datetime.utcnow().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Error cleaning up notifications: {e}")
-        raise HTTPException(status_code=500, detail="Failed to cleanup notifications")
-
-# =========================
-# HEALTH & MONITORING
-# =========================
-
-@app.get("/healthz", tags=["system"])
-def enhanced_healthz():
-    """Health check amélioré"""
-    
-    health_status = {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "components": {
-            "database": DB_READY,
-            "hybrid_model": HYBRID_MODEL_READY,
-            "wishlist_service": wishlist_manager is not None,
-            "price_monitoring": PRICE_MONITORING_TASK is not None and not PRICE_MONITORING_TASK.done()
-        }
-    }
-    
-    # Vérifier le statut du modèle hybride
-    if HYBRID_MODEL_READY:
-        hybrid_model = get_hybrid_model()
-        health_status["model_info"] = {
-            "version": hybrid_model.model_version,
-            "is_trained": hybrid_model.is_trained,
-            "total_predictions": hybrid_model.prediction_count
-        }
-    
-    # Vérifier le statut global
-    if not all(health_status["components"].values()):
-        health_status["status"] = "degraded"
-    
-    return health_status
-
-# =========================
-# STARTUP EVENT
-# =========================
-
+# ----------------- Startup -----------------
 @app.on_event("startup")
 async def startup_event():
-    """Initialisation au démarrage"""
-    global DB_READY, HYBRID_MODEL_READY, PRICE_MONITORING_TASK, wishlist_manager
-    
-    logger.info("Starting Enhanced Games API with Hybrid ML & Wishlist...")
-    
-    # 1. Initialiser la base de données
+    global DB_READY, DB_LAST_ERROR
+    logger.info("Starting Games API with ML and E4 compliance...")
+
     try:
-        if settings.db_configured:
-            with get_db_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT VERSION()")
-                    version = cur.fetchone()
-                    logger.info(f"Database connected: {version['VERSION()']}")
-            
+        if settings.db_configured and settings.DB_REQUIRED:
+            ensure_users_table()
             DB_READY = True
-            
-            # Initialiser le gestionnaire de wishlist
-            wishlist_manager = WishlistManager(get_db_conn)
-            wishlist_manager.ensure_wishlist_tables()
-            logger.info("Wishlist service initialized")
-            
+            DB_LAST_ERROR = None
+            logger.info("Database connected successfully (required mode)")
+        elif settings.db_configured:
+            try:
+                ensure_users_table()
+                DB_READY = True
+                DB_LAST_ERROR = None
+                logger.info("Database connected successfully (optional mode)")
+                try:
+                    n = count_games_in_db()
+                    logger.info("Games in DB: %s", n)
+                except Exception:
+                    logger.info("Users table ready")
+            except Exception as e:
+                DB_READY = False
+                DB_LAST_ERROR = str(e)
+                logger.warning(f"Database connection failed (continuing without DB): {e}")
         else:
-            logger.warning("Database not configured - running in demo mode")
-            
+            DB_READY = False
+            DB_LAST_ERROR = "Database not configured (set DB_* env vars)"
+            logger.info("Database not configured - using demo mode")
     except Exception as e:
+        DB_READY = False
+        DB_LAST_ERROR = str(e)
         logger.error(f"Database initialization failed: {e}")
         if settings.DB_REQUIRED:
+            logger.error("DB_REQUIRED=true but database failed - stopping startup")
             raise
-    
-    # 2. Ajouter les méthodes au modèle hybride
-    add_single_algorithm_methods()
-    
-    # 3. Charger le modèle hybride existant
+
+    # Charger modèle s'il existe
+    model = get_model()
+    model_path = os.path.join("model", "recommendation_model.pkl")
     try:
-        hybrid_model = get_hybrid_model()
-        model_path = "model/hybrid_model_latest.pkl"
-        
         if os.path.exists(model_path):
-            if hybrid_model.load_model(model_path):
-                logger.info(f"Hybrid model loaded: {hybrid_model.model_version}")
-                HYBRID_MODEL_READY = True
+            if model.load_model():
+                logger.info("Model loaded from disk: %s", model.model_version)
             else:
-                logger.info("Failed to load hybrid model - will train on first request")
+                logger.info("Model file exists but loading failed - will train on first request")
         else:
-            logger.info("No hybrid model found - will train on first request")
-            
+            logger.info("No saved model found - will train on first request")
     except Exception as e:
-        logger.warning(f"Hybrid model initialization error: {e}")
-    
-    # 4. Démarrer la surveillance des prix en arrière-plan
-    if wishlist_manager:
-        try:
-            PRICE_MONITORING_TASK = asyncio.create_task(wishlist_manager.start_price_monitoring())
-            logger.info("Price monitoring task started")
-        except Exception as e:
-            logger.error(f"Failed to start price monitoring: {e}")
-    
-    logger.info("Enhanced Games API startup completed")
+        logger.warning("Error loading model: %s - will train on first request", e)
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Nettoyage à l'arrêt"""
-    global PRICE_MONITORING_TASK
-    
-    logger.info("Shutting down Enhanced Games API...")
-    
-    # Arrêter la surveillance des prix
-    if PRICE_MONITORING_TASK and not PRICE_MONITORING_TASK.done():
-        PRICE_MONITORING_TASK.cancel()
-        try:
-            await PRICE_MONITORING_TASK
-        except asyncio.CancelledError:
-            pass
-        logger.info("Price monitoring task stopped")
-    
-    # Sauvegarder le modèle hybride
-    try:
-        if HYBRID_MODEL_READY:
-            hybrid_model = get_hybrid_model()
-            hybrid_model.save_model("model/hybrid_model_latest.pkl")
-            logger.info("Hybrid model saved")
-    except Exception as e:
-        logger.warning(f"Failed to save hybrid model: {e}")
-    
-    logger.info("Enhanced Games API shutdown completed")
-
-# Import des endpoints existants (auth, etc.)
-# Vous devrez ajouter ici les endpoints d'authentification de votre API existante
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    if COMPLIANCE_ENABLED:
+        logger.info("E4 Compliance standards active")
