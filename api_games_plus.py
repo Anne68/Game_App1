@@ -98,6 +98,10 @@ class PredictionRequest(BaseModel):
     query: str
     k: int = 10
     min_confidence: float = 0.1
+    # Nouveaux filtres côté API
+    platforms: Optional[List[str]] = None     # ex: ["PC", "Steam", "PS5"]
+    min_price: Optional[float] = None         # n'afficher que price >= min_price
+
 
 class SimilarGameRequest(BaseModel):
     game_id: Optional[int] = None
@@ -241,6 +245,42 @@ def _parse_platforms(value: Optional[str]) -> List[str]:
         return []
     return [p.strip() for p in str(value).split(",") if p.strip()]
 
+def _enrich_recommendations_with_commerce(recommendations: List[Dict[str, Any]]) -> None:
+    """Ajoute price/store/url/platforms aux recos à partir de la table games, si dispo."""
+    if not recommendations:
+        return
+    try:
+        ids = tuple(int(r["id"]) for r in recommendations if "id" in r)
+        if not ids:
+            return
+
+        # Requête d'enrichissement : adapte les noms de colonnes si nécessaire
+        sql = """
+            SELECT
+                game_id_rawg AS id,
+                price,               -- NUMERIC (nullable)
+                store AS store,      -- VARCHAR (nullable)
+                store_url AS url,    -- VARCHAR (nullable) - lien d'achat
+                platforms            -- VARCHAR (ex: 'PC, PS5, Steam')
+            FROM games
+            WHERE game_id_rawg IN %s
+        """
+        with get_db_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, (ids,))
+            rows = cur.fetchall() or []
+        by_id = {int(r["id"]): r for r in rows}
+        for r in recommendations:
+            info = by_id.get(int(r["id"]))
+            if not info:
+                continue
+            r["price"] = info.get("price")
+            r["store"] = info.get("store")
+            r["url"] = info.get("url")
+            r["platforms"] = _parse_platforms(info.get("platforms"))
+    except Exception as e:
+        logger.warning("Commerce enrichment failed: %s", e)
+
+
 def _safe_float(x, default: float = 0.0) -> float:
     try:
         if x is None:
@@ -250,6 +290,7 @@ def _safe_float(x, default: float = 0.0) -> float:
         return float(x)
     except Exception:
         return default
+
 
 def _safe_int(x, default: int = 0) -> int:
     try:
@@ -512,6 +553,7 @@ def evaluate_model(test_queries: List[str] = Query(default=["RPG", "Action", "In
 def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     _ensure_model_trained_with_db()
     model = get_model()
+
     clean_query = request.query.strip()
     sec = get_security_validator()
     if sec:
@@ -519,30 +561,62 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
             clean_query = sec.sanitize_input(clean_query)
         except Exception as e:
             logger.warning(f"Compliance sanitization failed: {e}")
+
     if not clean_query:
         raise HTTPException(status_code=400, detail="Query is empty")
+
     start_time = time.time()
     try:
-        recommendations = model.predict(query=clean_query, k=request.k, min_confidence=request.min_confidence)
+        recommendations = model.predict(
+            query=clean_query,
+            k=request.k,
+            min_confidence=request.min_confidence
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Bad input for model: {e}")
     except Exception:
         logger.exception("Prediction failed")
         raise HTTPException(status_code=500, detail="Prediction failed")
+
+    # 1) Enrichir avec price / store / url / platforms depuis la BDD
+    _enrich_recommendations_with_commerce(recommendations)
+
+    # 2) Filtres optionnels côté API
+    plats = [p.strip().lower() for p in (request.platforms or []) if p and str(p).strip()]
+    min_price = request.min_price
+
+    if plats:
+        def has_any_platform(rec: Dict[str, Any]) -> bool:
+            ps = rec.get("platforms") or []
+            ps_lower = [str(x).strip().lower() for x in ps if str(x).strip()]
+            return any(p in ps_lower for p in plats)
+        recommendations = [r for r in recommendations if has_any_platform(r)]
+
+    if (min_price is not None):
+        def price_ok(rec: Dict[str, Any]) -> bool:
+            try:
+                return rec.get("price") is not None and float(rec["price"]) >= float(min_price)
+            except Exception:
+                return False
+        recommendations = [r for r in recommendations if price_ok(r)]
+
     latency = time.time() - start_time
     get_monitor().record_prediction("recommend_ml", clean_query, recommendations, latency)
+
     response = {
         "query": clean_query,
         "recommendations": recommendations,
         "latency_ms": latency * 1000,
         "model_version": model.model_version,
     }
+
     acc = get_accessibility_validator()
     if acc:
         try:
             response = acc.enhance_response_accessibility(response)
         except Exception as e:
             logger.warning(f"Accessibility enhancement failed: {e}")
+
     return response
 
 @app.post("/recommend/similar-game", tags=["recommend"])
