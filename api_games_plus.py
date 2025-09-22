@@ -15,6 +15,9 @@ from passlib.context import CryptContext
 
 from model_manager import get_model
 
+
+
+
 # ============================================================
 # Config API + CORS
 # ============================================================
@@ -229,6 +232,37 @@ def health():
         "games_count": 0 if model.games_df is None else len(model.games_df),
         "model_version": model.model_version,
     }
+
+
+
+# ============================================================
+# healthz
+# ============================================================
+
+# --- Health endpoints additionnels (ne pas dupliquer si déjà présent) ---
+from fastapi import Response
+
+@app.get("/health", summary="Health check (public)")
+def health():
+    return {
+        "ok": True,
+        "is_trained": model.is_trained,
+        "games_count": 0 if model.games_df is None else len(model.games_df),
+        "model_version": model.model_version,
+    }
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    # Liveness: le process répond → 200
+    return {"status": "ok"}
+
+@app.get("/readyz", include_in_schema=False)
+def readyz():
+    # Readiness: l'app est prête si le modèle est chargé/entraîné
+    if not model.is_trained or model.games_df is None:
+        # 503 = pas prêt, instructif pour les probes k8s/Azure
+        raise HTTPException(status_code=503, detail="Model not ready")
+    return {"status": "ready", "games_count": len(model.games_df)}
 
 # ============================================================
 # Recommandations (protégées)
