@@ -8,7 +8,7 @@ from urllib3.util.retry import Retry
 # -----------------------------
 # Config de base
 # -----------------------------
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://game-app-y8be.onrender.com")
 API_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "180"))  # ⏱️ Augmenté pour l'entraînement initial
 
 st.set_page_config(page_title="Games+ Reco & Prix", page_icon="🎮", layout="wide")
