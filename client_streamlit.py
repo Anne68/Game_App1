@@ -1,387 +1,348 @@
-import streamlit as st
-import requests
+import os
 import json
 import time
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime
+from typing import Dict, Any, Optional, List
 
-# Configuration de la page avec thème sombre gaming
+import requests
+import streamlit as st
+import pandas as pd
+
+# =============================
+# Configuration
+# =============================
+# Point this to your deployed FastAPI base URL (without trailing slash)
+# Examples:
+#   - Local:        http://127.0.0.1:8000
+#   - Render:       https://your-service.onrender.com
+#   - AlwaysData:   https://your-domain.alwaysdata.net
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+
+# Optional demo credentials if your API is in demo mode when DB is unavailable
+DEMO_USERNAME = os.getenv("DEMO_USERNAME", "demo")
+DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "demo")
+
 st.set_page_config(
-    page_title="🎮 Games AI Recommender",
+    page_title="Games Recommender UI",
     page_icon="🎮",
     layout="wide",
-    initial_sidebar_state="expanded"
 )
 
-# CSS Gaming Dark Theme
-gaming_css = """
-<style>
-/* Fond gaming sombre avec effet néon */
-.stApp {
-    background: linear-gradient(135deg, 
-        #0a0a0a 0%, 
-        #1a1a2e 25%, 
-        #16213e 50%, 
-        #0f3460 100%) !important;
-    color: #e6f3ff;
-    font-family: 'Courier New', monospace;
-}
+# =============== Helpers ===============
 
-/* Sidebar gaming */
-.css-1d391kg {
-    background: linear-gradient(180deg, #0a0a0a, #1a1a2e) !important;
-    border-right: 2px solid #00ff88;
-}
+def _headers() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    token = st.session_state.get("token")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
-/* Titres avec effet néon */
-h1, h2, h3 {
-    color: #00ff88 !important;
-    text-shadow: 0 0 10px #00ff88, 0 0 20px #00ff88, 0 0 40px #00ff88;
-    text-align: center;
-    font-weight: bold;
-}
 
-/* Boutons gaming */
-.stButton > button {
-    background: linear-gradient(45deg, #ff6b6b, #4ecdc4) !important;
-    color: #000 !important;
-    border: 2px solid #00ff88 !important;
-    border-radius: 25px !important;
-    font-weight: bold !important;
-    box-shadow: 0 0 20px rgba(0,255,136,0.5) !important;
-    transition: all 0.3s ease !important;
-}
-
-.stButton > button:hover {
-    transform: scale(1.05) !important;
-    box-shadow: 0 0 30px rgba(0,255,136,0.8) !important;
-}
-
-/* Inputs avec style gaming */
-.stTextInput input, .stSelectbox select {
-    background: rgba(0,0,0,0.7) !important;
-    border: 2px solid #00ff88 !important;
-    border-radius: 10px !important;
-    color: #00ff88 !important;
-    font-family: 'Courier New', monospace !important;
-}
-
-/* Métriques gaming */
-.css-1r6slb0 {
-    background: rgba(0,255,136,0.1) !important;
-    border: 1px solid #00ff88 !important;
-    border-radius: 15px !important;
-    box-shadow: 0 0 15px rgba(0,255,136,0.3) !important;
-}
-
-/* Cards de recommandations */
-.recommendation-card {
-    background: linear-gradient(135deg, rgba(0,0,0,0.8), rgba(26,26,46,0.9));
-    border: 2px solid #00ff88;
-    border-radius: 20px;
-    padding: 20px;
-    margin: 10px 0;
-    box-shadow: 0 0 25px rgba(0,255,136,0.4);
-}
-
-/* Animation de typing pour les titres */
-@keyframes typing {
-    from { width: 0 }
-    to { width: 100% }
-}
-
-.typing-effect {
-    overflow: hidden;
-    border-right: .15em solid #00ff88;
-    white-space: nowrap;
-    margin: 0 auto;
-    letter-spacing: .15em;
-    animation: typing 3.5s steps(40, end);
-}
-
-/* Effet matrix pour le fond */
-.matrix-bg::before {
-    content: "";
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: radial-gradient(circle at 20% 50%, rgba(0,255,136,0.1) 0%, transparent 50%),
-                radial-gradient(circle at 80% 20%, rgba(255,107,107,0.1) 0%, transparent 50%),
-                radial-gradient(circle at 40% 80%, rgba(78,205,196,0.1) 0%, transparent 50%);
-    pointer-events: none;
-    z-index: -1;
-}
-
-/* Messages d'erreur et succès */
-.stAlert > div {
-    border-radius: 15px !important;
-    border: 2px solid #00ff88 !important;
-}
-
-/* Scrollbars gaming */
-::-webkit-scrollbar {
-    width: 12px;
-}
-
-::-webkit-scrollbar-track {
-    background: #1a1a2e;
-}
-
-::-webkit-scrollbar-thumb {
-    background: linear-gradient(45deg, #00ff88, #4ecdc4);
-    border-radius: 6px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-    background: linear-gradient(45deg, #4ecdc4, #00ff88);
-}
-</style>
-"""
-
-st.markdown(gaming_css, unsafe_allow_html=True)
-
-# Configuration API
-API_URL = "https://game-app-y8be.onrender.com"
-if "api_token" not in st.session_state:
-    st.session_state.api_token = None
-
-# Fonction d'authentification
-def authenticate(username, password):
+def api_get(path: str, params: Optional[Dict[str, Any]] = None, require_auth: bool = False):
+    url = f"{API_BASE_URL}{path}"
     try:
-        response = requests.post(
-            f"{API_URL}/token",
-            data={"username": username, "password": password},
-            timeout=10
-        )
-        if response.status_code == 200:
-            return response.json()["access_token"]
+        headers = _headers() if require_auth else {"Content-Type": "application/json"}
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code == 401:
+            raise PermissionError("Unauthorized. Please login first.")
+        resp.raise_for_status()
+        return resp.json()
+    except PermissionError:
+        raise
     except Exception as e:
-        st.error(f"Erreur de connexion: {e}")
-    return None
+        raise RuntimeError(f"GET {path} failed: {e}")
 
-# Fonction pour les recommandations
-def get_recommendations(query, k=10, token=None):
-    if not token:
-        return None
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    payload = {"query": query, "k": k, "min_confidence": 0.1}
-    
+
+def api_post(path: str, payload: Optional[Dict[str, Any]] = None, form: Optional[Dict[str, Any]] = None, require_auth: bool = True):
+    url = f"{API_BASE_URL}{path}"
     try:
-        response = requests.post(
-            f"{API_URL}/recommend/ml",
-            json=payload,
-            headers=headers,
-            timeout=30
-        )
-        if response.status_code == 200:
-            return response.json()
-    except Exception as e:
-        st.error(f"Erreur API: {e}")
-    return None
-
-# Interface principale
-def main():
-    # Titre avec effet typing
-    st.markdown('<div class="matrix-bg"></div>', unsafe_allow_html=True)
-    st.markdown('<h1 class="typing-effect">🎮 AI GAMES RECOMMENDER</h1>', unsafe_allow_html=True)
-    st.markdown('<h3 style="text-align: center; color: #4ecdc4;">Powered by Advanced ML Algorithms</h3>', unsafe_allow_html=True)
-    
-    # Sidebar pour l'authentification
-    with st.sidebar:
-        st.markdown("## 🔐 AUTHENTICATION PORTAL")
-        
-        if not st.session_state.api_token:
-            st.markdown("### 🚀 LOGIN TO ACCESS")
-            username = st.text_input("👤 Username", value="demo")
-            password = st.text_input("🔑 Password", value="demo123", type="password")
-            
-            if st.button("🎯 CONNECT TO SYSTEM"):
-                with st.spinner("🔄 Authentification en cours..."):
-                    token = authenticate(username, password)
-                    if token:
-                        st.session_state.api_token = token
-                        st.success("✅ Connexion réussie!")
-                        st.rerun()
+        if form is not None:
+            # form-encoded (for /token, /auth/token, /register)
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            resp = requests.post(url, headers=headers, data=form, timeout=30)
         else:
-            st.success("🟢 SYSTÈME CONNECTÉ")
-            if st.button("🚪 DÉCONNEXION"):
-                st.session_state.api_token = None
-                st.rerun()
-        
-        # Statut de l'API
-        st.markdown("## 📡 API STATUS")
-        try:
-            health_response = requests.get(f"{API_URL}/healthz", timeout=5)
-            if health_response.status_code == 200:
-                st.success("🟢 API ONLINE")
-            else:
-                st.error("🔴 API ERROR")
-        except:
-            st.error("🔴 API OFFLINE")
+            headers = _headers() if require_auth else {"Content-Type": "application/json"}
+            resp = requests.post(url, headers=headers, json=payload or {}, timeout=60)
+        if resp.status_code == 401:
+            raise PermissionError("Unauthorized. Please login first.")
+        # Let FastAPI error surfaces show nicely
+        if not resp.ok:
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = resp.text
+            raise RuntimeError(f"POST {path} -> HTTP {resp.status_code}: {detail}")
+        return resp.json()
+    except PermissionError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"POST {path} failed: {e}")
 
-    # Interface principale si connecté
-    if st.session_state.api_token:
-        # Métriques en temps réel
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.markdown('<div class="css-1r6slb0">', unsafe_allow_html=True)
-            st.metric("🎮 Games DB", "10K+", "↗️ 5%")
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown('<div class="css-1r6slb0">', unsafe_allow_html=True)
-            st.metric("🤖 AI Accuracy", "94.2%", "↗️ 2.1%")
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with col3:
-            st.markdown('<div class="css-1r6slb0">', unsafe_allow_html=True)
-            st.metric("⚡ Response Time", "127ms", "↘️ 15ms")
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with col4:
-            st.markdown('<div class="css-1r6slb0">', unsafe_allow_html=True)
-            st.metric("👥 Users Online", "2.3K", "↗️ 12%")
-            st.markdown('</div>', unsafe_allow_html=True)
-        
+
+# =============== UI Pieces ===============
+
+def show_header():
+    st.markdown(
+        """
+        <style>
+        .headline {font-size: 2rem; font-weight: 800; margin-bottom: .2rem}
+        .subtle {opacity:.7}
+        .token-pill {background:#f0f2f6; padding:6px 10px; border-radius:999px; font-size:.85rem}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='headline'>🎮 Games API ML – Streamlit</div>", unsafe_allow_html=True)
+    st.caption("Frontend minimaliste pour l'API de recommandations de jeux (C9→C13).")
+
+
+def sidebar_auth():
+    with st.sidebar:
+        st.subheader("Connexion")
+        logged = st.session_state.get("logged", False)
+        if not logged:
+            with st.form("login_form", clear_on_submit=False):
+                username = st.text_input("Nom d'utilisateur", key="login_username", value=DEMO_USERNAME)
+                password = st.text_input("Mot de passe", type="password", key="login_password", value=DEMO_PASSWORD)
+                col1, col2 = st.columns(2)
+                do_login = col1.form_submit_button("Se connecter")
+                do_register = col2.form_submit_button("Créer le compte")
+            if do_login:
+                try:
+                    data = api_post("/auth/token", form={"username": username, "password": password}, require_auth=False)
+                    st.session_state.token = data.get("access_token")
+                    st.session_state.username = username
+                    st.session_state.logged = True
+                    st.success("Connecté ✅")
+                except Exception as e:
+                    st.error(str(e))
+            if do_register:
+                try:
+                    out = api_post("/register", form={"username": username, "password": password}, require_auth=False)
+                    st.success(f"Compte créé (user_id={out.get('user_id')}). Vous pouvez vous connecter.")
+                except Exception as e:
+                    st.error(str(e))
+        else:
+            st.success(f"Connecté en tant que {st.session_state.get('username')}")
+            if st.button("Se déconnecter"):
+                st.session_state.clear()
+                st.experimental_rerun()
+
         st.markdown("---")
-        
-        # Interface de recommandation
-        st.markdown("## 🔮 AI RECOMMENDATION ENGINE")
-        
-        col_left, col_right = st.columns([2, 1])
-        
-        with col_left:
-            game_query = st.text_input(
-                "🎯 Décris ton jeu idéal:",
-                placeholder="Ex: Action RPG fantasy avec magic system...",
-                help="Utilise des mots-clés comme: genre, thème, gameplay, plateformes..."
-            )
-        
-        with col_right:
-            num_recommendations = st.selectbox(
-                "📊 Nombre de recommandations:",
-                options=[5, 10, 15, 20],
-                index=1
-            )
-        
-        if st.button("🚀 GÉNÉRER RECOMMANDATIONS IA", type="primary"):
-            if game_query.strip():
-                with st.spinner("🤖 L'IA analyse vos préférences..."):
-                    time.sleep(1)  # Animation
-                    recommendations = get_recommendations(
-                        game_query, 
-                        num_recommendations, 
-                        st.session_state.api_token
-                    )
-                    
-                    if recommendations and recommendations.get("recommendations"):
-                        st.success(f"✅ {len(recommendations['recommendations'])} jeux trouvés!")
-                        
-                        # Graphique de confiance
-                        games_df = pd.DataFrame(recommendations["recommendations"])
-                        if not games_df.empty:
-                            fig = px.bar(
-                                games_df.head(10), 
-                                x="confidence", 
-                                y="title",
-                                orientation="h",
-                                color="confidence",
-                                color_continuous_scale="viridis",
-                                title="🎯 Scores de Confiance IA"
-                            )
-                            fig.update_layout(
-                                plot_bgcolor='rgba(0,0,0,0)',
-                                paper_bgcolor='rgba(0,0,0,0)',
-                                font_color='#00ff88'
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Affichage des recommandations
-                        st.markdown("## 🎮 RECOMMANDATIONS PERSONNALISÉES")
-                        
-                        for i, game in enumerate(recommendations["recommendations"], 1):
-                            # Card de jeu stylée
-                            st.markdown(f'''
-                            <div class="recommendation-card">
-                                <h3 style="color: #00ff88;">#{i} {game["title"]}</h3>
-                                <div style="display: flex; justify-content: space-between; margin: 15px 0;">
-                                    <span style="color: #4ecdc4;"><strong>Genre:</strong> {game.get("genres", "N/A")}</span>
-                                    <span style="color: #ff6b6b;"><strong>Confiance:</strong> {game["confidence"]:.1%}</span>
-                                </div>
-                                <div style="display: flex; justify-content: space-between;">
-                                    <span><strong>⭐ Rating:</strong> {game.get("rating", 0):.1f}/5</span>
-                                    <span><strong>🏆 Metacritic:</strong> {game.get("metacritic", 0)}</span>
-                                </div>
-                            </div>
-                            ''', unsafe_allow_html=True)
-                        
-                        # Métriques de la requête
-                        st.markdown("## 📈 MÉTRIQUES DE LA REQUÊTE")
-                        col1, col2, col3 = st.columns(3)
-                        
-                        with col1:
-                            st.metric("⚡ Temps de traitement", 
-                                    f"{recommendations.get('latency_ms', 0):.0f}ms")
-                        with col2:
-                            st.metric("🤖 Version du modèle", 
-                                    recommendations.get('model_version', 'N/A'))
-                        with col3:
-                            st.metric("🎯 Confiance moyenne", 
-                                    f"{sum(r['confidence'] for r in recommendations['recommendations'])/len(recommendations['recommendations']):.1%}")
-                    
-                    else:
-                        st.warning("❌ Aucune recommandation trouvée. Essayez avec d'autres mots-clés.")
+        st.caption("Base API :")
+        st.markdown(f"<span class='token-pill'>{API_BASE_URL}</span>", unsafe_allow_html=True)
+
+
+# =============== Pages ===============
+
+def page_status():
+    st.subheader("Statut & Monitoring")
+    colA, colB = st.columns([1,1])
+    with colA:
+        if st.button("Actualiser le statut API"):
+            st.session_state["_health"] = None  # erase cache
+        try:
+            if st.session_state.get("_health") is None:
+                st.session_state["_health"] = api_get("/healthz")
+            st.json(st.session_state["_health"])
+        except Exception as e:
+            st.error(str(e))
+    with colB:
+        try:
+            if st.session_state.get("logged"):
+                metrics = api_get("/model/metrics", require_auth=True)
+                st.metric("Version modèle", metrics.get("model_version", "?"))
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Entraîné ?", "✅" if metrics.get("is_trained") else "❌")
+                c2.metric("Predictions totales", metrics.get("total_predictions", 0))
+                c3.metric("Confiance moyenne", f"{metrics.get('avg_confidence', 0.0):.3f}")
+                st.caption("Détails complets :")
+                st.json(metrics)
             else:
-                st.error("⚠️ Veuillez saisir une description de jeu.")
-        
-        # Section de navigation supplémentaire
-        st.markdown("---")
-        st.markdown("## 🎯 NAVIGATION RAPIDE")
-        
-        nav_col1, nav_col2, nav_col3 = st.columns(3)
-        
-        with nav_col1:
-            if st.button("🔥 Trending Games"):
-                st.info("🚧 Fonctionnalité en développement")
-        
-        with nav_col2:
-            if st.button("⭐ Top Rated"):
-                st.info("🚧 Fonctionnalité en développement")
-        
-        with nav_col3:
-            if st.button("🆕 New Releases"):
-                st.info("🚧 Fonctionnalité en développement")
-        
-        # Footer gaming
-        st.markdown("""
-        ---
-        <div style="text-align: center; color: #4ecdc4; font-family: 'Courier New', monospace;">
-            <p>🎮 <strong>GAMES AI RECOMMENDER v2.0</strong> 🎮</p>
-            <p style="font-size: 12px; color: #666;">
-                Powered by Advanced Machine Learning | Built with ❤️ for Gamers
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    else:
-        # Message d'accueil si pas connecté
-        st.markdown("""
-        <div style="text-align: center; margin: 50px 0;">
-            <h2 style="color: #ff6b6b;">🔒 ACCÈS SÉCURISÉ REQUIS</h2>
-            <p style="color: #4ecdc4; font-size: 18px;">
-                Connectez-vous dans la sidebar pour accéder au système de recommandation IA
-            </p>
-            <p style="color: #666;">
-                💡 <em>Utilisez demo/demo123 pour tester</em>
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
+                st.info("Connectez-vous pour voir les métriques du modèle.")
+        except Exception as e:
+            st.error(str(e))
+
+
+def page_recommendations():
+    st.subheader("🔎 Recommandations (ML)")
+    if not st.session_state.get("logged"):
+        st.warning("Veuillez vous connecter pour utiliser le modèle.")
+        return
+
+    with st.form("ml_reco_form"):
+        query = st.text_input("Votre requête (mots-clés / description / genres)", value="RPG open world")
+        k = st.slider("Nombre de résultats (k)", 1, 50, 10)
+        min_conf = st.slider("Confiance minimale", 0.0, 1.0, 0.10, step=0.01)
+        submitted = st.form_submit_button("Recommander")
+
+    if submitted:
+        try:
+            payload = {"query": query, "k": k, "min_confidence": min_conf}
+            t0 = time.time()
+            data = api_post("/recommend/ml", payload)
+            dt_ms = (time.time() - t0) * 1000
+            recs = data.get("recommendations", [])
+            if not recs:
+                st.info("Aucune recommandation.")
+                return
+            # Normalize to DataFrame
+            df = pd.json_normalize(recs)
+            # Friendly columns if present
+            rename_map = {"score": "score", "confidence": "confiance", "id": "game_id", "title": "titre", "genres": "genres", "rating": "rating", "metacritic": "metacritic"}
+            cols = [c for c in rename_map if c in df.columns]
+            df = df[cols].rename(columns=rename_map)
+            st.caption(f"{len(df)} résultats – {dt_ms:.1f} ms")
+            st.dataframe(df, use_container_width=True)
+            with st.expander("Réponse brute"):
+                st.json(data)
+        except Exception as e:
+            st.error(str(e))
+
+    st.markdown("---")
+    st.subheader("🧭 Recommandations avancées")
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.caption("Par Jeu (ID ou Titre)")
+        with st.form("similar_form"):
+            game_id = st.number_input("game_id", min_value=0, step=1, value=0)
+            title = st.text_input("title", value="")
+            k2 = st.slider("k", 1, 50, 10, key="k_sim")
+            go_sim = st.form_submit_button("Trouver similaires")
+        if go_sim:
+            try:
+                payload = {"game_id": int(game_id) if game_id else None, "title": title or None, "k": k2}
+                data = api_post("/recommend/similar-game", payload)
+                df = pd.json_normalize(data.get("recommendations", []))
+                if not df.empty:
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.info("Aucun résultat.")
+                with st.expander("Réponse brute"):
+                    st.json(data)
+            except Exception as e:
+                st.error(str(e))
+
+    with c2:
+        st.caption("Par Titre (similarité)")
+        title_q = st.text_input("Titre exact/partiel", value="Hades")
+        k_title = st.slider("k", 1, 50, 10, key="k_title")
+        if st.button("Recommander par titre"):
+            try:
+                data = api_get(f"/recommend/by-title/{title_q}", params={"k": k_title}, require_auth=True)
+                df = pd.json_normalize(data.get("recommendations", []))
+                st.dataframe(df, use_container_width=True)
+                with st.expander("Réponse brute"):
+                    st.json(data)
+            except Exception as e:
+                st.error(str(e))
+
+    with c3:
+        st.caption("Par Genre")
+        genre = st.text_input("Genre", value="Action")
+        k_gen = st.slider("k", 1, 50, 10, key="k_gen")
+        if st.button("Recommander par genre"):
+            try:
+                data = api_get(f"/recommend/by-genre/{genre}", params={"k": k_gen}, require_auth=True)
+                df = pd.json_normalize(data.get("recommendations", []))
+                st.dataframe(df, use_container_width=True)
+                with st.expander("Réponse brute"):
+                    st.json(data)
+            except Exception as e:
+                st.error(str(e))
+
+    with c4:
+        st.caption("Clusters")
+        top_terms = st.slider("Top terms", 3, 30, 10)
+        sample = st.slider("Sample", 1, 200, 12)
+        colX, colY = st.columns(2)
+        if colX.button("Explorer clusters"):
+            try:
+                data = api_get("/recommend/cluster-explore", params={"top_terms": top_terms}, require_auth=True)
+                st.json(data)
+            except Exception as e:
+                st.error(str(e))
+        if colY.button("Cluster aléatoire"):
+            try:
+                data = api_get("/recommend/random-cluster", params={"sample": sample}, require_auth=True)
+                games = data if isinstance(data, list) else data.get("games", data)
+                df = pd.json_normalize(games)
+                st.dataframe(df, use_container_width=True)
+                with st.expander("Réponse brute"):
+                    st.json(data)
+            except Exception as e:
+                st.error(str(e))
+
+    st.markdown("---")
+    st.subheader("Jeux d'un cluster donné")
+    cluster_id = st.number_input("cluster_id", min_value=0, step=1, value=0)
+    sample2 = st.slider("Sample", 1, 500, 50, key="sample_cluster")
+    if st.button("Charger le cluster"):
+        try:
+            data = api_get(f"/recommend/cluster/{int(cluster_id)}", params={"sample": int(sample2)}, require_auth=True)
+            df = pd.json_normalize(data.get("games", []))
+            st.dataframe(df, use_container_width=True)
+            with st.expander("Réponse brute"):
+                st.json(data)
+        except Exception as e:
+            st.error(str(e))
+
+
+def page_training():
+    st.subheader("⚙️ Entraînement & Évaluation")
+    if not st.session_state.get("logged"):
+        st.warning("Veuillez vous connecter.")
+        return
+
+    with st.expander("Entraîner le modèle"):
+        version = st.text_input("Version (optionnel)", value="")
+        force = st.checkbox("Forcer le réentraînement à la prochaine requête (côté API)", value=False, help="Utile si vous avez modifié la BDD.")
+        if st.button("Lancer l'entraînement maintenant"):
+            try:
+                payload = {"version": version or None, "force_retrain": bool(force)}
+                data = api_post("/model/train", payload)
+                st.success("Entraînement lancé / réalisé ✔️")
+                st.json(data)
+            except Exception as e:
+                st.error(str(e))
+
+    with st.expander("Évaluer (smoke-test)"):
+        default_q = ["RPG", "Action", "Indie", "Simulation"]
+        q = st.text_area("Liste de requêtes (séparées par des virgules)", value=", ".join(default_q))
+        if st.button("Évaluer"):
+            try:
+                lst = [x.strip() for x in q.split(",") if x.strip()]
+                # /model/evaluate expects a query param list named test_queries
+                params = []
+                for item in lst:
+                    params.append(("test_queries", item))
+                url = f"{API_BASE_URL}/model/evaluate"
+                resp = requests.post(url, headers=_headers(), params=params, timeout=60)
+                if not resp.ok:
+                    raise RuntimeError(resp.text)
+                st.json(resp.json())
+            except Exception as e:
+                st.error(str(e))
+
+
+# =============== Main Layout ===============
+
+def main():
+    show_header()
+    sidebar_auth()
+
+    tabs = st.tabs(["Statut", "Recommandations", "Entraînement / Évaluation"])  # light, focused UI
+
+    with tabs[0]:
+        page_status()
+    with tabs[1]:
+        page_recommendations()
+    with tabs[2]:
+        page_training()
+
+    st.markdown("---")
+    st.caption("💡 Astuces : Assurez-vous que la base MySQL est prête côté API. En mode démo (DB indisponible), utilisez les identifiants par défaut si activés.")
+
 
 if __name__ == "__main__":
     main()
