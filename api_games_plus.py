@@ -226,50 +226,113 @@ def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: 
 
 # ----------------- Recos ML -----------------
 @app.post("/recommend/ml", tags=["recommend"])
-def recommend_ml(req: PredictionRequest, user: dict = Depends(verify_token)):
+def recommend_ml(req: PredictionRequest, user: str = Depends(verify_token)):
     _ensure_model_trained_with_db()
     model = get_model()
 
-    clean_query = req.query.strip()
+    clean_query = (req.query or "").strip()
     if not clean_query:
         raise HTTPException(status_code=400, detail="Query is empty")
 
+    # 1) prédiction
     try:
-        recommendations = model.predict(
+        recs = model.predict(
             query=clean_query,
             k=req.k,
             min_confidence=req.min_confidence
         )
     except Exception as e:
+        logger.exception("Prediction failed")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
-    # --------------------------
-    # ✅ Appliquer les filtres
-    # --------------------------
-    if req.min_price is not None:
-        recommendations = [
-            r for r in recommendations
-            if r.get("best_price_PC") is not None and r["best_price_PC"] >= req.min_price
-        ]
+    # ---------- helpers robustes ----------
+    def _to_float(x):
+        # accepte "19.99", "19,99", 19, None...
+        if x is None:
+            return None
+        try:
+            if isinstance(x, str):
+                x = x.replace(",", ".").strip()
+            return float(x)
+        except Exception:
+            return None
 
-    if req.platforms:
-        recommendations = [
-            r for r in recommendations
-            if any(p in r.get("platforms", []) for p in req.platforms)
-        ]
+    def _as_list(v):
+        # -> liste nettoyée de chaînes
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        s = str(v).strip()
+        if not s:
+            return []
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) == 1:  # pas de virgules -> on split sur espaces
+            parts = [p for p in s.split() if p.strip()]
+        return [p for p in parts if p]
 
-    if req.genres:
-        recommendations = [
-            r for r in recommendations
-            if any(g.lower() in (r.get("genres", "").lower()) for g in req.genres)
-        ]
+    def _lower_set(items):
+        return {str(i).strip().lower() for i in items if str(i).strip()}
 
-    return {
+    def price_of(rec):
+        # best_price_PC prioritaire, sinon price si dispo
+        p = rec.get("best_price_PC", None)
+        if p is None:
+            p = rec.get("price", None)
+        return _to_float(p)
+
+    # 2) filtres croisés – on SKIP silencieusement ce qui est invalide
+    filtered = []
+    want_plats = _lower_set(req.platforms or [])
+    want_genres = _lower_set(req.genres or [])
+    min_price = _to_float(req.min_price) if req.min_price is not None else None
+
+    for r in recs:
+        try:
+            # -- prix
+            if min_price is not None:
+                p = price_of(r)
+                if p is None or p < min_price:
+                    continue
+
+            # -- plateformes (intersection non vide)
+            if want_plats:
+                plats = _lower_set(_as_list(r.get("platforms")))
+                if not (plats & want_plats):
+                    continue
+
+            # -- genres (intersection non vide; fallback sous-chaîne)
+            if want_genres:
+                gval = r.get("genres")
+                rec_genres = _lower_set(_as_list(gval))
+                ok = bool(rec_genres & want_genres)
+                if not ok and isinstance(gval, str):
+                    gtxt = gval.lower()
+                    ok = any(w in gtxt for w in want_genres)
+                if not ok:
+                    continue
+
+            filtered.append(r)
+        except Exception as e:
+            # on ignore la ligne invalide plutôt que de 500
+            logger.warning("Skipping invalid record during filtering: %s", e)
+            continue
+
+    resp = {
         "query": clean_query,
-        "recommendations": recommendations,
-        "count": len(recommendations),
-        "model_version": model.model_version
+        "recommendations": filtered,
+        "count": len(filtered),
+        "model_version": model.model_version,
     }
+    # accessibilité si dispo
+    acc = get_accessibility_validator()
+    if acc:
+        try:
+            resp = acc.enhance_response_accessibility(resp)
+        except Exception as e:
+            logger.warning("Accessibility enhancement failed: %s", e)
+
+    return resp
 
 
 # ----------------- Autres endpoints reco -----------------
