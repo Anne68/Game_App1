@@ -148,15 +148,48 @@ async def get_current_user(
 # ============================================================
 # Endpoint Auth
 # ============================================================
+from fastapi import Request
+
 @app.post("/token", response_model=Token, summary="Obtenir un JWT (OAuth2 Password)")
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+async def login_for_access_token(
+    request: Request,
+    form_data: OAuth2PasswordRequestForm = Depends()
+):
     """
-    Envoie `username` et `password` (form-data).
-    Retourne un JWT Bearer (access_token).
+    Autorise deux formats d'entrée :
+    1) application/x-www-form-urlencoded (standard OAuth2) -> Swagger, curl -d ...
+       champs: username, password, (scope optionnel)
+    2) application/json -> { "username": "...", "password": "..." }
     """
-    user = authenticate_user(form_data.username, form_data.password)
+    username = form_data.username
+    password = form_data.password
+
+    # Si l'appel n'a pas envoyé de form-data, essayer JSON
+    if not username or not password:
+        # Essayer de parser le JSON, sans planter si vide
+        try:
+            body = await request.json()
+            username = body.get("username") or username
+            password = body.get("password") or password
+        except Exception:
+            pass
+
+    if not username or not password:
+        # 400 = mauvais format ; message clair
+        raise HTTPException(
+            status_code=400,
+            detail="Requête invalide: envoyer username/password en form-data OU en JSON."
+        )
+
+    user = authenticate_user(username, password)
     if not user:
-        raise HTTPException(status_code=400, detail="Nom d'utilisateur ou mot de passe incorrect")
+        # 401 + WWW-Authenticate pour signaler un auth error (mieux que 400 pour clients OAuth)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Nom d'utilisateur ou mot de passe incorrect",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     granted_scopes = user.scopes or []
     access_token = create_access_token(
         data={"sub": user.username, "scopes": granted_scopes},
