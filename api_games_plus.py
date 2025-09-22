@@ -1,533 +1,760 @@
-# model_manager.py - Gestion du modèle de recommandation (Pipeline TF-IDF → SVD → KMeans → KNN)
+# api_games_plus.py
 from __future__ import annotations
 import os
-import pickle
+import time
+import math
 import logging
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+import inspect
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any, Tuple
 
-import numpy as np
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import TruncatedSVD
-from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.cluster import KMeans
+import pymysql
+from fastapi import FastAPI, HTTPException, Depends, Form, Query, BackgroundTasks, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
+from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel
 
-logger = logging.getLogger("model-manager")
+from settings import get_settings
+from model_manager import get_model
+from monitoring_metrics import (
+    prediction_latency,
+    model_prediction_counter,
+    get_monitor,
+)
 
-class RecommendationModel:
-    """
-    Modèle de recommandation avec pipeline :
-      TF-IDF (titre+genres+plateformes) -> SVD -> KMeans (8 clusters) -> KNN (NearestNeighbors)
+logger = logging.getLogger("games-api-ml")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
-    Méthodes spécialisées :
-      - predict(query)
-      - predict_by_game_id(game_id)
-      - recommend_by_title_similarity(query_title)
-      - recommend_by_genre(genre)
-      - recommend_with_filters(genre, platforms, max_price)   # <--- AJOUT
-      - get_cluster_games(cluster_id)
-      - cluster_explore() / random_cluster()
-    """
+# Compliance (optionnel)
+try:
+    from compliance.standards_compliance import SecurityValidator, AccessibilityValidator
+    COMPLIANCE_AVAILABLE = True
+    logger.info("Compliance module loaded successfully")
+except ImportError as e:
+    COMPLIANCE_AVAILABLE = False
+    logger.warning(f"Compliance module not available: {e}")
 
-    def __init__(self, model_version: str = "2.1.0"):
-        self.model_version = model_version
+settings = get_settings()
+SECRET_KEY = settings.SECRET_KEY
+ALGORITHM = settings.ALGORITHM
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
-        # Texte (contenu)
-        self.vectorizer = TfidfVectorizer(
-            max_features=5000,
-            ngram_range=(1, 2),
-            stop_words="english",
-            lowercase=True
-        )
-        self.svd = TruncatedSVD(n_components=128, random_state=42)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+pwd_ctx = CryptContext(schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"], deprecated="auto")
 
-        # Titre seul (pour similarité stricte par titre)
-        self.title_vectorizer = TfidfVectorizer(
-            max_features=8000,
-            analyzer="char",
-            ngram_range=(3, 5),
-            lowercase=True
-        )
+DB_READY: bool = False
+DB_LAST_ERROR: Optional[str] = None
 
-        # Clustering et KNN
-        self.kmeans = KMeans(n_clusters=8, random_state=42, n_init="auto")
-        self.knn = NearestNeighbors(metric="cosine", n_neighbors=50, algorithm="auto")
+app = FastAPI(
+    title="Games API ML (C9→C13)",
+    version="2.5.0",
+    description="API avec modèle ML, monitoring avancé et MySQL (AlwaysData) pour les utilisateurs",
+)
 
-        # Données/features
-        self.game_features: Optional[np.ndarray] = None          # features réduites + numériques
-        self.features_reduced: Optional[np.ndarray] = None       # uniquement SVD
-        self.tfidf_matrix: Optional[np.ndarray] = None           # TF-IDF brut (sparse)
-        self.cluster_labels: Optional[np.ndarray] = None
-        self.games_df: Optional[pd.DataFrame] = None
-        self.is_trained: bool = False
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o for o in settings.ALLOW_ORIGINS.split(",") if o] or ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-        # Caches
-        self._id_to_index: Dict[int, int] = {}
-        self._neighbors_cache: Dict[int, List[Tuple[int, float]]] = {}
-
-        # Métriques
-        self.metrics = {
-            "total_predictions": 0,
-            "avg_confidence": 0.0,
-            "last_training": None,
-            "model_version": model_version,
-            "feature_dim": 0
-        }
-
-    # -----------------------------
-    # Préparation des features
-    # -----------------------------
-    def prepare_features(self, games: List[Dict]) -> pd.DataFrame:
-        df = pd.DataFrame(games)
-
-        # Texte combiné pour le contenu
-        df["platforms_str"] = df["platforms"].apply(lambda x: " ".join(x) if isinstance(x, list) else str(x or ""))
-        df["combined_features"] = (
-            df["title"].fillna("") + " " +
-            df["genres"].fillna("") + " " +
-            df["platforms_str"].fillna("")
-        )
-
-        # Normalisation numérique robuste (évite division par zéro)
-        for col in ["rating", "metacritic"]:
-            if col not in df:
-                df[col] = 0
-        df["rating"] = pd.to_numeric(df["rating"], errors="coerce").fillna(0.0)
-        df["metacritic"] = pd.to_numeric(df["metacritic"], errors="coerce").fillna(0.0)
-
-        def norm_col(x: pd.Series) -> pd.Series:
-            x_min, x_max = float(x.min()), float(x.max())
-            if x_max == x_min:
-                return pd.Series(np.zeros(len(x)))
-            return (x - x_min) / (x_max - x_min)
-
-        df["rating_norm"] = norm_col(df["rating"])
-        df["metacritic_norm"] = norm_col(df["metacritic"])
-
-        # --- AJOUT : colonne prix (utilisée uniquement pour filtrer, pas dans les features)
-        if "price" not in df:
-            df["price"] = np.nan
-        df["price"] = pd.to_numeric(df["price"], errors="coerce")
-
-        return df
-
-    # -----------------------------
-    # Entraînement
-    # -----------------------------
-    def train(self, games: List[Dict]) -> Dict:
-        logger.info(f"Training model v{self.model_version} with {len(games)} games")
-        self.games_df = self.prepare_features(games)
-
-        # TF-IDF contenu -> SVD
-        self.tfidf_matrix = self.vectorizer.fit_transform(self.games_df["combined_features"])
-        self.features_reduced = self.svd.fit_transform(self.tfidf_matrix)
-
-        # Concat avec numériques
-        numeric = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float)
-        self.game_features = np.hstack([self.features_reduced, numeric])
-
-        # KMeans + KNN
-        self.cluster_labels = self.kmeans.fit_predict(self.features_reduced)
-        self.knn.fit(self.game_features)
-
-        # Vectoriseur de titres pour similarité stricte titres
-        self.title_tfidf = self.title_vectorizer.fit_transform(self.games_df["title"].fillna(""))
-
-        # Index rapides
-        self._id_to_index = {int(self.games_df.iloc[idx]["id"]): idx for idx in range(len(self.games_df))}
-        self._neighbors_cache.clear()
-
-        self.is_trained = True
-        self.metrics["last_training"] = datetime.utcnow().isoformat()
-        self.metrics["feature_dim"] = int(self.game_features.shape[1])
-
-        validation = self._validate_model()
-        logger.info(f"Model trained. Features: {self.game_features.shape}, clusters: {len(np.unique(self.cluster_labels))}")
-        return {
-            "status": "success",
-            "model_version": self.model_version,
-            "games_count": len(games),
-            "feature_dim": int(self.game_features.shape[1]),
-            "validation_metrics": validation
-        }
-
-    def _validate_model(self) -> Dict:
-        if not self.is_trained or self.game_features is None:
-            return {"error": "Model not trained"}
-        # Mesure de compacité inter/intra cluster simple
+# ----------------- Compliance helpers -----------------
+def setup_compliance():
+    if COMPLIANCE_AVAILABLE:
         try:
-            centers = self.kmeans.cluster_centers_  # espace réduit
-            # Distance moyenne jeu->centre de son cluster
-            dists = []
-            for i, z in enumerate(self.features_reduced):
-                c = centers[self.cluster_labels[i]]
-                dists.append(np.linalg.norm(z - c))
-            return {
-                "mean_distance_to_center": float(np.mean(dists)),
-                "std_distance_to_center": float(np.std(dists)),
-                "max_distance_to_center": float(np.max(dists))
-            }
-        except Exception:
-            return {"note": "validation skipped"}
-
-    # -----------------------------
-    # Prédictions & recommandations
-    # -----------------------------
-    def _neighbors_for_index(self, idx: int, k: int) -> List[Tuple[int, float]]:
-        if idx in self._neighbors_cache and len(self._neighbors_cache[idx]) >= k:
-            return self._neighbors_cache[idx][:k]
-        distances, indices = self.knn.kneighbors([self.game_features[idx]], n_neighbors=min(k + 1, len(self.game_features)))
-        # Exclure soi-même (distance zéro)
-        pairs = [(int(j), float(1.0 - distances[0][t])) for t, j in enumerate(indices[0]) if int(j) != idx]
-        self._neighbors_cache[idx] = pairs
-        return pairs[:k]
-
-    def predict(self, query: str, k: int = 10, min_confidence: float = 0.1) -> List[Dict]:
-        """Recommandations par requête libre (contenu)."""
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-
-        # Projeter la requête dans l'espace
-        q_tfidf = self.vectorizer.transform([query])
-        q_red = self.svd.transform(q_tfidf)
-        avg_num = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float).mean(axis=0)
-        q_feat = np.hstack([q_red[0], avg_num])
-
-        # KNN global
-        distances, indices = self.knn.kneighbors([q_feat], n_neighbors=min(k * 3, len(self.game_features)))
-        recs = []
-        for t, j in enumerate(indices[0]):
-            score = 1.0 - float(distances[0][t])  # convertir distance cos en similarité
-            if score < min_confidence:
-                continue
-            row = self.games_df.iloc[int(j)]
-            recs.append({
-                "id": int(row["id"]),
-                "title": row["title"],
-                "genres": row["genres"],
-                "confidence": score,
-                "rating": float(row["rating"]),
-                "metacritic": int(row["metacritic"]),
-                "cluster": int(self.cluster_labels[int(j)])
-            })
-            if len(recs) >= k:
-                break
-
-        # métriques
-        self._update_metrics(recs, k)
-        return recs
-
-    def predict_by_game_id(self, game_id: int, k: int = 10) -> List[Dict]:
-        """Recommandations type 'jeux similaires' à un jeu existant (KNN)."""
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-        if game_id not in self._id_to_index:
-            raise ValueError(f"Game with id {game_id} not found")
-
-        idx = self._id_to_index[game_id]
-        pairs = self._neighbors_for_index(idx, k)
-        recs = []
-        for j, score in pairs:
-            row = self.games_df.iloc[j]
-            recs.append({
-                "id": int(row["id"]),
-                "title": row["title"],
-                "genres": row["genres"],
-                "confidence": score,
-                "rating": float(row["rating"]),
-                "metacritic": int(row["metacritic"]),
-                "cluster": int(self.cluster_labels[j])
-            })
-        self._update_metrics(recs, k)
-        return recs
-
-    def recommend_by_title_similarity(self, query_title: str, k: int = 10, min_confidence: float = 0.0) -> List[Dict]:
-        """Similarité stricte sur les titres (TF-IDF caractères) — utile pour typo/fuzzy."""
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-        q = self.title_vectorizer.transform([query_title])
-        sims = cosine_similarity(q, self.title_tfidf)[0]
-        order = np.argsort(sims)[::-1]
-        recs = []
-        for idx in order[:k * 2]:
-            score = float(sims[idx])
-            if score < min_confidence:
-                continue
-            row = self.games_df.iloc[int(idx)]
-            recs.append({
-                "id": int(row["id"]),
-                "title": row["title"],
-                "genres": row["genres"],
-                "confidence": score,
-                "rating": float(row["rating"]),
-                "metacritic": int(row["metacritic"]),
-                "cluster": int(self.cluster_labels[int(idx)])
-            })
-            if len(recs) >= k:
-                break
-        self._update_metrics(recs, k)
-        return recs
-
-    def recommend_by_genre(self, genre: str, k: int = 10) -> List[Dict]:
-        """Filtrage simple par genre: prend les plus proches d'une 'requête-genre'."""
-        return self.predict(query=genre, k=k, min_confidence=0.0)
-
-    # -----------------------------
-    # AJOUTS : filtres budget / plateformes / genre
-    # -----------------------------
-    @staticmethod
-    def _match_platforms(row_platforms, wanted_platforms: Optional[List[str]]) -> bool:
-        """Vrai si l'intersection est non-vide (case-insensitive)."""
-        if not wanted_platforms:
+            app.state.security_validator = SecurityValidator()
+            app.state.accessibility_validator = AccessibilityValidator()
+            logger.info("Compliance validators attached to app state")
             return True
-        if isinstance(row_platforms, list):
-            row_set = {str(p).strip().lower() for p in row_platforms}
+        except Exception as e:
+            logger.error(f"Failed to setup compliance validators: {e}")
+            return False
+    logger.info("Compliance not available - continuing without")
+    return False
+
+COMPLIANCE_ENABLED = setup_compliance()
+
+def get_security_validator():
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'security_validator'):
+        return app.state.security_validator
+    return None
+
+def get_accessibility_validator():
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'accessibility_validator'):
+        return app.state.accessibility_validator
+    return None
+
+# ----------------- Models -----------------
+class TrainRequest(BaseModel):
+    version: Optional[str] = None
+    force_retrain: bool = False
+
+class PredictionRequest(BaseModel):
+    query: str
+    k: int = 10
+    min_confidence: float = 0.1
+
+class SimilarGameRequest(BaseModel):
+    game_id: Optional[int] = None
+    title: Optional[str] = None
+    k: int = 10
+
+class ModelMetricsResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    model_version: str
+    is_trained: bool
+    total_predictions: int
+    avg_confidence: float
+    last_training: Optional[str]
+    games_count: int
+    feature_dimension: int
+
+class TrainResponse(BaseModel):
+    status: str
+    version: Optional[str] = None
+    duration: Optional[float] = None
+    result: Optional[Dict[str, Any]] = None
+
+# ----------------- Utils -----------------
+def get_setting_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = getattr(settings, name, None)
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return default
+
+# ----------------- DB helpers -----------------
+def _ssl_kwargs() -> dict:
+    ssl_dict: Dict[str, str] = {}
+    if getattr(settings, "DB_SSL_CA", None):
+        ssl_dict["ca"] = settings.DB_SSL_CA
+    if getattr(settings, "DB_SSL_CERT", None) and getattr(settings, "DB_SSL_KEY", None):
+        ssl_dict["cert"] = settings.DB_SSL_CERT
+        ssl_dict["key"] = settings.DB_SSL_KEY
+    return {"ssl": ssl_dict} if ssl_dict else {}
+
+def get_db_conn():
+    if not settings.db_configured:
+        raise RuntimeError("Database not configured (missing DB_* env vars)")
+    return pymysql.connect(
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        user=settings.DB_USER,
+        password=settings.DB_PASSWORD,
+        database=settings.DB_NAME,
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=5,
+        read_timeout=10,
+        write_timeout=10,
+        **_ssl_kwargs(),
+    )
+
+def ensure_users_table():
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SHOW TABLES LIKE 'users';")
+        if not cur.fetchone():
+            cur.execute(
+                """
+                CREATE TABLE users (
+                  id INT AUTO_INCREMENT PRIMARY KEY,
+                  username VARCHAR(190) UNIQUE NOT NULL,
+                  hashed_password VARCHAR(255) NOT NULL,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+            )
+            conn.commit()
+            logger.info("Created users table.")
+            return
+        cur.execute("SHOW COLUMNS FROM users LIKE 'hashed_password';")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE users ADD COLUMN hashed_password VARCHAR(255) NOT NULL;")
+            conn.commit()
+            logger.info("Added 'hashed_password' column.")
+
+def users_has_column(column: str) -> bool:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SHOW COLUMNS FROM users LIKE %s;", (column,))
+        return cur.fetchone() is not None
+
+def get_user(username: str) -> Optional[dict]:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        return cur.fetchone()
+
+def create_user(username: str, password: str) -> int:
+    hpwd = pwd_ctx.hash(password)
+    with get_db_conn() as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                "INSERT INTO users(username, hashed_password) VALUES(%s,%s)",
+                (username, hpwd),
+            )
+            user_id = int(cur.lastrowid)
+            if users_has_column("password_hash"):
+                cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (hpwd, user_id))
+            conn.commit()
+            logger.info("User '%s' created (id=%s)", username, user_id)
+            return user_id
+        except pymysql.err.IntegrityError:
+            cur.execute("SELECT id FROM users WHERE username=%s", (username,))
+            row = cur.fetchone()
+            return int(row["id"]) if row and "id" in row else 0
+
+def extract_stored_password(row: dict) -> Tuple[Optional[str], str]:
+    for col in ("hashed_password", "password_hash", "password"):
+        if col in row:
+            v = (row[col] or "").strip()
+            if v:
+                return col, v
+    return None, ""
+
+def update_user_password(username: str, new_hash: str) -> None:
+    set_parts = ["hashed_password=%s"]
+    params = [new_hash]
+    if users_has_column("password_hash"):
+        set_parts.append("password_hash=%s")
+        params.append(new_hash)
+    params.append(username)
+    sql = f"UPDATE users SET {', '.join(set_parts)} WHERE username=%s"
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        conn.commit()
+
+def count_games_in_db() -> int:
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM games WHERE COALESCE(title,'') <> ''")
+        row = cur.fetchone()
+        return int(row["n"]) if row else 0
+
+def _parse_platforms(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [p.strip() for p in str(value).split(",") if p.strip()]
+
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float) and math.isnan(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _safe_int(x, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float) and math.isnan(x):
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+# ---------- IMPORTANT: lire TOUJOURS la BDD (pas de fallback, sauf USE_DEMO_GAMES=true) ----------
+def fetch_games_for_ml(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    use_demo = get_setting_bool("USE_DEMO_GAMES", False)
+    if not DB_READY and not use_demo:
+        raise RuntimeError("Database not ready and USE_DEMO_GAMES is false")
+
+    if not DB_READY and use_demo:
+        logger.warning("DB not ready. Falling back to demo games because USE_DEMO_GAMES=true")
+        return [
+            {"id": 1, "title": "The Witcher 3", "genres": "RPG Action", "rating": 4.9, "metacritic": 93, "platforms": ["PC", "PS4"]},
+            {"id": 2, "title": "Hades", "genres": "Action Roguelike", "rating": 4.8, "metacritic": 93, "platforms": ["PC", "Switch"]},
+            {"id": 3, "title": "Stardew Valley", "genres": "Simulation RPG", "rating": 4.7, "metacritic": 89, "platforms": ["PC", "Switch"]},
+            {"id": 4, "title": "Celeste", "genres": "Platformer Indie", "rating": 4.6, "metacritic": 94, "platforms": ["PC", "Switch"]},
+            {"id": 5, "title": "Doom Eternal", "genres": "Action FPS", "rating": 4.5, "metacritic": 88, "platforms": ["PC", "PS4"]},
+            {"id": 6, "title": "Hollow Knight", "genres": "Metroidvania Indie", "rating": 4.7, "metacritic": 90, "platforms": ["PC", "Switch"]},
+            {"id": 7, "title": "Cyberpunk 2077", "genres": "RPG Action", "rating": 4.0, "metacritic": 76, "platforms": ["PC", "PS4", "Xbox"]},
+        ]
+
+    sql = """
+        SELECT
+            game_id_rawg AS id,
+            title,
+            genres,
+            rating,
+            metacritic,
+            platforms
+        FROM games
+        WHERE COALESCE(title,'') <> ''
+    """
+    if limit and limit > 0:
+        sql += " LIMIT %s"
+
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, (limit,) if limit else None)
+        rows = cur.fetchall() or []
+
+    games: List[Dict[str, Any]] = []
+    for r in rows:
+        games.append({
+            "id": int(r["id"]),
+            "title": r.get("title") or "",
+            "genres": r.get("genres") or "",
+            "rating": _safe_float(r.get("rating"), 0.0),
+            "metacritic": _safe_int(r.get("metacritic"), 0),
+            "platforms": _parse_platforms(r.get("platforms")),
+        })
+
+    logger.info("Loaded %s games from DB", len(games))
+    if not games:
+        raise RuntimeError("Aucun jeu exploitable trouvé dans la table 'games'.")
+    return games
+
+def find_games_by_title(q: str, limit: int = 25) -> List[Dict[str, Any]]:
+    use_demo = get_setting_bool("USE_DEMO_GAMES", False)
+    if not DB_READY and not use_demo:
+        raise RuntimeError("Database not ready and USE_DEMO_GAMES is false")
+    if not DB_READY and use_demo:
+        # recherche simple dans la démo
+        default_games = fetch_games_for_ml()
+        q_lower = q.strip().lower()
+        results = []
+        for game in default_games:
+            if q_lower in game["title"].lower():
+                results.append({
+                    "id": game["id"],
+                    "title": game["title"],
+                    "rating": game["rating"],
+                    "metacritic": game["metacritic"],
+                    "platforms": ",".join(game["platforms"]) if isinstance(game["platforms"], list) else game["platforms"]
+                })
+        return results[:limit]
+
+    like = f"%{q.strip().lower()}%"
+    sql = """
+        SELECT
+            g.game_id_rawg AS id,
+            g.title,
+            g.rating,
+            g.metacritic,
+            g.platforms
+        FROM games g
+        WHERE LOWER(g.title) LIKE %s
+        ORDER BY CHAR_LENGTH(g.title) ASC
+        LIMIT %s
+    """
+    with get_db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, (like, max(1, limit)))
+        return cur.fetchall() or []
+
+# ----------------- Auth helpers -----------------
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def verify_token(token: str = Depends(oauth2_scheme)) -> str:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        sub: str = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return sub
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ----------------- Decorator (latency) -----------------
+def measure_latency(endpoint: str):
+    def decorator(func):
+        if inspect.iscoroutinefunction(func):
+            async def async_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = await func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            async_wrapper.__name__ = func.__name__
+            async_wrapper.__signature__ = inspect.signature(func)
+            return async_wrapper
         else:
-            row_set = {str(row_platforms).strip().lower()}
-        want_set = {str(p).strip().lower() for p in wanted_platforms}
-        return len(row_set.intersection(want_set)) > 0
+            def sync_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            sync_wrapper.__name__ = func.__name__
+            sync_wrapper.__signature__ = inspect.signature(func)
+            return sync_wrapper
+    return decorator
 
-    @staticmethod
-    def _match_genre(row_genres, wanted_genre: Optional[str]) -> bool:
-        if not wanted_genre:
-            return True
-        if pd.isna(row_genres):
-            return False
-        return str(wanted_genre).strip().lower() in str(row_genres).lower()
+# ----------------- System & monitoring -----------------
+@app.get("/healthz", tags=["system"])
+def healthz():
+    model = get_model()
+    model_path = os.path.join("model", "recommendation_model.pkl")
+    try:
+        if os.path.exists(model_path):
+            if model.load_model():
+                logger.info("Model %s loaded successfully", getattr(model, "model_version", "unknown"))
+            else:
+                logger.info("No saved model found; will train on first request")
+        else:
+            logger.info("No saved model found; will train on first request")
+    except Exception as e:
+        logger.warning("Error while loading model: %s. Will train on first request.", e)
 
-    def recommend_with_filters(
-        self,
-        genre: Optional[str] = None,
-        platforms: Optional[List[str]] = None,
-        max_price: Optional[float] = None,
-        k: int = 10,
-        min_confidence: float = 0.0,
-        sort_by: str = "score",   # "score" ou "price"
-    ) -> List[Dict]:
-        """
-        Recommandations filtrées par genre, plateformes et prix max.
-        Stratégie :
-          1) Filtrer les candidats dans games_df (prix/plateformes/genre)
-          2) Construire une requête texte simple (genre + plateformes)
-          3) Projeter la requête (TF-IDF -> SVD + moyennes numériques)
-          4) Similarité cosine avec les SEULS candidats
-          5) Trier (par score ou prix) et retourner top-k
-        """
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-        if self.games_df is None or self.game_features is None:
-            raise ValueError("Model data not available")
+    if COMPLIANCE_ENABLED:
+        logger.info("E4 Compliance standards active")
+        logger.info(f"Security validator: {get_security_validator() is not None}")
+        logger.info(f"Accessibility validator: {get_accessibility_validator() is not None}")
+    else:
+        logger.warning("E4 Compliance standards not available")
 
-        # 1) Masque candidats
-        mask = pd.Series(True, index=self.games_df.index)
+    monitor = get_monitor()
+    return {
+        "status": "healthy" if (DB_READY or not settings.DB_REQUIRED) else "degraded",
+        "time": datetime.utcnow().isoformat(),
+        "db_ready": DB_READY,
+        "db_error": DB_LAST_ERROR,
+        "model_loaded": model.is_trained,
+        "model_version": model.model_version,
+        "monitoring": monitor.get_metrics_summary(),
+        "compliance_enabled": COMPLIANCE_ENABLED,
+    }
 
-        if max_price is not None:
-            mask &= self.games_df["price"].notna() & (self.games_df["price"] <= float(max_price))
+@app.get("/", include_in_schema=False)
+def root():
+    return {"name": app.title, "version": app.version, "status": "ok"}
 
-        if genre:
-            mask &= self.games_df["genres"].apply(lambda g: self._match_genre(g, genre))
+# Health probe Render HEAD /
+@app.head("/", include_in_schema=False)
+def head_root():
+    return Response(status_code=200)
 
-        if platforms:
-            mask &= self.games_df["platforms"].apply(lambda p: self._match_platforms(p, platforms))
+Instrumentator().instrument(app).expose(app, include_in_schema=True)
 
-        candidate_idxs = np.where(mask.values)[0]
-        if len(candidate_idxs) == 0:
-            return []
-
-        # 2) Requête texte simple
-        parts = []
-        if genre:
-            parts.append(str(genre))
-        if platforms:
-            parts.extend([str(p) for p in platforms])
-        query_text = " ".join(parts) if parts else ""
-
-        # 3) Projection de la requête
-        q_tfidf = self.vectorizer.transform([query_text])
-        q_red = self.svd.transform(q_tfidf)
-        avg_num = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float).mean(axis=0)
-        q_feat = np.hstack([q_red[0], avg_num]).reshape(1, -1)
-
-        # 4) Similarité cosine avec candidats
-        cand_feats = self.game_features[candidate_idxs]
-        sims = cosine_similarity(q_feat, cand_feats)[0]  # longueur = nb candidats
-
-        # 5) Tri
-        order = np.argsort(sims)[::-1]  # par score décroissant
-        if sort_by == "price":
-            prices = self.games_df.iloc[candidate_idxs]["price"].to_numpy()
-            # Tri primaire sur prix (asc), secondaire sur score (desc)
-            order = np.lexsort((-sims, prices))
-
-        # 6) Sortie top-k
-        recs = []
-        for pos in order:
-            idx = int(candidate_idxs[int(pos)])
-            score = float(sims[int(pos)])
-            if score < min_confidence:
-                continue
-            row = self.games_df.iloc[idx]
-            recs.append({
-                "id": int(row["id"]),
-                "title": row["title"],
-                "genres": row["genres"],
-                "platforms": row["platforms"],
-                "price": (None if pd.isna(row["price"]) else float(row["price"])),
-                "confidence": score,
-                "rating": float(row["rating"]),
-                "metacritic": int(row["metacritic"]),
-                "cluster": int(self.cluster_labels[idx]),
-            })
-            if len(recs) >= k:
-                break
-
-        self._update_metrics(recs, k)
-        return recs
-
-    # -----------------------------
-    # Clusters
-    # -----------------------------
-    def get_cluster_games(self, cluster_id: int, sample: Optional[int] = None) -> List[Dict]:
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-        if cluster_id < 0 or cluster_id >= self.kmeans.n_clusters:
-            raise ValueError(f"Cluster id must be in [0, {self.kmeans.n_clusters-1}]")
-        idxs = np.where(self.cluster_labels == cluster_id)[0]
-        if sample is not None and sample > 0:
-            if sample < len(idxs):
-                rng = np.random.default_rng(42)
-                idxs = rng.choice(idxs, size=sample, replace=False)
-        out = []
-        for i in idxs:
-            row = self.games_df.iloc[int(i)]
-            out.append({
-                "id": int(row["id"]),
-                "title": row["title"],
-                "genres": row["genres"],
-                "rating": float(row["rating"]),
-                "metacritic": int(row["metacritic"])
-            })
-        return out
-
-    def _top_terms_per_cluster(self, top_n: int = 10) -> List[Dict]:
-        """
-        Approximation: moyenne TF-IDF par cluster, top features textuelles.
-        """
-        if self.tfidf_matrix is None:
-            return []
-        terms = np.array(self.vectorizer.get_feature_names_out())
-        result = []
-        for c in range(self.kmeans.n_clusters):
-            idxs = np.where(self.cluster_labels == c)[0]
-            if len(idxs) == 0:
-                result.append({"cluster": c, "size": 0, "top_terms": []})
-                continue
-            # moyenne TF-IDF cluster (sparse -> dense mean via .mean(axis=0))
-            mean_vec = self.tfidf_matrix[idxs].mean(axis=0).A1
-            top_idx = np.argsort(mean_vec)[::-1][:top_n]
-            result.append({
-                "cluster": c,
-                "size": int(len(idxs)),
-                "top_terms": terms[top_idx].tolist()
-            })
-        return result
-
-    def cluster_explore(self, top_n_terms: int = 10) -> Dict:
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-        sizes = np.bincount(self.cluster_labels, minlength=self.kmeans.n_clusters).tolist()
-        return {
-            "n_clusters": int(self.kmeans.n_clusters),
-            "sizes": sizes,
-            "top_terms": self._top_terms_per_cluster(top_n_terms)
-        }
-
-    def random_cluster(self, sample: int = 12) -> Dict:
-        if not self.is_trained:
-            raise ValueError("Model not trained")
-        c = int(np.random.default_rng().integers(0, self.kmeans.n_clusters))
-        games = self.get_cluster_games(c, sample=sample)
-        return {"cluster": c, "sample": games}
-
-    # -----------------------------
-    # Persistance & métriques
-    # -----------------------------
-    def save_model(self, filepath: str = "model/recommendation_model.pkl") -> bool:
+# ----------------- Training & metrics -----------------
+def _ensure_model_trained_with_db(force: bool = False):
+    model = get_model()
+    if (not model.is_trained) or force:
+        games = fetch_games_for_ml()
         try:
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            model_data = {
-                "version": self.model_version,
-                "vectorizer": self.vectorizer,
-                "svd": self.svd,
-                "kmeans": self.kmeans,
-                "knn": self.knn,
-                "title_vectorizer": self.title_vectorizer,
-                "title_tfidf": getattr(self, "title_tfidf", None),
-                "tfidf_matrix": self.tfidf_matrix,
-                "features_reduced": self.features_reduced,
-                "game_features": self.game_features,
-                "cluster_labels": self.cluster_labels,
-                "games_df": self.games_df,
-                "metrics": self.metrics,
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-            with open(filepath, "wb") as f:
-                pickle.dump(model_data, f)
-            logger.info(f"Model saved to {filepath}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save model: {e}")
-            return False
-
-    def load_model(self, filepath: str = "model/recommendation_model.pkl") -> bool:
+            model.train(games)
+        except ValueError as e:
+            logger.warning("Training error (%s). Retrying with sanitized numeric fields.", e)
+            for g in games:
+                g["rating"] = _safe_float(g.get("rating"), 0.0)
+                g["metacritic"] = _safe_int(g.get("metacritic"), 0)
+            model.train(games)
         try:
-            with open(filepath, "rb") as f:
-                m = pickle.load(f)
-            self.model_version = m["version"]
-            self.vectorizer = m["vectorizer"]
-            self.svd = m["svd"]
-            self.kmeans = m["kmeans"]
-            self.knn = m["knn"]
-            self.title_vectorizer = m["title_vectorizer"]
-            self.title_tfidf = m["title_tfidf"]
-            self.tfidf_matrix = m["tfidf_matrix"]
-            self.features_reduced = m["features_reduced"]
-            self.game_features = m["game_features"]
-            self.cluster_labels = m["cluster_labels"]
-            self.games_df = m["games_df"]
-            self.metrics = m["metrics"]
-            self._id_to_index = {int(row.id): idx for idx, row in self.games_df[["id"]].itertuples(index=True)}
-            self._neighbors_cache.clear()
-            self.is_trained = True
-            logger.info(f"Model v{self.model_version} loaded from {filepath}")
-            return True
+            model.save_model()
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            return False
+            logger.warning("Could not save model: %s", e)
 
-    def _update_metrics(self, recs: List[Dict], k: int):
-        self.metrics["total_predictions"] += 1
-        if recs:
-            avg_conf = float(np.mean([r["confidence"] for r in recs[:k]]))
-            n = self.metrics["total_predictions"]
-            self.metrics["avg_confidence"] = (self.metrics["avg_confidence"] * (n - 1) + avg_conf) / n
+@app.post("/model/train", tags=["model"], response_model=TrainResponse)
+def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: str = Depends(verify_token)):
+    start_time = time.time()
+    version = request.version or f"api-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    model = get_model()
+    model.model_version = version
+    games = fetch_games_for_ml()
+    result = model.train(games)
+    duration = time.time() - start_time
+    monitor = get_monitor()
+    monitor.record_training(
+        model_version=version,
+        games_count=len(games),
+        feature_dim=model.game_features.shape[1],
+        duration=duration,
+        metrics=result,
+    )
+    background_tasks.add_task(model.save_model)
+    return TrainResponse(status="success", version=version, duration=duration, result=result)
 
-    def get_metrics(self) -> Dict:
-        return {
-            **self.metrics,
-            "is_trained": self.is_trained,
-            "games_count": len(self.games_df) if self.games_df is not None else 0
-        }
+@app.get("/model/metrics", tags=["model"], response_model=ModelMetricsResponse)
+def get_model_metrics(user: str = Depends(verify_token)):
+    model = get_model()
+    metrics = model.get_metrics()
+    return ModelMetricsResponse(
+        model_version=metrics.get("model_version", "unknown"),
+        is_trained=metrics.get("is_trained", False),
+        total_predictions=metrics.get("total_predictions", 0),
+        avg_confidence=metrics.get("avg_confidence", 0.0),
+        last_training=metrics.get("last_training"),
+        games_count=metrics.get("games_count", 0),
+        feature_dimension=metrics.get("feature_dim", 0),
+    )
 
-# Singleton
-_model_instance: Optional[RecommendationModel] = None
+@app.post("/model/evaluate", tags=["model"])
+def evaluate_model(test_queries: List[str] = Query(default=["RPG", "Action", "Indie", "Simulation"]),
+                   user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    monitor = get_monitor()
+    return monitor.evaluate_model(model, test_queries)
 
-def get_model() -> RecommendationModel:
-    global _model_instance
-    if _model_instance is None:
-        _model_instance = RecommendationModel()
-        if os.path.exists("model/recommendation_model.pkl"):
-            _model_instance.load_model()
-    return _model_instance
+# ----------------- Recos (ML) -----------------
+@app.post("/recommend/ml", tags=["recommend"])
+@measure_latency("recommend_ml")
+def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    clean_query = request.query.strip()
+    sec = get_security_validator()
+    if sec:
+        try:
+            clean_query = sec.sanitize_input(clean_query)
+        except Exception as e:
+            logger.warning(f"Compliance sanitization failed: {e}")
+    if not clean_query:
+        raise HTTPException(status_code=400, detail="Query is empty")
+    start_time = time.time()
+    try:
+        recommendations = model.predict(query=clean_query, k=request.k, min_confidence=request.min_confidence)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Bad input for model: {e}")
+    except Exception:
+        logger.exception("Prediction failed")
+        raise HTTPException(status_code=500, detail="Prediction failed")
+    latency = time.time() - start_time
+    get_monitor().record_prediction("recommend_ml", clean_query, recommendations, latency)
+    response = {
+        "query": clean_query,
+        "recommendations": recommendations,
+        "latency_ms": latency * 1000,
+        "model_version": model.model_version,
+    }
+    acc = get_accessibility_validator()
+    if acc:
+        try:
+            response = acc.enhance_response_accessibility(response)
+        except Exception as e:
+            logger.warning(f"Accessibility enhancement failed: {e}")
+    return response
+
+@app.post("/recommend/similar-game", tags=["recommend"])
+def recommend_similar_game(payload: SimilarGameRequest, user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    game_id = payload.game_id
+    if not game_id and payload.title:
+        matches = find_games_by_title(payload.title, limit=1)
+        if not matches:
+            raise HTTPException(status_code=404, detail="Game not found with given title")
+        game_id = int(matches[0]["id"])
+    if not game_id:
+        raise HTTPException(status_code=400, detail="Provide either 'game_id' or 'title'")
+    try:
+        recs = model.predict_by_game_id(int(game_id), k=max(1, payload.k))
+        return {"source_id": int(game_id), "recommendations": recs, "model_version": model.model_version}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/recommend/cluster/{cluster_id}", tags=["recommend"])
+def recommend_cluster(cluster_id: int, sample: int = Query(50, ge=1, le=500), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    try:
+        games = model.get_cluster_games(cluster_id, sample=sample)
+        return {"cluster": cluster_id, "count": len(games), "games": games}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/recommend/cluster-explore", tags=["recommend"])
+def recommend_cluster_explore(top_terms: int = Query(10, ge=3, le=30), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    return model.cluster_explore(top_n_terms=top_terms)
+
+@app.get("/recommend/random-cluster", tags=["recommend"])
+def recommend_random_cluster(sample: int = Query(12, ge=1, le=200), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    return model.random_cluster(sample=sample)
+
+@app.get("/recommend/by-title/{title}", tags=["recommend"])
+def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    try:
+        recos = model.recommend_by_title_similarity(title, k=k)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"title": title, "recommendations": recos}
+
+@app.get("/recommend/by-genre/{genre}", tags=["recommend"])
+def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
+    _ensure_model_trained_with_db()
+    model = get_model()
+    recos = model.recommend_by_genre(genre, k=k)
+    return {"genre": genre, "recommendations": recos}
+
+# ----------------- Auth (auto-create au login) -----------------
+def _issue_token_core(username: str, password: str):
+    if not DB_READY:
+        if settings.DEMO_LOGIN_ENABLED and username == settings.DEMO_USERNAME and password == settings.DEMO_PASSWORD:
+            access_token = create_access_token({"sub": username})
+            return {"access_token": access_token, "token_type": "bearer", "mode": "demo"}
+        raise HTTPException(status_code=503, detail="Database unavailable: cannot authenticate")
+
+    auto_create = get_setting_bool("AUTO_CREATE_USER_ON_LOGIN", True)
+
+    try:
+        u = get_user(username)
+    except Exception as e:
+        logger.error("DB error on login lookup: %s", e)
+        raise HTTPException(status_code=503, detail="Database error during login")
+
+    if not u and auto_create:
+        logger.info("Auto-creating user '%s' on first login", username)
+        try:
+            sec = get_security_validator()
+            if sec:
+                pv = sec.validate_password(password)
+                if not pv.get("valid", True):
+                    raise HTTPException(status_code=400, detail={
+                        "message": "Password does not meet security requirements",
+                        "issues": pv.get("issues", []),
+                        "strength": pv.get("strength"),
+                    })
+                username = sec.sanitize_input(username)
+            create_user(username, password)
+            u = get_user(username)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Auto-create user failed: %s", e)
+            raise HTTPException(status_code=503, detail="Database error creating user")
+
+    if not u:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    col, stored = extract_stored_password(u)
+    if not stored:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    try:
+        if not pwd_ctx.verify(password, stored):
+            raise HTTPException(status_code=401, detail="Incorrect username or password")
+    except UnknownHashError:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    if col != "hashed_password" and users_has_column("hashed_password"):
+        try:
+            update_user_password(username, pwd_ctx.hash(password))
+        except Exception as e:
+            logger.warning("Cannot upgrade user hash for %s: %s", username, e)
+
+    access_token = create_access_token({"sub": username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/token", tags=["auth"])
+def token(username: str = Form(...), password: str = Form(...)):
+    return _issue_token_core(username, password)
+
+@app.post("/auth/token", tags=["auth"])
+def token_alias(username: str = Form(...), password: str = Form(...)):
+    return _issue_token_core(username, password)
+
+@app.post("/register", tags=["auth"])
+def register(username: str = Form(...), password: str = Form(...)):
+    if not DB_READY:
+        raise HTTPException(status_code=503, detail="Database unavailable: cannot register now")
+    try:
+        ensure_users_table()
+    except Exception as e:
+        logger.error("DB error ensuring users table: %s", e)
+        raise HTTPException(status_code=503, detail="Database error preparing table")
+    username = username.strip()
+    sec = get_security_validator()
+    if sec:
+        try:
+            username = sec.sanitize_input(username)
+            pv = sec.validate_password(password)
+            if not pv["valid"]:
+                raise HTTPException(status_code=400, detail={
+                    "message": "Password does not meet security requirements",
+                    "issues": pv["issues"],
+                    "strength": pv["strength"]
+                })
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Compliance validation failed: {e}")
+    if get_user(username):
+        raise HTTPException(status_code=400, detail="User already exists")
+    try:
+        user_id = create_user(username, password)
+    except Exception as e:
+        logger.error("DB error on register: %s", e)
+        raise HTTPException(status_code=503, detail="Database error during register")
+    return {"ok": True, "user_id": user_id}
+
+# ----------------- Startup -----------------
+@app.on_event("startup")
+async def startup_event():
+    global DB_READY, DB_LAST_ERROR
+    logger.info("Starting Games API with ML and E4 compliance...")
+
+    try:
+        if settings.db_configured and settings.DB_REQUIRED:
+            ensure_users_table()
+            DB_READY = True
+            DB_LAST_ERROR = None
+            logger.info("Database connected successfully (required mode)")
+        elif settings.db_configured:
+            try:
+                ensure_users_table()
+                DB_READY = True
+                DB_LAST_ERROR = None
+                logger.info("Database connected successfully (optional mode)")
+                try:
+                    n = count_games_in_db()
+                    logger.info("Games in DB: %s", n)
+                except Exception:
+                    logger.info("Users table ready")
+            except Exception as e:
+                DB_READY = False
+                DB_LAST_ERROR = str(e)
+                logger.warning(f"Database connection failed (continuing without DB): {e}")
+        else:
+            DB_READY = False
+            DB_LAST_ERROR = "Database not configured (set DB_* env vars)"
+            logger.info("Database not configured - using demo mode")
+    except Exception as e:
+        DB_READY = False
+        DB_LAST_ERROR = str(e)
+        logger.error(f"Database initialization failed: {e}")
+        if settings.DB_REQUIRED:
+            logger.error("DB_REQUIRED=true but database failed - stopping startup")
+            raise
+
+    # Charger modèle s'il existe
+    model = get_model()
+    model_path = os.path.join("model", "recommendation_model.pkl")
+    try:
+        if os.path.exists(model_path):
+            if model.load_model():
+                logger.info("Model loaded from disk: %s", model.model_version)
+            else:
+                logger.info("Model file exists but loading failed - will train on first request")
+        else:
+            logger.info("No saved model found - will train on first request")
+    except Exception as e:
+        logger.warning("Error loading model: %s - will train on first request", e)
+
+    if COMPLIANCE_ENABLED:
+        logger.info("E4 Compliance standards active")
