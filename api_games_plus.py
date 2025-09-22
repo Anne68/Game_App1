@@ -258,7 +258,7 @@ def _enrich_recommendations_with_commerce(recommendations: List[Dict[str, Any]])
         sql = """
             SELECT
                 game_id_rawg AS id,
-                price,               -- NUMERIC (nullable)
+                best_price_PC,               -- NUMERIC (nullable)
                 store AS store,      -- VARCHAR (nullable)
                 store_url AS url,    -- VARCHAR (nullable) - lien d'achat
                 platforms            -- VARCHAR (ex: 'PC, PS5, Steam')
@@ -273,7 +273,7 @@ def _enrich_recommendations_with_commerce(recommendations: List[Dict[str, Any]])
             info = by_id.get(int(r["id"]))
             if not info:
                 continue
-            r["price"] = info.get("price")
+            r["best_price_PC"] = info.get("best_price_PC")
             r["store"] = info.get("store")
             r["url"] = info.get("url")
             r["platforms"] = _parse_platforms(info.get("platforms"))
@@ -595,7 +595,7 @@ def recommend_ml(request: PredictionRequest, user: str = Depends(verify_token)):
     if (min_price is not None):
         def price_ok(rec: Dict[str, Any]) -> bool:
             try:
-                return rec.get("price") is not None and float(rec["price"]) >= float(min_price)
+                return rec.get("best_price_PC") is not None and float(rec["best_price_PC"]) >= float(min_price)
             except Exception:
                 return False
         recommendations = [r for r in recommendations if price_ok(r)]
