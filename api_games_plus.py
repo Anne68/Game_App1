@@ -226,8 +226,8 @@ def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: 
 
 # ----------------- Recos ML -----------------
 @app.post("/recommend/ml", tags=["recommend"])
-@measure_latency("recommend_ml")
-def recommend_ml(req: PredictionRequest, user: str = Depends(verify_token)):
+def recommend_ml(req: PredictionRequest, user: dict = Depends(verify_token)):
+    _ensure_model_trained_with_db()
     model = get_model()
 
     clean_query = req.query.strip()
@@ -243,7 +243,9 @@ def recommend_ml(req: PredictionRequest, user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
-    # ✅ Filtres
+    # --------------------------
+    # ✅ Appliquer les filtres
+    # --------------------------
     if req.min_price is not None:
         recommendations = [
             r for r in recommendations
@@ -268,6 +270,7 @@ def recommend_ml(req: PredictionRequest, user: str = Depends(verify_token)):
         "count": len(recommendations),
         "model_version": model.model_version
     }
+
 
 # ----------------- Autres endpoints reco -----------------
 @app.post("/recommend/similar-game", tags=["recommend"])
