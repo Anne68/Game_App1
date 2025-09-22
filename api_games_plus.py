@@ -1,472 +1,533 @@
-# api.py
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+# model_manager.py - Gestion du modèle de recommandation (Pipeline TF-IDF → SVD → KMeans → KNN)
+from __future__ import annotations
+import os
+import pickle
+import logging
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
 
-from fastapi import FastAPI, Query, HTTPException, Depends, Security, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import (
-    OAuth2PasswordBearer,
-    OAuth2PasswordRequestForm,
-    SecurityScopes,
-)
-from pydantic import BaseModel, Field, ValidationError
-from jose import JWTError, jwt
-from passlib.context import CryptContext
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans
 
-from model_manager import get_model
+logger = logging.getLogger("model-manager")
 
-# ============================================================
-# Config API + CORS
-# ============================================================
-app = FastAPI(
-    title="Game Reco API (JWT Protected)",
-    version="1.1.0",
-    description="""
-API de recommandations de jeux vidéo.
-
-**Sécurité** :
-- Authentification **OAuth2 Password** (POST /token) → JWT Bearer
-- Swagger permet de s'authentifier via le bouton **Authorize**
-- Scopes:
-  - `recommend:read` pour les endpoints de recommandations
-  - `clusters:read` pour les endpoints d'exploration de clusters
-  - `metrics:read` pour l'endpoint de métriques du modèle
-""",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],            # 🔒 restreindre en prod
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],  # /token est POST
-    allow_headers=["*"],
-)
-
-# ============================================================
-# Sécurité / Auth (OAuth2 + JWT)
-# ============================================================
-# ⚠️ En prod: mettre ce secret en variable d'env (ou vault)
-SECRET_KEY = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET_!!!"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-
-OAUTH2_SCOPES = {
-    "recommend:read": "Lire les recommandations filtrées et par similarité",
-    "clusters:read": "Explorer les clusters (tailles, top termes, échantillons)",
-    "metrics:read": "Consulter les métriques du modèle",
-}
-oauth2_scheme = OAuth2PasswordBearer(
-    tokenUrl="token",
-    scopes=OAUTH2_SCOPES,
-)
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# --- Modèles auth ---
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-class TokenData(BaseModel):
-    username: Optional[str] = None
-    scopes: List[str] = []
-
-class User(BaseModel):
-    username: str
-    full_name: Optional[str] = None
-    disabled: Optional[bool] = False
-    scopes: List[str] = []
-
-class UserInDB(User):
-    hashed_password: str
-
-# --- Fake users DB (à remplacer par MySQL si besoin) ---
-fake_users_db: Dict[str, UserInDB] = {
-    "demo": UserInDB(
-        username="demo",
-        full_name="Demo User",
-        disabled=False,
-        scopes=["recommend:read", "clusters:read", "metrics:read"],
-        hashed_password=pwd_context.hash("demo"),  # password: demo
-    )
-}
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_user(db: Dict[str, UserInDB], username: str) -> Optional[UserInDB]:
-    return db.get(username)
-
-def authenticate_user(username: str, password: str) -> Optional[UserInDB]:
-    user = get_user(fake_users_db, username)
-    if not user or not verify_password(password, user.hashed_password) or user.disabled:
-        return None
-    return user
-
-def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-async def get_current_user(
-    security_scopes: SecurityScopes,
-    token: str = Depends(oauth2_scheme)
-) -> User:
-    if security_scopes.scopes:
-        authenticate_value = f'Bearer scope="{security_scopes.scope_str}"'
-    else:
-        authenticate_value = "Bearer"
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Impossible de valider les identifiants",
-        headers={"WWW-Authenticate": authenticate_value},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: Optional[str] = payload.get("sub")
-        token_scopes = payload.get("scopes", [])
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username, scopes=token_scopes)
-    except (JWTError, ValidationError):
-        raise credentials_exception
-
-    user = get_user(fake_users_db, token_data.username)
-    if user is None:
-        raise credentials_exception
-
-    # Vérifier les scopes requis
-    for scope in security_scopes.scopes:
-        if scope not in token_data.scopes:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Permissions insuffisantes (scope manquant)",
-                headers={"WWW-Authenticate": authenticate_value},
-            )
-    return user
-
-# ============================================================
-# Endpoint Auth
-# ============================================================
-from fastapi import Request
-
-@app.post("/token", response_model=Token, summary="Obtenir un JWT (OAuth2 Password)")
-async def login_for_access_token(
-    request: Request,
-    form_data: OAuth2PasswordRequestForm = Depends()
-):
+class RecommendationModel:
     """
-    Autorise deux formats d'entrée :
-    1) application/x-www-form-urlencoded (standard OAuth2) -> Swagger, curl -d ...
-       champs: username, password, (scope optionnel)
-    2) application/json -> { "username": "...", "password": "..." }
-    """
-    username = form_data.username
-    password = form_data.password
+    Modèle de recommandation avec pipeline :
+      TF-IDF (titre+genres+plateformes) -> SVD -> KMeans (8 clusters) -> KNN (NearestNeighbors)
 
-    # Si l'appel n'a pas envoyé de form-data, essayer JSON
-    if not username or not password:
-        # Essayer de parser le JSON, sans planter si vide
+    Méthodes spécialisées :
+      - predict(query)
+      - predict_by_game_id(game_id)
+      - recommend_by_title_similarity(query_title)
+      - recommend_by_genre(genre)
+      - recommend_with_filters(genre, platforms, max_price)   # <--- AJOUT
+      - get_cluster_games(cluster_id)
+      - cluster_explore() / random_cluster()
+    """
+
+    def __init__(self, model_version: str = "2.1.0"):
+        self.model_version = model_version
+
+        # Texte (contenu)
+        self.vectorizer = TfidfVectorizer(
+            max_features=5000,
+            ngram_range=(1, 2),
+            stop_words="english",
+            lowercase=True
+        )
+        self.svd = TruncatedSVD(n_components=128, random_state=42)
+
+        # Titre seul (pour similarité stricte par titre)
+        self.title_vectorizer = TfidfVectorizer(
+            max_features=8000,
+            analyzer="char",
+            ngram_range=(3, 5),
+            lowercase=True
+        )
+
+        # Clustering et KNN
+        self.kmeans = KMeans(n_clusters=8, random_state=42, n_init="auto")
+        self.knn = NearestNeighbors(metric="cosine", n_neighbors=50, algorithm="auto")
+
+        # Données/features
+        self.game_features: Optional[np.ndarray] = None          # features réduites + numériques
+        self.features_reduced: Optional[np.ndarray] = None       # uniquement SVD
+        self.tfidf_matrix: Optional[np.ndarray] = None           # TF-IDF brut (sparse)
+        self.cluster_labels: Optional[np.ndarray] = None
+        self.games_df: Optional[pd.DataFrame] = None
+        self.is_trained: bool = False
+
+        # Caches
+        self._id_to_index: Dict[int, int] = {}
+        self._neighbors_cache: Dict[int, List[Tuple[int, float]]] = {}
+
+        # Métriques
+        self.metrics = {
+            "total_predictions": 0,
+            "avg_confidence": 0.0,
+            "last_training": None,
+            "model_version": model_version,
+            "feature_dim": 0
+        }
+
+    # -----------------------------
+    # Préparation des features
+    # -----------------------------
+    def prepare_features(self, games: List[Dict]) -> pd.DataFrame:
+        df = pd.DataFrame(games)
+
+        # Texte combiné pour le contenu
+        df["platforms_str"] = df["platforms"].apply(lambda x: " ".join(x) if isinstance(x, list) else str(x or ""))
+        df["combined_features"] = (
+            df["title"].fillna("") + " " +
+            df["genres"].fillna("") + " " +
+            df["platforms_str"].fillna("")
+        )
+
+        # Normalisation numérique robuste (évite division par zéro)
+        for col in ["rating", "metacritic"]:
+            if col not in df:
+                df[col] = 0
+        df["rating"] = pd.to_numeric(df["rating"], errors="coerce").fillna(0.0)
+        df["metacritic"] = pd.to_numeric(df["metacritic"], errors="coerce").fillna(0.0)
+
+        def norm_col(x: pd.Series) -> pd.Series:
+            x_min, x_max = float(x.min()), float(x.max())
+            if x_max == x_min:
+                return pd.Series(np.zeros(len(x)))
+            return (x - x_min) / (x_max - x_min)
+
+        df["rating_norm"] = norm_col(df["rating"])
+        df["metacritic_norm"] = norm_col(df["metacritic"])
+
+        # --- AJOUT : colonne prix (utilisée uniquement pour filtrer, pas dans les features)
+        if "price" not in df:
+            df["price"] = np.nan
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
+        return df
+
+    # -----------------------------
+    # Entraînement
+    # -----------------------------
+    def train(self, games: List[Dict]) -> Dict:
+        logger.info(f"Training model v{self.model_version} with {len(games)} games")
+        self.games_df = self.prepare_features(games)
+
+        # TF-IDF contenu -> SVD
+        self.tfidf_matrix = self.vectorizer.fit_transform(self.games_df["combined_features"])
+        self.features_reduced = self.svd.fit_transform(self.tfidf_matrix)
+
+        # Concat avec numériques
+        numeric = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float)
+        self.game_features = np.hstack([self.features_reduced, numeric])
+
+        # KMeans + KNN
+        self.cluster_labels = self.kmeans.fit_predict(self.features_reduced)
+        self.knn.fit(self.game_features)
+
+        # Vectoriseur de titres pour similarité stricte titres
+        self.title_tfidf = self.title_vectorizer.fit_transform(self.games_df["title"].fillna(""))
+
+        # Index rapides
+        self._id_to_index = {int(self.games_df.iloc[idx]["id"]): idx for idx in range(len(self.games_df))}
+        self._neighbors_cache.clear()
+
+        self.is_trained = True
+        self.metrics["last_training"] = datetime.utcnow().isoformat()
+        self.metrics["feature_dim"] = int(self.game_features.shape[1])
+
+        validation = self._validate_model()
+        logger.info(f"Model trained. Features: {self.game_features.shape}, clusters: {len(np.unique(self.cluster_labels))}")
+        return {
+            "status": "success",
+            "model_version": self.model_version,
+            "games_count": len(games),
+            "feature_dim": int(self.game_features.shape[1]),
+            "validation_metrics": validation
+        }
+
+    def _validate_model(self) -> Dict:
+        if not self.is_trained or self.game_features is None:
+            return {"error": "Model not trained"}
+        # Mesure de compacité inter/intra cluster simple
         try:
-            body = await request.json()
-            username = body.get("username") or username
-            password = body.get("password") or password
+            centers = self.kmeans.cluster_centers_  # espace réduit
+            # Distance moyenne jeu->centre de son cluster
+            dists = []
+            for i, z in enumerate(self.features_reduced):
+                c = centers[self.cluster_labels[i]]
+                dists.append(np.linalg.norm(z - c))
+            return {
+                "mean_distance_to_center": float(np.mean(dists)),
+                "std_distance_to_center": float(np.std(dists)),
+                "max_distance_to_center": float(np.max(dists))
+            }
         except Exception:
-            pass
+            return {"note": "validation skipped"}
 
-    if not username or not password:
-        # 400 = mauvais format ; message clair
-        raise HTTPException(
-            status_code=400,
-            detail="Requête invalide: envoyer username/password en form-data OU en JSON."
-        )
+    # -----------------------------
+    # Prédictions & recommandations
+    # -----------------------------
+    def _neighbors_for_index(self, idx: int, k: int) -> List[Tuple[int, float]]:
+        if idx in self._neighbors_cache and len(self._neighbors_cache[idx]) >= k:
+            return self._neighbors_cache[idx][:k]
+        distances, indices = self.knn.kneighbors([self.game_features[idx]], n_neighbors=min(k + 1, len(self.game_features)))
+        # Exclure soi-même (distance zéro)
+        pairs = [(int(j), float(1.0 - distances[0][t])) for t, j in enumerate(indices[0]) if int(j) != idx]
+        self._neighbors_cache[idx] = pairs
+        return pairs[:k]
 
-    user = authenticate_user(username, password)
-    if not user:
-        # 401 + WWW-Authenticate pour signaler un auth error (mieux que 400 pour clients OAuth)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Nom d'utilisateur ou mot de passe incorrect",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    def predict(self, query: str, k: int = 10, min_confidence: float = 0.1) -> List[Dict]:
+        """Recommandations par requête libre (contenu)."""
+        if not self.is_trained:
+            raise ValueError("Model not trained")
 
-    granted_scopes = user.scopes or []
-    access_token = create_access_token(
-        data={"sub": user.username, "scopes": granted_scopes},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-    )
-    return Token(access_token=access_token, token_type="bearer")
+        # Projeter la requête dans l'espace
+        q_tfidf = self.vectorizer.transform([query])
+        q_red = self.svd.transform(q_tfidf)
+        avg_num = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float).mean(axis=0)
+        q_feat = np.hstack([q_red[0], avg_num])
 
-# ============================================================
-# Charger le modèle
-# ============================================================
-model = get_model()
+        # KNN global
+        distances, indices = self.knn.kneighbors([q_feat], n_neighbors=min(k * 3, len(self.game_features)))
+        recs = []
+        for t, j in enumerate(indices[0]):
+            score = 1.0 - float(distances[0][t])  # convertir distance cos en similarité
+            if score < min_confidence:
+                continue
+            row = self.games_df.iloc[int(j)]
+            recs.append({
+                "id": int(row["id"]),
+                "title": row["title"],
+                "genres": row["genres"],
+                "confidence": score,
+                "rating": float(row["rating"]),
+                "metacritic": int(row["metacritic"]),
+                "cluster": int(self.cluster_labels[int(j)])
+            })
+            if len(recs) >= k:
+                break
 
-# ============================================================
-# Schémas de réponse
-# ============================================================
-class RecommendationItem(BaseModel):
-    id: int
-    title: str
-    genres: Optional[str] = None
-    platforms: Optional[Any] = None  # peut être list ou str selon ta source
-    price: Optional[float] = None
-    confidence: float = Field(..., ge=0.0, le=1.0)
-    rating: float
-    metacritic: int
-    cluster: int
+        # métriques
+        self._update_metrics(recs, k)
+        return recs
 
-class RecommendationResponse(BaseModel):
-    model_version: str
-    total: int
-    items: List[RecommendationItem]
+    def predict_by_game_id(self, game_id: int, k: int = 10) -> List[Dict]:
+        """Recommandations type 'jeux similaires' à un jeu existant (KNN)."""
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        if game_id not in self._id_to_index:
+            raise ValueError(f"Game with id {game_id} not found")
 
-class ClusterGameItem(BaseModel):
-    id: int
-    title: str
-    genres: Optional[str] = None
-    rating: float
-    metacritic: int
+        idx = self._id_to_index[game_id]
+        pairs = self._neighbors_for_index(idx, k)
+        recs = []
+        for j, score in pairs:
+            row = self.games_df.iloc[j]
+            recs.append({
+                "id": int(row["id"]),
+                "title": row["title"],
+                "genres": row["genres"],
+                "confidence": score,
+                "rating": float(row["rating"]),
+                "metacritic": int(row["metacritic"]),
+                "cluster": int(self.cluster_labels[j])
+            })
+        self._update_metrics(recs, k)
+        return recs
 
-class ClusterExploreItem(BaseModel):
-    cluster: int
-    size: int
-    top_terms: List[str]
+    def recommend_by_title_similarity(self, query_title: str, k: int = 10, min_confidence: float = 0.0) -> List[Dict]:
+        """Similarité stricte sur les titres (TF-IDF caractères) — utile pour typo/fuzzy."""
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        q = self.title_vectorizer.transform([query_title])
+        sims = cosine_similarity(q, self.title_tfidf)[0]
+        order = np.argsort(sims)[::-1]
+        recs = []
+        for idx in order[:k * 2]:
+            score = float(sims[idx])
+            if score < min_confidence:
+                continue
+            row = self.games_df.iloc[int(idx)]
+            recs.append({
+                "id": int(row["id"]),
+                "title": row["title"],
+                "genres": row["genres"],
+                "confidence": score,
+                "rating": float(row["rating"]),
+                "metacritic": int(row["metacritic"]),
+                "cluster": int(self.cluster_labels[int(idx)])
+            })
+            if len(recs) >= k:
+                break
+        self._update_metrics(recs, k)
+        return recs
 
-class ClusterExploreResponse(BaseModel):
-    n_clusters: int
-    sizes: List[int]
-    top_terms: List[ClusterExploreItem]
+    def recommend_by_genre(self, genre: str, k: int = 10) -> List[Dict]:
+        """Filtrage simple par genre: prend les plus proches d'une 'requête-genre'."""
+        return self.predict(query=genre, k=k, min_confidence=0.0)
 
-class RandomClusterResponse(BaseModel):
-    cluster: int
-    sample: List[ClusterGameItem]
+    # -----------------------------
+    # AJOUTS : filtres budget / plateformes / genre
+    # -----------------------------
+    @staticmethod
+    def _match_platforms(row_platforms, wanted_platforms: Optional[List[str]]) -> bool:
+        """Vrai si l'intersection est non-vide (case-insensitive)."""
+        if not wanted_platforms:
+            return True
+        if isinstance(row_platforms, list):
+            row_set = {str(p).strip().lower() for p in row_platforms}
+        else:
+            row_set = {str(row_platforms).strip().lower()}
+        want_set = {str(p).strip().lower() for p in wanted_platforms}
+        return len(row_set.intersection(want_set)) > 0
 
-class MetricsResponse(BaseModel):
-    total_predictions: int
-    avg_confidence: float
-    last_training: Optional[str]
-    model_version: str
-    feature_dim: int
-    is_trained: bool
-    games_count: int
+    @staticmethod
+    def _match_genre(row_genres, wanted_genre: Optional[str]) -> bool:
+        if not wanted_genre:
+            return True
+        if pd.isna(row_genres):
+            return False
+        return str(wanted_genre).strip().lower() in str(row_genres).lower()
 
-# ============================================================
-# Health public + probes standard
-# ============================================================
-@app.get("/health", summary="Health check (public)")
-def health():
-    return {
-        "ok": True,
-        "is_trained": model.is_trained,
-        "games_count": 0 if model.games_df is None else len(model.games_df),
-        "model_version": model.model_version,
-    }
+    def recommend_with_filters(
+        self,
+        genre: Optional[str] = None,
+        platforms: Optional[List[str]] = None,
+        max_price: Optional[float] = None,
+        k: int = 10,
+        min_confidence: float = 0.0,
+        sort_by: str = "score",   # "score" ou "price"
+    ) -> List[Dict]:
+        """
+        Recommandations filtrées par genre, plateformes et prix max.
+        Stratégie :
+          1) Filtrer les candidats dans games_df (prix/plateformes/genre)
+          2) Construire une requête texte simple (genre + plateformes)
+          3) Projeter la requête (TF-IDF -> SVD + moyennes numériques)
+          4) Similarité cosine avec les SEULS candidats
+          5) Trier (par score ou prix) et retourner top-k
+        """
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        if self.games_df is None or self.game_features is None:
+            raise ValueError("Model data not available")
 
-@app.get("/healthz", include_in_schema=False)
-def healthz():
-    # Liveness: si le process répond → 200
-    return {"status": "ok"}
+        # 1) Masque candidats
+        mask = pd.Series(True, index=self.games_df.index)
 
-@app.get("/readyz", include_in_schema=False)
-def readyz():
-    # Readiness: prêt uniquement si le modèle est chargé/entraîné
-    if not model.is_trained or model.games_df is None:
-        raise HTTPException(status_code=503, detail="Model not ready")
-    return {"status": "ready", "games_count": len(model.games_df)}
+        if max_price is not None:
+            mask &= self.games_df["price"].notna() & (self.games_df["price"] <= float(max_price))
 
-# ============================================================
-# Recommandations (protégées)
-# ============================================================
-@app.get(
-    "/recommend/filters",
-    response_model=RecommendationResponse,
-    summary="Recommandations filtrées par genre/plateformes/prix (protégé)",
-)
-def recommend_with_filters(
-    genre: Optional[str] = Query(None, description="Genre recherché (ex: 'Action RPG')"),
-    platforms: Optional[List[str]] = Query(
-        None,
-        description="Plateformes (répéter: &platforms=switch&platforms=pc ou CSV: 'switch,pc')"
-    ),
-    max_price: Optional[float] = Query(None, gt=0, description="Prix maximum"),
-    k: int = Query(10, gt=0, le=100, description="Nombre max de recommandations"),
-    min_confidence: float = Query(0.0, ge=0.0, le=1.0, description="Score minimal (0-1)"),
-    sort_by: str = Query("score", pattern="^(score|price)$", description="Tri: 'score' ou 'price'"),
-    current_user: User = Security(get_current_user, scopes=["recommend:read"]),
-):
-    # CSV pour platforms supporté
-    if platforms and len(platforms) == 1 and "," in platforms[0]:
-        platforms = [p.strip() for p in platforms[0].split(",") if p.strip()]
+        if genre:
+            mask &= self.games_df["genres"].apply(lambda g: self._match_genre(g, genre))
 
-    if not model.is_trained or model.games_df is None:
-        raise HTTPException(status_code=503, detail="Le modèle n'est pas prêt.")
+        if platforms:
+            mask &= self.games_df["platforms"].apply(lambda p: self._match_platforms(p, platforms))
 
-    try:
-        recs = model.recommend_with_filters(
-            genre=genre,
-            platforms=platforms,
-            max_price=max_price,
-            k=k,
-            min_confidence=min_confidence,
-            sort_by=sort_by,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        candidate_idxs = np.where(mask.values)[0]
+        if len(candidate_idxs) == 0:
+            return []
 
-    return RecommendationResponse(
-        model_version=model.model_version,
-        total=len(recs),
-        items=[RecommendationItem(**r) for r in recs]
-    )
+        # 2) Requête texte simple
+        parts = []
+        if genre:
+            parts.append(str(genre))
+        if platforms:
+            parts.extend([str(p) for p in platforms])
+        query_text = " ".join(parts) if parts else ""
 
-@app.get(
-    "/recommend/query",
-    response_model=RecommendationResponse,
-    summary="Recommandations par requête libre (protégé)",
-)
-def recommend_query(
-    q: str = Query(..., min_length=1, description="Texte libre (ex: 'roguelike metroidvania on switch')"),
-    k: int = Query(10, gt=0, le=100),
-    min_confidence: float = Query(0.1, ge=0.0, le=1.0),
-    current_user: User = Security(get_current_user, scopes=["recommend:read"]),
-):
-    if not model.is_trained:
-        raise HTTPException(status_code=503, detail="Le modèle n'est pas prêt.")
-    recs = model.predict(query=q, k=k, min_confidence=min_confidence)
-    return RecommendationResponse(
-        model_version=model.model_version,
-        total=len(recs),
-        items=[RecommendationItem(**r) for r in recs]
-    )
+        # 3) Projection de la requête
+        q_tfidf = self.vectorizer.transform([query_text])
+        q_red = self.svd.transform(q_tfidf)
+        avg_num = self.games_df[["rating_norm", "metacritic_norm"]].to_numpy(dtype=float).mean(axis=0)
+        q_feat = np.hstack([q_red[0], avg_num]).reshape(1, -1)
 
-@app.get(
-    "/recommend/by-id",
-    response_model=RecommendationResponse,
-    summary="Jeux similaires à un jeu donné (protégé)",
-)
-def recommend_by_id(
-    game_id: int = Query(..., description="Identifiant du jeu existant"),
-    k: int = Query(10, gt=0, le=100),
-    current_user: User = Security(get_current_user, scopes=["recommend:read"]),
-):
-    if not model.is_trained:
-        raise HTTPException(status_code=503, detail="Le modèle n'est pas prêt.")
-    try:
-        recs = model.predict_by_game_id(game_id=game_id, k=k)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return RecommendationResponse(
-        model_version=model.model_version,
-        total=len(recs),
-        items=[RecommendationItem(**r) for r in recs]
-    )
+        # 4) Similarité cosine avec candidats
+        cand_feats = self.game_features[candidate_idxs]
+        sims = cosine_similarity(q_feat, cand_feats)[0]  # longueur = nb candidats
 
-@app.get(
-    "/recommend/by-title",
-    response_model=RecommendationResponse,
-    summary="Similarité stricte par titre (protégé, fuzzy)",
-)
-def recommend_by_title(
-    title: str = Query(..., min_length=1, description="Titre du jeu (typos acceptées)"),
-    k: int = Query(10, gt=0, le=100),
-    min_confidence: float = Query(0.0, ge=0.0, le=1.0),
-    current_user: User = Security(get_current_user, scopes=["recommend:read"]),
-):
-    if not model.is_trained:
-        raise HTTPException(status_code=503, detail="Le modèle n'est pas prêt.")
-    recs = model.recommend_by_title_similarity(query_title=title, k=k, min_confidence=min_confidence)
-    return RecommendationResponse(
-        model_version=model.model_version,
-        total=len(recs),
-        items=[RecommendationItem(**r) for r in recs]
-    )
+        # 5) Tri
+        order = np.argsort(sims)[::-1]  # par score décroissant
+        if sort_by == "price":
+            prices = self.games_df.iloc[candidate_idxs]["price"].to_numpy()
+            # Tri primaire sur prix (asc), secondaire sur score (desc)
+            order = np.lexsort((-sims, prices))
 
-@app.get(
-    "/recommend/by-genre",
-    response_model=RecommendationResponse,
-    summary="Recommandations par genre (protégé)",
-)
-def recommend_by_genre(
-    genre: str = Query(..., min_length=1, description="Genre (ex: 'Action RPG')"),
-    k: int = Query(10, gt=0, le=100),
-    current_user: User = Security(get_current_user, scopes=["recommend:read"]),
-):
-    if not model.is_trained:
-        raise HTTPException(status_code=503, detail="Le modèle n'est pas prêt.")
-    recs = model.recommend_by_genre(genre=genre, k=k)
-    return RecommendationResponse(
-        model_version=model.model_version,
-        total=len(recs),
-        items=[RecommendationItem(**r) for r in recs]
-    )
+        # 6) Sortie top-k
+        recs = []
+        for pos in order:
+            idx = int(candidate_idxs[int(pos)])
+            score = float(sims[int(pos)])
+            if score < min_confidence:
+                continue
+            row = self.games_df.iloc[idx]
+            recs.append({
+                "id": int(row["id"]),
+                "title": row["title"],
+                "genres": row["genres"],
+                "platforms": row["platforms"],
+                "price": (None if pd.isna(row["price"]) else float(row["price"])),
+                "confidence": score,
+                "rating": float(row["rating"]),
+                "metacritic": int(row["metacritic"]),
+                "cluster": int(self.cluster_labels[idx]),
+            })
+            if len(recs) >= k:
+                break
 
-# ============================================================
-# Clusters (protégés)
-# ============================================================
-@app.get(
-    "/clusters/explore",
-    response_model=ClusterExploreResponse,
-    summary="Explorer les clusters (tailles, top termes) (protégé)",
-)
-def clusters_explore(
-    top_n_terms: int = Query(10, gt=0, le=50, description="Nombre de termes top par cluster"),
-    current_user: User = Security(get_current_user, scopes=["clusters:read"]),
-):
-    if not model.is_trained:
-        raise HTTPException(status_code=503, detail="Le modèle n'est pas prêt.")
-    data = model.cluster_explore(top_n_terms=top_n_terms)
-    return ClusterExploreResponse(
-        n_clusters=data["n_clusters"],
-        sizes=data["sizes"],
-        top_terms=[ClusterExploreItem(**d) for d in data["top_terms"]]
-    )
+        self._update_metrics(recs, k)
+        return recs
 
-@app.get(
-    "/clusters/random",
-    response_model=RandomClusterResponse,
-    summary="Prendre un cluster au hasard (protégé)",
-)
-def cluster_random(
-    sample: int = Query(12, gt=0, le=100, description="Taille de l'échantillon renvoyé"),
-    current_user: User = Security(get_current_user, scopes=["clusters:read"]),
-):
-    if not model.is_trained:
-        raise HTTPException(status_code=503, detail="Le modèle n'est pas prêt.")
-    data = model.random_cluster(sample=sample)
-    return RandomClusterResponse(
-        cluster=data["cluster"],
-        sample=[ClusterGameItem(**g) for g in data["sample"]]
-    )
+    # -----------------------------
+    # Clusters
+    # -----------------------------
+    def get_cluster_games(self, cluster_id: int, sample: Optional[int] = None) -> List[Dict]:
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        if cluster_id < 0 or cluster_id >= self.kmeans.n_clusters:
+            raise ValueError(f"Cluster id must be in [0, {self.kmeans.n_clusters-1}]")
+        idxs = np.where(self.cluster_labels == cluster_id)[0]
+        if sample is not None and sample > 0:
+            if sample < len(idxs):
+                rng = np.random.default_rng(42)
+                idxs = rng.choice(idxs, size=sample, replace=False)
+        out = []
+        for i in idxs:
+            row = self.games_df.iloc[int(i)]
+            out.append({
+                "id": int(row["id"]),
+                "title": row["title"],
+                "genres": row["genres"],
+                "rating": float(row["rating"]),
+                "metacritic": int(row["metacritic"])
+            })
+        return out
 
-@app.get(
-    "/clusters/{cluster_id}/games",
-    response_model=List[ClusterGameItem],
-    summary="Lister les jeux d'un cluster (protégé)",
-)
-def cluster_games(
-    cluster_id: int,
-    sample: Optional[int] = Query(None, gt=0, le=500, description="Échantillon aléatoire (optionnel)"),
-    current_user: User = Security(get_current_user, scopes=["clusters:read"]),
-):
-    if not model.is_trained:
-        raise HTTPException(status_code=503, detail="Le modèle n'est pas prêt.")
-    try:
-        items = model.get_cluster_games(cluster_id=cluster_id, sample=sample)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return [ClusterGameItem(**g) for g in items]
+    def _top_terms_per_cluster(self, top_n: int = 10) -> List[Dict]:
+        """
+        Approximation: moyenne TF-IDF par cluster, top features textuelles.
+        """
+        if self.tfidf_matrix is None:
+            return []
+        terms = np.array(self.vectorizer.get_feature_names_out())
+        result = []
+        for c in range(self.kmeans.n_clusters):
+            idxs = np.where(self.cluster_labels == c)[0]
+            if len(idxs) == 0:
+                result.append({"cluster": c, "size": 0, "top_terms": []})
+                continue
+            # moyenne TF-IDF cluster (sparse -> dense mean via .mean(axis=0))
+            mean_vec = self.tfidf_matrix[idxs].mean(axis=0).A1
+            top_idx = np.argsort(mean_vec)[::-1][:top_n]
+            result.append({
+                "cluster": c,
+                "size": int(len(idxs)),
+                "top_terms": terms[top_idx].tolist()
+            })
+        return result
 
-# ============================================================
-# Métriques (protégées)
-# ============================================================
-@app.get(
-    "/metrics",
-    response_model=MetricsResponse,
-    summary="Métriques du modèle (protégé)",
-)
-def metrics(
-    current_user: User = Security(get_current_user, scopes=["metrics:read"]),
-):
-    data = model.get_metrics()
-    return MetricsResponse(**data)
+    def cluster_explore(self, top_n_terms: int = 10) -> Dict:
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        sizes = np.bincount(self.cluster_labels, minlength=self.kmeans.n_clusters).tolist()
+        return {
+            "n_clusters": int(self.kmeans.n_clusters),
+            "sizes": sizes,
+            "top_terms": self._top_terms_per_cluster(top_n_terms)
+        }
+
+    def random_cluster(self, sample: int = 12) -> Dict:
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+        c = int(np.random.default_rng().integers(0, self.kmeans.n_clusters))
+        games = self.get_cluster_games(c, sample=sample)
+        return {"cluster": c, "sample": games}
+
+    # -----------------------------
+    # Persistance & métriques
+    # -----------------------------
+    def save_model(self, filepath: str = "model/recommendation_model.pkl") -> bool:
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            model_data = {
+                "version": self.model_version,
+                "vectorizer": self.vectorizer,
+                "svd": self.svd,
+                "kmeans": self.kmeans,
+                "knn": self.knn,
+                "title_vectorizer": self.title_vectorizer,
+                "title_tfidf": getattr(self, "title_tfidf", None),
+                "tfidf_matrix": self.tfidf_matrix,
+                "features_reduced": self.features_reduced,
+                "game_features": self.game_features,
+                "cluster_labels": self.cluster_labels,
+                "games_df": self.games_df,
+                "metrics": self.metrics,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            with open(filepath, "wb") as f:
+                pickle.dump(model_data, f)
+            logger.info(f"Model saved to {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save model: {e}")
+            return False
+
+    def load_model(self, filepath: str = "model/recommendation_model.pkl") -> bool:
+        try:
+            with open(filepath, "rb") as f:
+                m = pickle.load(f)
+            self.model_version = m["version"]
+            self.vectorizer = m["vectorizer"]
+            self.svd = m["svd"]
+            self.kmeans = m["kmeans"]
+            self.knn = m["knn"]
+            self.title_vectorizer = m["title_vectorizer"]
+            self.title_tfidf = m["title_tfidf"]
+            self.tfidf_matrix = m["tfidf_matrix"]
+            self.features_reduced = m["features_reduced"]
+            self.game_features = m["game_features"]
+            self.cluster_labels = m["cluster_labels"]
+            self.games_df = m["games_df"]
+            self.metrics = m["metrics"]
+            self._id_to_index = {int(row.id): idx for idx, row in self.games_df[["id"]].itertuples(index=True)}
+            self._neighbors_cache.clear()
+            self.is_trained = True
+            logger.info(f"Model v{self.model_version} loaded from {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            return False
+
+    def _update_metrics(self, recs: List[Dict], k: int):
+        self.metrics["total_predictions"] += 1
+        if recs:
+            avg_conf = float(np.mean([r["confidence"] for r in recs[:k]]))
+            n = self.metrics["total_predictions"]
+            self.metrics["avg_confidence"] = (self.metrics["avg_confidence"] * (n - 1) + avg_conf) / n
+
+    def get_metrics(self) -> Dict:
+        return {
+            **self.metrics,
+            "is_trained": self.is_trained,
+            "games_count": len(self.games_df) if self.games_df is not None else 0
+        }
+
+# Singleton
+_model_instance: Optional[RecommendationModel] = None
+
+def get_model() -> RecommendationModel:
+    global _model_instance
+    if _model_instance is None:
+        _model_instance = RecommendationModel()
+        if os.path.exists("model/recommendation_model.pkl"):
+            _model_instance.load_model()
+    return _model_instance
