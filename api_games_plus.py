@@ -227,6 +227,7 @@ def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: 
 # ----------------- Recos ML -----------------
 @app.post("/recommend/ml", tags=["recommend"])
 def recommend_ml(req: PredictionRequest, user: str = Depends(verify_token)):
+    """Recommandations + filtres croisés robustes (prix, plateformes, genres)."""
     _ensure_model_trained_with_db()
     model = get_model()
 
@@ -234,16 +235,105 @@ def recommend_ml(req: PredictionRequest, user: str = Depends(verify_token)):
     if not clean_query:
         raise HTTPException(status_code=400, detail="Query is empty")
 
-    # 1) prédiction
+    # --- 1) Prédiction
     try:
         recs = model.predict(
             query=clean_query,
             k=req.k,
             min_confidence=req.min_confidence
-        )
+        ) or []
     except Exception as e:
         logger.exception("Prediction failed")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+
+    # --- Helpers défensifs
+    def _to_float(x):
+        if x is None:
+            return None
+        try:
+            if isinstance(x, str):
+                x = x.replace(",", ".").strip()
+            return float(x)
+        except Exception:
+            return None
+
+    def _as_list(v):
+        # Accepte liste, "A, B, C", "A B C", None
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        s = str(v).strip()
+        if not s:
+            return []
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) == 1:  # pas de virgules → split espaces
+            parts = [p for p in s.split() if p.strip()]
+        return [p for p in parts if p]
+
+    def _lower_set(items):
+        return {str(i).strip().lower() for i in items if str(i).strip()}
+
+    def price_of(rec):
+        # best_price_PC prioritaire, sinon price si dispo
+        p = rec.get("best_price_PC", None)
+        if p is None:
+            p = rec.get("price", None)
+        return _to_float(p)
+
+    # --- 2) Filtres croisés (on skip silencieusement ce qui est invalide)
+    filtered = []
+    want_plats  = _lower_set(req.platforms or [])
+    want_genres = _lower_set(req.genres or [])
+    min_price   = _to_float(req.min_price) if req.min_price is not None else None
+
+    for r in recs:
+        try:
+            # Prix
+            if min_price is not None:
+                p = price_of(r)
+                if p is None or p < min_price:
+                    continue
+
+            # Plateformes (intersection non vide, insensible à la casse)
+            if want_plats:
+                plats = _lower_set(_as_list(r.get("platforms")))
+                if not (plats & want_plats):
+                    continue
+
+            # Genres (intersection non vide; fallback sous-chaîne)
+            if want_genres:
+                gval = r.get("genres")
+                rec_genres = _lower_set(_as_list(gval))
+                ok = bool(rec_genres & want_genres)
+                if not ok and isinstance(gval, str):
+                    gtxt = gval.lower()
+                    ok = any(w in gtxt for w in want_genres)
+                if not ok:
+                    continue
+
+            filtered.append(r)
+        except Exception as e:
+            logger.warning("Skipping invalid record during filtering: %s | rec=%r", e, r)
+            continue
+
+    resp = {
+        "query": clean_query,
+        "recommendations": filtered,
+        "count": len(filtered),
+        "model_version": model.model_version,
+    }
+
+    # Accessibilité (optionnel) – ne doit jamais casser la réponse
+    acc = get_accessibility_validator()
+    if acc:
+        try:
+            resp = acc.enhance_response_accessibility(resp)
+        except Exception as e:
+            logger.warning("Accessibility enhancement failed: %s", e)
+
+    return resp
+ailed: {e}")
 
     # ---------- helpers robustes ----------
     def _to_float(x):
