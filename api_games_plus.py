@@ -1,175 +1,294 @@
+from __future__ import annotations
 import os
-import json
 import time
-from typing import Dict, Any, Optional, List
+import math
+import logging
+import inspect
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any, Tuple
 
-import requests
-import streamlit as st
-import pandas as pd
+import pymysql
+from fastapi import FastAPI, HTTPException, Depends, Form, Query, BackgroundTasks, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
+from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel
 
-# =============================
-# Configuration
-# =============================
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
-DEMO_USERNAME = os.getenv("DEMO_USERNAME", "demo")
-DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "demo")
-
-COMMON_PLATFORMS = [
-    "PC", "Steam", "Epic", "GOG", "PS5", "PS4", "Xbox", "Xbox One",
-    "Xbox Series", "Switch", "Nintendo Switch", "Mobile", "iOS", "Android"
-]
-
-st.set_page_config(
-    page_title="Games Recommender UI",
-    page_icon="🎮",
-    layout="wide",
+from settings import get_settings
+from model_manager import get_model
+from monitoring_metrics import (
+    prediction_latency,
+    model_prediction_counter,
+    get_monitor,
 )
 
-# =============== Helpers ===============
+logger = logging.getLogger("games-api-ml")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
-def _headers() -> Dict[str, str]:
-    headers = {"Content-Type": "application/json"}
-    token = st.session_state.get("token")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
+# ----------------- Compliance (optionnel) -----------------
+try:
+    from compliance.standards_compliance import SecurityValidator, AccessibilityValidator
+    COMPLIANCE_AVAILABLE = True
+    logger.info("Compliance module loaded successfully")
+except ImportError as e:
+    COMPLIANCE_AVAILABLE = False
+    logger.warning(f"Compliance module not available: {e}")
 
+settings = get_settings()
 
-def api_post(path: str, payload: Optional[Dict[str, Any]] = None, form: Optional[Dict[str, Any]] = None, require_auth: bool = True):
-    url = f"{API_BASE_URL}{path}"
-    try:
-        if form is not None:
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
-            resp = requests.post(url, headers=headers, data=form, timeout=30)
-        else:
-            headers = _headers() if require_auth else {"Content-Type": "application/json"}
-            resp = requests.post(url, headers=headers, json=payload or {}, timeout=60)
-        if resp.status_code == 401:
-            st.error("Non autorisé : connectez-vous.")
-            return {}
-        if not resp.ok:
-            try:
-                detail = resp.json()
-            except Exception:
-                detail = resp.text
-            st.error(f"POST {path} -> HTTP {resp.status_code}: {detail}")
-            return {}
-        return resp.json()
-    except Exception as e:
-        st.error(f"POST {path} failed: {e}")
-        return {}
+SECRET_KEY = settings.SECRET_KEY
+ALGORITHM = settings.ALGORITHM
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+pwd_ctx = CryptContext(schemes=["bcrypt", "pbkdf2_sha256", "sha256_crypt"], deprecated="auto")
 
+DB_READY: bool = False
+DB_LAST_ERROR: Optional[str] = None
 
-def show_header():
-    st.markdown("<h2>🎮 Games API ML – Streamlit</h2>", unsafe_allow_html=True)
-    st.caption("Interface simple pour tester l'API de recommandations.")
+app = FastAPI(
+    title="Games API ML (C9→C13)",
+    version="2.6.0",
+    description="API avec modèle ML, monitoring avancé et MySQL (AlwaysData) pour les utilisateurs",
+)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o for o in settings.ALLOW_ORIGINS.split(",") if o] or ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def sidebar_auth():
-    with st.sidebar:
-        st.subheader("Connexion")
-        if not st.session_state.get("logged", False):
-            with st.form("login_form"):
-                username = st.text_input("Nom d'utilisateur", value=DEMO_USERNAME)
-                password = st.text_input("Mot de passe", type="password", value=DEMO_PASSWORD)
-                login_btn = st.form_submit_button("Se connecter")
-            if login_btn:
-                data = api_post("/auth/token", form={"username": username, "password": password}, require_auth=False)
-                if data.get("access_token"):
-                    st.session_state.token = data["access_token"]
-                    st.session_state.logged = True
-                    st.session_state.username = username
-                    st.success("Connecté ✅")
-        else:
-            st.success(f"Connecté en tant que {st.session_state.get('username')}")
-            if st.button("Se déconnecter"):
-                st.session_state.clear()
-                st.experimental_rerun()
+# ----------------- Compliance helpers -----------------
+def setup_compliance():
+    if COMPLIANCE_AVAILABLE:
+        try:
+            app.state.security_validator = SecurityValidator()
+            app.state.accessibility_validator = AccessibilityValidator()
+            logger.info("Compliance validators attached to app state")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to setup compliance validators: {e}")
+            return False
+    logger.info("Compliance not available - continuing without")
+    return False
 
-# =============== Pages ===============
+COMPLIANCE_ENABLED = setup_compliance()
 
-
-def _detect_url_col(df: pd.DataFrame) -> Optional[str]:
-    url_candidates = ["url", "store_url", "purchase_url", "buy_url", "link", "shop_url", "steam_url", "epic_url", "gog_url"]
-    for c in url_candidates:
-        if c in df.columns:
-            return c
-    for c in df.columns:
-        lc = c.lower()
-        if "url" in lc or "link" in lc:
-            return c
+def get_security_validator():
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'security_validator'):
+        return app.state.security_validator
     return None
 
+def get_accessibility_validator():
+    if COMPLIANCE_ENABLED and hasattr(app.state, 'accessibility_validator'):
+        return app.state.accessibility_validator
+    return None
 
-def page_recommendations():
-    st.subheader("🔎 Recommandations ML")
-    if not st.session_state.get("logged"):
-        st.warning("Veuillez vous connecter.")
-        return
+# ----------------- Models -----------------
+class TrainRequest(BaseModel):
+    version: Optional[str] = None
+    force_retrain: bool = False
 
-    with st.form("reco_form"):
-        query = st.text_input("Votre requête (ex: RPG open world)", value="RPG open world")
-        k = st.slider("Nombre de résultats (k)", 1, 50, 10)
-        plats = st.multiselect("Filtrer par plateformes (côté API)", COMMON_PLATFORMS, default=[])
-        min_price = st.number_input("Prix minimum (≥)", min_value=0.0, step=1.0, value=0.0)
-        submit = st.form_submit_button("Recommander")
+class PredictionRequest(BaseModel):
+    query: str
+    k: int = 10
+    min_confidence: float = 0.1
+    platforms: Optional[List[str]] = None
+    min_price: Optional[float] = None
+    genres: Optional[List[str]] = None  # ✅ nouveau
 
-    if submit:
-        payload = {
-            "query": query,
-            "k": int(k),
-            "min_confidence": 0.1,
-            "platforms": plats or None,
-            "min_price": float(min_price) if min_price else None
-        }
-        data = api_post("/recommend/ml", payload)
-        recs = data.get("recommendations", [])
-        if not recs:
-            st.info("Aucune recommandation.")
-            with st.expander("Réponse brute"):
-                st.json(data)
-            return
+class SimilarGameRequest(BaseModel):
+    game_id: Optional[int] = None
+    title: Optional[str] = None
+    k: int = 10
 
-        df = pd.DataFrame(recs)
+class ModelMetricsResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    model_version: str
+    is_trained: bool
+    total_predictions: int
+    avg_confidence: float
+    last_training: Optional[str]
+    games_count: int
+    feature_dimension: int
 
-        title_col = "title" if "title" in df.columns else None
-        price_col = "best_price_PC" if "best_price_PC" in df.columns else ("price" if "price" in df.columns else None)
-        store_col = "store" if "store" in df.columns else None
-        url_col = _detect_url_col(df)
+class TrainResponse(BaseModel):
+    status: str
+    version: Optional[str] = None
+    duration: Optional[float] = None
+    result: Optional[Dict[str, Any]] = None
 
-        display_cols = []
-        rename_map = {}
-        if title_col:
-            display_cols.append(title_col); rename_map[title_col] = "Titre"
-        if price_col:
-            display_cols.append(price_col); rename_map[price_col] = "Prix"
-        if store_col:
-            display_cols.append(store_col); rename_map[store_col] = "Store"
-        if url_col:
-            display_cols.append(url_col); rename_map[url_col] = "Lien"
+# ----------------- Utils -----------------
+def get_setting_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = getattr(settings, name, None)
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return default
 
-        if display_cols:
-            df_disp = df[display_cols].rename(columns=rename_map).copy()
-            if "Lien" in df_disp.columns:
-                def mk_link(row):
-                    u = str(row.get("Lien") or "").strip()
-                    t = str(row.get("Titre") or "").strip() or "Voir"
-                    return f"[{t}]({u})" if u.startswith("http") else t
-                df_disp["Titre"] = df_disp.apply(mk_link, axis=1)
-            st.dataframe(df_disp, use_container_width=True)
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float) and math.isnan(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def _safe_int(x, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float) and math.isnan(x):
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+# ----------------- Auth helpers -----------------
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def verify_token(token: str = Depends(oauth2_scheme)) -> str:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        sub: str = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return sub
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ----------------- Decorator (latency) -----------------
+def measure_latency(endpoint: str):
+    def decorator(func):
+        if inspect.iscoroutinefunction(func):
+            async def async_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = await func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            return async_wrapper
         else:
-            base_cols = [c for c in ["confidence","id","title","genres","rating","metacritic"] if c in df.columns]
-            st.dataframe(df[base_cols].rename(columns={"id":"game_id","title":"Titre"}), use_container_width=True)
-            st.info("Astuce: ajoutez `best_price_PC`/`store`/`url` côté API pour afficher Titre · Prix · Store · Lien.")
+            def sync_wrapper(*args, **kwargs):
+                start = time.time()
+                try:
+                    res = func(*args, **kwargs)
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    return res
+                except Exception:
+                    prediction_latency.labels(endpoint=endpoint).observe(time.time() - start)
+                    model_prediction_counter.labels(endpoint=endpoint, status="error").inc()
+                    raise
+            return sync_wrapper
+    return decorator
 
-        with st.expander("Réponse brute"):
-            st.json(data)
+# ----------------- System -----------------
+@app.get("/healthz", tags=["system"])
+def healthz():
+    model = get_model()
+    return {
+        "status": "healthy" if (DB_READY or not settings.DB_REQUIRED) else "degraded",
+        "time": datetime.utcnow().isoformat(),
+        "model_loaded": model.is_trained,
+        "model_version": model.model_version,
+    }
 
+# ----------------- Training -----------------
+@app.post("/model/train", tags=["model"], response_model=TrainResponse)
+def train_model(request: TrainRequest, background_tasks: BackgroundTasks, user: str = Depends(verify_token)):
+    start_time = time.time()
+    version = request.version or f"api-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    model = get_model()
+    model.model_version = version
+    games = []  # ⚠️ à remplir depuis ta DB
+    result = model.train(games)
+    duration = time.time() - start_time
+    background_tasks.add_task(model.save_model)
+    return TrainResponse(status="success", version=version, duration=duration, result=result)
 
-def main():
-    show_header()
-    sidebar_auth()
-    page_recommendations()
+# ----------------- Recos ML -----------------
+@app.post("/recommend/ml", tags=["recommend"])
+@measure_latency("recommend_ml")
+def recommend_ml(req: PredictionRequest, user: str = Depends(verify_token)):
+    model = get_model()
 
-if __name__ == "__main__":
-    main()
+    clean_query = req.query.strip()
+    if not clean_query:
+        raise HTTPException(status_code=400, detail="Query is empty")
+
+    try:
+        recommendations = model.predict(
+            query=clean_query,
+            k=req.k,
+            min_confidence=req.min_confidence
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+
+    # ✅ Filtres
+    if req.min_price is not None:
+        recommendations = [
+            r for r in recommendations
+            if r.get("best_price_PC") is not None and r["best_price_PC"] >= req.min_price
+        ]
+
+    if req.platforms:
+        recommendations = [
+            r for r in recommendations
+            if any(p in r.get("platforms", []) for p in req.platforms)
+        ]
+
+    if req.genres:
+        recommendations = [
+            r for r in recommendations
+            if any(g.lower() in (r.get("genres", "").lower()) for g in req.genres)
+        ]
+
+    return {
+        "query": clean_query,
+        "recommendations": recommendations,
+        "count": len(recommendations),
+        "model_version": model.model_version
+    }
+
+# ----------------- Autres endpoints reco -----------------
+@app.post("/recommend/similar-game", tags=["recommend"])
+def recommend_similar_game(payload: SimilarGameRequest, user: str = Depends(verify_token)):
+    model = get_model()
+    return {"recommendations": model.predict_by_game_id(payload.game_id, k=payload.k)}
+
+@app.get("/recommend/by-genre/{genre}", tags=["recommend"])
+def recommend_by_genre(genre: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
+    model = get_model()
+    return {"genre": genre, "recommendations": model.recommend_by_genre(genre, k=k)}
+
+@app.get("/recommend/by-title/{title}", tags=["recommend"])
+def recommend_by_title(title: str, k: int = Query(10, ge=1, le=50), user: str = Depends(verify_token)):
+    model = get_model()
+    return {"title": title, "recommendations": model.recommend_by_title_similarity(title, k=k)}
+
+# ----------------- Auth -----------------
+@app.post("/token", tags=["auth"])
+def token(username: str = Form(...), password: str = Form(...)):
+    access_token = create_access_token({"sub": username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+Instrumentator().instrument(app).expose(app, include_in_schema=True)
