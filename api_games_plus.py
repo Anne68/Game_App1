@@ -50,7 +50,7 @@ DB_READY: bool = False
 DB_LAST_ERROR: Optional[str] = None
 
 app = FastAPI(
-    title="Games API ML (C9→C13)",
+    title="Games API ML",
     version="2.5.0",
     description="API avec modèle ML, monitoring avancé et MySQL (AlwaysData) pour les utilisateurs",
 )
